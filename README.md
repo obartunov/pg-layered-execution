@@ -12,20 +12,33 @@ heap and compact partitions?
 ## Architecture
 
 ```
-Partitioned PostgreSQL table
+PostgreSQL parent table
         |
-        +── cold partition → ZLFS borrowed batches
+        +── hot heap partitions
         |
-        +── hot partition  → heap-owned batches
-                         |
-                    BatchAppend
-                         ↓
-                    BatchHashJoin
-                         ↓
-                    BatchHashJoin
-                         ↓
-                    BatchGroupAgg
+        +── cold logical partitions
+        |       ├── compact base segments
+        |       ├── mutable delta + internal CDC
+        |       └── min/max and Bloom pruning
+        |
+        └── selected providers
+                 ↓
+             BatchAppend
+                 ↓
+             BatchHashJoin
+                 ↓
+             BatchHashJoin
+                 ↓
+             BatchGroupAgg
 ```
+
+The current experiments use one ZLFS zone as the first compact-segment
+prototype. The intended cold layer is broader: PostgreSQL prunes partitions,
+while the cold provider prunes internal segments and later merges an immutable
+base with transactional delta.
+
+See [docs/architecture.md](docs/architecture.md) and
+[docs/cold-layer-architecture.md](docs/cold-layer-architecture.md).
 
 ## Three experiments
 
@@ -88,11 +101,15 @@ cd benchmarks/02-batch-joins && ./run.sh
 cd benchmarks/03-partition-layers && ./run.sh
 ```
 
-## Next step
+## Next steps
 
-**planner-v1**: let the PostgreSQL planner choose partitions, providers,
-join order, and batch-aware upper paths through standard hooks.
-See [docs/roadmap/planner-v1.md](docs/roadmap/planner-v1.md).
+- **planner-v1**: let PostgreSQL choose partitions, providers, join order, and
+  batch-aware upper paths through standard hooks;
+- **cold-provider-v1**: evolve the current single ZLFS zone into prunable
+  compact segments with a transactional delta, internal CDC, and compaction.
+
+See [docs/roadmap/planner-v1.md](docs/roadmap/planner-v1.md) and
+[docs/cold-layer-architecture.md](docs/cold-layer-architecture.md).
 
 ## License
 

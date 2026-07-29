@@ -5,12 +5,14 @@
 - Benchmark uses int32 exclusively
 - No varlena, nullable, or composite types
 
-## ZLFS zones
-- Read-only snapshots, no incremental maintenance
-- No WAL integration
+## ZLFS zones and cold layer
+- Current ZLFS is one read-only zone, not yet a segmented cold provider
+- No internal segment directory, min/max pruning, or Bloom filters
+- No transactional delta, internal CDC, base-plus-delta merge, or compaction
+- No WAL integration for cold-layer maintenance
 - Backend-local registry, not shared across connections
 - Schema hash validation on load, but no runtime monitoring
-- Zone files must be rebuilt after any DML on the source table
+- Zone files must be rebuilt after DML or the query must fall back to heap
 
 ## Execution
 - Static-capacity hash tables (GRP_CAP=16384, DIM_CAP=256/512)
