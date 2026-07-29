@@ -1,0 +1,6 @@
+path,median_ms,runs,groups,checksum
+borrowed_columns,2.8,5,600,171653effb5086ed160c67ff2ce1588d
+copied_columns,4.2,5,600,171653effb5086ed160c67ff2ce1588d
+slot_row_wise,8.2,5,600,171653effb5086ed160c67ff2ce1588d
+heap_compact_batch,248.4,5,600,171653effb5086ed160c67ff2ce1588d
+pg_vanilla,969.3,5,600,171653effb5086ed160c67ff2ce1588d

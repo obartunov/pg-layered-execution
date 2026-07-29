@@ -1,0 +1,20 @@
+# Build
+*.o
+*.so
+*.bc
+/extension/xp_batch/results/
+
+# PostgreSQL
+/pgdata/
+/pginstall/
+*.zlfs
+postmaster.pid
+
+# System
+*.core
+*.swp
+*~
+.DS_Store
+
+# Archives
+*.tar.gz

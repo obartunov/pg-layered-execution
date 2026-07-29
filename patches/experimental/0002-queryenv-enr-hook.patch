@@ -1,0 +1,278 @@
+From: PostgreSQL HTAP lab <noreply@example.invalid>
+Subject: [PATCH 2/2] tcop, SPI: allow extensions to enrich QueryEnvironment
+
+Adds a hook through which an extension can inject EphemeralNamedRelations
+into QueryEnvironment before parse analysis and cached-plan acquisition.
+
+This patch is required by the tr_extension experiment and is independent
+of the executor batch API.
+
+diff --git a/src/backend/executor/spi.c b/src/backend/executor/spi.c
+index 52f3b11..f5c1bb4 100644
+--- a/src/backend/executor/spi.c
++++ b/src/backend/executor/spi.c
+@@ -30,10 +30,12 @@
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
++#include "utils/queryenvironment.h"
+ #include "utils/snapmgr.h"
+ #include "utils/syscache.h"
+ #include "utils/tuplestore.h"
+ #include "utils/typcache.h"
++#include "tcop/tcopprot.h"
+ 
+ 
+ /*
+@@ -140,6 +142,18 @@ SPI_connect_ext(int options)
+ 	_SPI_current->execCxt = NULL;
+ 	_SPI_current->connectSubid = GetCurrentSubTransactionId();
+ 	_SPI_current->queryEnv = NULL;
++
++	/*
++	 * Let extensions inject EphemeralNamedRelations into SPI's
++	 * QueryEnvironment. This enables TR extension to make backend-local
++	 * tuplestores visible to SPI-initiated parse/analyze (PL/pgSQL DO blocks,
++	 * function calls, etc.).
++	 */
++	if (tr_enrich_queryenv_hook)
++	{
++		_SPI_current->queryEnv = create_queryEnv();
++		tr_enrich_queryenv_hook(_SPI_current->queryEnv);
++	}
+ 	_SPI_current->atomic = (options & SPI_OPT_NONATOMIC ? false : true);
+ 	_SPI_current->internal_xact = false;
+ 	_SPI_current->outer_processed = SPI_processed;
+@@ -1660,6 +1674,21 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
+ 	 */
+ 
+ 	/* Replan if needed, and increment plan refcount for portal */
++
++	/*
++	 * Refresh queryEnv with current TR ENRs before GetCachedPlan.
++	 * For oneshot plans, GetCachedPlan calls pg_analyze_and_rewrite
++	 * internally with this queryEnv. TRs created since SPI_connect
++	 * (or since last EXECUTE) must be visible.
++	 */
++	if (tr_enrich_queryenv_hook)
++	{
++		MemoryContext oldcxt2 = MemoryContextSwitchTo(_SPI_current->procCxt);
++		_SPI_current->queryEnv = create_queryEnv();
++		tr_enrich_queryenv_hook(_SPI_current->queryEnv);
++		MemoryContextSwitchTo(oldcxt2);
++	}
++
+ 	cplan = GetCachedPlan(plansource, paramLI, NULL, _SPI_current->queryEnv);
+ 	stmt_list = cplan->stmt_list;
+ 
+@@ -2226,6 +2255,25 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
+ 	SPICallbackArg spicallbackarg;
+ 	ErrorContextCallback spierrcontext;
+ 
++	/*
++	 * Refresh _SPI_current->queryEnv with current TR ENRs.
++	 * TRs may have been created/dropped since SPI_connect.
++	 * Allocate in SPI's procCxt so it survives through execute phase.
++	 * The old queryEnv (if any) becomes garbage but won't be freed
++	 * until procCxt reset — safe because no portal holds it past
++	 * this prepare+execute cycle within a single EXECUTE statement.
++	 */
++	if (tr_enrich_queryenv_hook)
++	{
++		MemoryContext oldcxt = MemoryContextSwitchTo(_SPI_current->procCxt);
++		QueryEnvironment *freshEnv = create_queryEnv();
++		tr_enrich_queryenv_hook(freshEnv);
++		_SPI_current->queryEnv = freshEnv;
++		MemoryContextSwitchTo(oldcxt);
++	}
++
++	QueryEnvironment *localQueryEnv = _SPI_current->queryEnv;
++
+ 	/*
+ 	 * Setup error traceback support for ereport()
+ 	 */
+@@ -2272,7 +2320,7 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
+ 													  src,
+ 													  plan->parserSetup,
+ 													  plan->parserSetupArg,
+-													  _SPI_current->queryEnv);
++													  localQueryEnv);
+ 		}
+ 		else
+ 		{
+@@ -2280,7 +2328,7 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
+ 														   src,
+ 														   plan->argtypes,
+ 														   plan->nargs,
+-														   _SPI_current->queryEnv);
++														   localQueryEnv);
+ 		}
+ 
+ 		/* Finish filling in the CachedPlanSource */
+diff --git a/src/backend/tcop/postgres.c b/src/backend/tcop/postgres.c
+index 10be600..686d495 100644
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -79,6 +79,7 @@
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+ #include "utils/ps_status.h"
++#include "utils/queryenvironment.h"
+ #include "utils/snapmgr.h"
+ #include "utils/timeout.h"
+ #include "utils/timestamp.h"
+@@ -107,6 +108,9 @@ int			client_connection_check_interval = 0;
+ /* flags for non-system relation kinds to restrict use */
+ int			restrict_nonsystem_relation_kind;
+ 
++/* Hook for TR (transient relation) QueryEnvironment enrichment */
++tr_enrich_queryenv_hook_type tr_enrich_queryenv_hook = NULL;
++
+ /* ----------------
+  *		private typedefs etc
+  * ----------------
+@@ -1191,47 +1195,65 @@ exec_simple_query(const char *query_string)
+ 		else
+ 			oldcontext = MemoryContextSwitchTo(MessageContext);
+ 
+-		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
+-															NULL, 0, NULL);
+-
+-		plantree_list = pg_plan_queries(querytree_list, query_string,
+-										CURSOR_OPT_PARALLEL_OK, NULL);
+-
+ 		/*
+-		 * Done with the snapshot used for parsing/planning.
+-		 *
+-		 * While it looks promising to reuse the same snapshot for query
+-		 * execution (at least for simple protocol), unfortunately it causes
+-		 * execution to use a snapshot that has been acquired before locking
+-		 * any of the tables mentioned in the query.  This creates user-
+-		 * visible anomalies, so refrain.  Refer to
+-		 * https://postgr.es/m/flat/5075D8DF.6050500@fuzzy.cz for details.
++		 * Create QueryEnvironment and let extensions inject ENRs.
++		 * This enables TR extension to make backend-local named
++		 * tuplestores visible to the parser.
+ 		 */
+-		if (snapshot_set)
+-			PopActiveSnapshot();
++		{
++			QueryEnvironment *queryEnv = NULL;
+ 
+-		/* If we got a cancel signal in analysis or planning, quit */
+-		CHECK_FOR_INTERRUPTS();
++			if (tr_enrich_queryenv_hook)
++			{
++				queryEnv = create_queryEnv();
++				tr_enrich_queryenv_hook(queryEnv);
++			}
+ 
+-		/*
+-		 * Create unnamed portal to run the query or queries in. If there
+-		 * already is one, silently drop it.
+-		 */
+-		portal = CreatePortal("", true, true);
+-		/* Don't display the portal in pg_cursors */
+-		portal->visible = false;
++			querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
++																NULL, 0, queryEnv);
+ 
+-		/*
+-		 * We don't have to copy anything into the portal, because everything
+-		 * we are passing here is in MessageContext or the
+-		 * per_parsetree_context, and so will outlive the portal anyway.
+-		 */
+-		PortalDefineQuery(portal,
+-						  NULL,
+-						  query_string,
+-						  commandTag,
+-						  plantree_list,
+-						  NULL);
++			plantree_list = pg_plan_queries(querytree_list, query_string,
++											CURSOR_OPT_PARALLEL_OK, NULL);
++
++			/*
++			 * Done with the snapshot used for parsing/planning.
++			 *
++			 * While it looks promising to reuse the same snapshot for query
++			 * execution (at least for simple protocol), unfortunately it causes
++			 * execution to use a snapshot that has been acquired before locking
++			 * any of the tables mentioned in the query.  This creates user-
++			 * visible anomalies, so refrain.  Refer to
++			 * https://postgr.es/m/flat/5075D8DF.6050500@fuzzy.cz for details.
++			 */
++			if (snapshot_set)
++				PopActiveSnapshot();
++
++			/* If we got a cancel signal in analysis or planning, quit */
++			CHECK_FOR_INTERRUPTS();
++
++			/*
++			 * Create unnamed portal to run the query or queries in. If there
++			 * already is one, silently drop it.
++			 */
++			portal = CreatePortal("", true, true);
++			/* Don't display the portal in pg_cursors */
++			portal->visible = false;
++
++			/* Pass QueryEnvironment with injected ENRs to portal */
++			portal->queryEnv = queryEnv;
++
++			/*
++			 * We don't have to copy anything into the portal, because everything
++			 * we are passing here is in MessageContext or the
++			 * per_parsetree_context, and so will outlive the portal anyway.
++			 */
++			PortalDefineQuery(portal,
++							  NULL,
++							  query_string,
++							  commandTag,
++							  plantree_list,
++							  NULL);
++		}
+ 
+ 		/*
+ 		 * Start the portal.  No parameters here.
+@@ -1520,11 +1542,21 @@ exec_parse_message(const char *query_string,	/* string to execute */
+ 		 * parameter set is not required to be complete, so we have to use
+ 		 * pg_analyze_and_rewrite_varparams().
+ 		 */
+-		querytree_list = pg_analyze_and_rewrite_varparams(raw_parse_tree,
+-														  query_string,
+-														  &paramTypes,
+-														  &numParams,
+-														  NULL);
++		{
++			QueryEnvironment *queryEnv = NULL;
++
++			if (tr_enrich_queryenv_hook)
++			{
++				queryEnv = create_queryEnv();
++				tr_enrich_queryenv_hook(queryEnv);
++			}
++
++			querytree_list = pg_analyze_and_rewrite_varparams(raw_parse_tree,
++															  query_string,
++															  &paramTypes,
++															  &numParams,
++															  queryEnv);
++		}
+ 
+ 		/* Done with the snapshot used for parsing */
+ 		if (snapshot_set)
+diff --git a/src/include/tcop/tcopprot.h b/src/include/tcop/tcopprot.h
+index 5bc5bcf..e7bd816 100644
+--- a/src/include/tcop/tcopprot.h
++++ b/src/include/tcop/tcopprot.h
+@@ -93,4 +93,11 @@ extern bool set_plan_disabling_options(const char *arg,
+ 									   GucContext context, GucSource source);
+ extern const char *get_stats_option_name(const char *arg);
+ 
++/*
++ * Hook for injecting EphemeralNamedRelations into QueryEnvironment
++ * before parse analysis. Called in exec_simple_query and exec_parse_message.
++ */
++typedef void (*tr_enrich_queryenv_hook_type)(QueryEnvironment *queryEnv);
++extern PGDLLIMPORT tr_enrich_queryenv_hook_type tr_enrich_queryenv_hook;
++
+ #endif							/* TCOPPROT_H */

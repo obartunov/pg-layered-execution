@@ -1,0 +1,217 @@
+From: PostgreSQL HTAP lab <noreply@example.invalid>
+Subject: [PATCH 1/2] executor: add an optional slot-batch transport API
+
+Adds ExecProcNodeBatch() alongside the existing tuple-at-a-time entry point.
+The fallback fills a caller-owned array of TupleTableSlots by repeatedly
+calling ExecProcNode(); providers may install a batch callback in BatchState.
+
+This patch is required by the xp_batch experimental extension.
+
+diff --git a/src/backend/executor/Makefile b/src/backend/executor/Makefile
+index 11118d0..3e72f3f 100644
+--- a/src/backend/executor/Makefile
++++ b/src/backend/executor/Makefile
+@@ -15,6 +15,7 @@ include $(top_builddir)/src/Makefile.global
+ OBJS = \
+ 	execAmi.o \
+ 	execAsync.o \
++	execBatch.o \
+ 	execCurrent.o \
+ 	execExpr.o \
+ 	execExprInterp.o \
+diff --git a/src/backend/executor/meson.build b/src/backend/executor/meson.build
+index dc45be0..e5af90e 100644
+--- a/src/backend/executor/meson.build
++++ b/src/backend/executor/meson.build
+@@ -3,6 +3,7 @@
+ backend_sources += files(
+   'execAmi.c',
+   'execAsync.c',
++  'execBatch.c',
+   'execCurrent.c',
+   'execExpr.c',
+   'execExprInterp.c',
+diff --git a/src/include/executor/execBatch.h b/src/include/executor/execBatch.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/include/executor/execBatch.h
+@@ -0,0 +1,61 @@
++/*-------------------------------------------------------------------------
++ * execBatch.h
++ *    Batch execution protocol for PostgreSQL.
++ *
++ * BatchState provides a pre-allocated array of TupleTableSlots for
++ * batch-mode data transport between executor nodes.
++ *
++ * The protocol:
++ *   1. Consumer calls ExecProcNodeBatch(planstate, &batch)
++ *   2. ExecProcNodeBatch invokes batch.method(planstate, &batch)
++ *   3. Producer fills batch.slots[0..nslots-1], sets batch.done when exhausted
++ *   4. Consumer iterates batch.slots
++ *
++ * Copyright (c) 2025-2026, PostgreSQL Global Development Group
++ *-------------------------------------------------------------------------
++ */
++#ifndef EXECBATCH_H
++#define EXECBATCH_H
++
++#include "executor/tuptable.h"
++#include "nodes/execnodes.h"
++#include "utils/memutils.h"
++
++struct PlanState;
++struct BatchState;
++
++/* Batch method callback type */
++typedef void (*BatchMethodFunction)(struct PlanState *pstate,
++                                    struct BatchState *batch);
++
++/*
++ * BatchState — pre-allocated batch buffer
++ *
++ * slots:    array of capacity TupleTableSlots (TTSOpsVirtual)
++ * nslots:   number of valid slots after last fill (0..capacity)
++ * done:     true when producer has no more tuples
++ * capacity: max slots per batch
++ * method:   producer callback (NULL = not wired)
++ */
++typedef struct BatchState
++{
++    TupleTableSlot **slots;
++    int              nslots;
++    bool             done;
++    int              capacity;
++    BatchMethodFunction method;
++} BatchState;
++
++/* Initialize BatchState with pre-allocated Virtual slots */
++extern void ExecBatchStateInit(BatchState *batch,
++                               MemoryContext mcxt,
++                               TupleDesc tupdesc,
++                               int capacity);
++
++/* Release batch slots */
++extern void ExecBatchStateRelease(BatchState *batch);
++
++/* Drive batch execution: calls batch->method if wired */
++extern void ExecProcNodeBatch(struct PlanState *pstate, BatchState *batch);
++
++#endif /* EXECBATCH_H */
+diff --git a/src/backend/executor/execBatch.c b/src/backend/executor/execBatch.c
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/src/backend/executor/execBatch.c
+@@ -0,0 +1,111 @@
++/*-------------------------------------------------------------------------
++ * execBatch.c
++ *    Batch execution protocol implementation.
++ *
++ * Copyright (c) 2025-2026, PostgreSQL Global Development Group
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include "executor/execBatch.h"
++#include "executor/executor.h"
++#include "executor/tuptable.h"
++#include "nodes/execnodes.h"
++#include "utils/memutils.h"
++
++/*
++ * ExecBatchStateInit
++ *    Allocate and initialize batch buffer with Virtual slots.
++ */
++void
++ExecBatchStateInit(BatchState *batch, MemoryContext mcxt,
++                   TupleDesc tupdesc, int capacity)
++{
++    MemoryContext oldcxt;
++    int i;
++
++    Assert(capacity > 0);
++
++    oldcxt = MemoryContextSwitchTo(mcxt);
++
++    batch->slots = palloc(sizeof(TupleTableSlot *) * capacity);
++    for (i = 0; i < capacity; i++)
++    {
++        batch->slots[i] = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
++    }
++
++    batch->capacity = capacity;
++    batch->nslots = 0;
++    batch->done = false;
++    batch->method = NULL;
++
++    MemoryContextSwitchTo(oldcxt);
++}
++
++/*
++ * ExecBatchStateRelease
++ *    Release all slots in the batch.
++ */
++void
++ExecBatchStateRelease(BatchState *batch)
++{
++    int i;
++
++    if (batch->slots)
++    {
++        for (i = 0; i < batch->capacity; i++)
++        {
++            if (batch->slots[i])
++                ExecDropSingleTupleTableSlot(batch->slots[i]);
++        }
++        pfree(batch->slots);
++        batch->slots = NULL;
++    }
++    batch->capacity = 0;
++    batch->nslots = 0;
++    batch->done = false;
++    batch->method = NULL;
++}
++
++/*
++ * ExecProcNodeBatch
++ *    Drive batch execution by calling the registered batch method.
++ *
++ *    If no batch method is wired, falls back to tuple-at-a-time:
++ *    calls ExecProcNode in a loop to fill the batch.
++ */
++void
++ExecProcNodeBatch(PlanState *pstate, BatchState *batch)
++{
++    if (batch->method != NULL)
++    {
++        batch->method(pstate, batch);
++        return;
++    }
++
++    /*
++     * Fallback: tuple-at-a-time loop.
++     * Fill batch by calling ExecProcNode repeatedly.
++     */
++    {
++        int n = 0;
++
++        batch->nslots = 0;
++        batch->done = false;
++
++        while (n < batch->capacity)
++        {
++            TupleTableSlot *slot = ExecProcNode(pstate);
++
++            if (TupIsNull(slot))
++            {
++                batch->done = true;
++                break;
++            }
++
++            ExecCopySlot(batch->slots[n], slot);
++            n++;
++        }
++        batch->nslots = n;
++    }
++}

@@ -1,0 +1,36 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get install -y bison flex libreadline-dev zlib1g-dev
+
+      - name: Build PostgreSQL
+        run: |
+          git clone --depth 100 https://github.com/postgres/postgres.git /tmp/pg
+          cd /tmp/pg && git checkout 5713b43
+          git apply $GITHUB_WORKSPACE/patches/required/0001-executor-batch-api.patch
+          ./configure --prefix=$HOME/pginstall --enable-debug --enable-cassert --without-icu --without-readline
+          make -j$(nproc) && make install
+
+      - name: Build extension
+        run: |
+          cd extension/xp_batch
+          make PG_CONFIG=$HOME/pginstall/bin/pg_config
+          make install PG_CONFIG=$HOME/pginstall/bin/pg_config
+
+      - name: Init cluster
+        run: |
+          export PATH=$HOME/pginstall/bin:$PATH
+          initdb -D /tmp/pgdata --no-locale
+          pg_ctl -D /tmp/pgdata start -l /tmp/pg.log
+          createdb testdb
+
+      - name: Smoke tests
+        run: |
+          export PATH=$HOME/pginstall/bin:$PATH
+          scripts/run-smoke-tests.sh

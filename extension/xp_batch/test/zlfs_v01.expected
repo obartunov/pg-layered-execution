@@ -1,0 +1,139 @@
+LOAD
+SET
+ zlfs_drop_zone 
+----------------
+ 
+(1 row)
+
+ zlfs_drop_zone 
+----------------
+ 
+(1 row)
+
+ groups |    total    | heap_path_slow 
+--------+-------------+----------------
+    600 | 50000501100 | t
+(1 row)
+
+ zlfs_build_zone 
+-----------------
+ VALID
+(1 row)
+
+ period_lo | period_hi |  nrows  | freshness | file_pattern_ok 
+-----------+-----------+---------+-----------+-----------------
+        25 |        36 | 1000008 | VALID     | t
+(1 row)
+
+ groups |    total    | zlfs_path_fast 
+--------+-------------+----------------
+    600 | 50000501100 | t
+(1 row)
+
+ matching_groups | zlfs_groups | heap_groups 
+-----------------+-------------+-------------
+             600 |         600 |         600
+(1 row)
+
+ zlfs_invalidate_zone 
+----------------------
+ STALE
+(1 row)
+
+ freshness 
+-----------
+ STALE
+(1 row)
+
+ groups |    total    | fallback_slow 
+--------+-------------+---------------
+    600 | 50000501100 | t
+(1 row)
+
+ zlfs_build_zone 
+-----------------
+ VALID
+(1 row)
+
+ freshness 
+-----------
+ VALID
+(1 row)
+
+ groups |    total    
+--------+-------------
+    600 | 50000501100
+(1 row)
+
+ groups | uncovered_uses_heap 
+--------+---------------------
+   6000 | t
+(1 row)
+
+ zlfs_build_zone 
+-----------------
+ VALID
+(1 row)
+
+ zone_count 
+------------
+          2
+(1 row)
+
+ groups |    total    
+--------+-------------
+    600 | 50000500204
+(1 row)
+
+ zlfs_drop_zone 
+----------------
+ 
+(1 row)
+
+ zone_count 
+------------
+          1
+(1 row)
+
+SET
+SET
+SET
+SET
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Custom Scan (XpGroupAgg2) (actual rows=600.00 loops=1)
+   Pushed Pred: col1 >= 25
+   Pushed Pred: col1 <= 36
+   GroupAgg Path: ZLFS zone scan (columnar)
+   ...
+   Groups: 600
+   Zone Rows Scanned: 1000008
+   ...
+
+ zlfs_invalidate_zone 
+----------------------
+ STALE
+(1 row)
+
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Custom Scan (XpGroupAgg2) (actual rows=600.00 loops=1)
+   Pushed Pred: col1 >= 25
+   Pushed Pred: col1 <= 36
+   GroupAgg Path: HashAgg+Sort (composite, no stream order)
+   ...
+   Pages Rejected (page pruning): 66177
+   Pages Scanned: 7354
+   Tuples Visited: 1000008
+   ...
+
+ zlfs_drop_zone 
+----------------
+ 
+(1 row)
+
+ remaining_zones 
+-----------------
+               0
+(1 row)
+

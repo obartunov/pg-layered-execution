@@ -1,0 +1,4 @@
+comment = 'Batch execution provider for aggregation queries'
+default_version = '1.0'
+module_pathname = '$libdir/xp_batch'
+relocatable = true

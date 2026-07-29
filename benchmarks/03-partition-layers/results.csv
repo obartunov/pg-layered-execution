@@ -1,0 +1,4 @@
+path,median_ms,runs,groups,rows,checksum
+mixed_zlfs_heap,30.5,5,400,2000016,cb03f8722641a06bb8bc2284a39ea7ee
+both_heap,44.5,5,400,2000016,cb03f8722641a06bb8bc2284a39ea7ee
+pg_vanilla,690.5,3,400,2000016,cb03f8722641a06bb8bc2284a39ea7ee
