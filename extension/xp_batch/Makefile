@@ -12,7 +12,8 @@ OBJS = src/xp_batch.o src/xpb_groupagg2.o src/xpb_pageagg.o \
        src/xpb_batch_hashjoin.o \
        src/xpb_batch_partition.o \
        src/xpb_contract_probe.o \
-       src/xpb_typed_pipeline.o
+       src/xpb_typed_pipeline.o \
+       src/xpb_v2_report.o
 
 EXTENSION = xp_batch
 DATA = sql/xp_batch--1.0.sql

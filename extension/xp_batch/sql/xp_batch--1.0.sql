@@ -101,3 +101,14 @@ CREATE OR REPLACE FUNCTION xpb_typed_report(
 RETURNS TABLE(gkey text, nrows bigint, sums text[])
 LANGUAGE C
 AS '$libdir/xp_batch', 'xpb_typed_report';
+
+-- Benchmark 05-A register report on the Typed Batch v2 row shape: two joins,
+-- three aggregates, int8 money, period predicate. The heap arm runs on the
+-- generic deform path because the row has a varlena at attnum 2 -- its source
+-- timing is not comparable with benchmark 04's fixed-offset source.
+CREATE OR REPLACE FUNCTION xpb_v2_register_report(lo int, hi int, source_mode text)
+RETURNS TABLE(company_group int, account_group int, company_key int,
+              debit_turnover bigint, credit_turnover bigint,
+              net_turnover bigint, total_ms float8)
+LANGUAGE C STRICT
+AS '$libdir/xp_batch', 'xpb_v2_register_report';
