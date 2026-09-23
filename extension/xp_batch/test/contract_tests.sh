@@ -371,6 +371,62 @@ else
 fi
 
 echo
+echo "=== the whole row shape, end to end ==="
+
+# Everything at once, on the layout that used to corrupt: the varlena sits at
+# attnum 2, so every column that matters is read from AFTER it. int8 keys past
+# 2^31, a nullable int8 group key, nullable numeric sums, a dimension with a
+# NULL key and a NULL payload, and fact rows whose key is absent from it.
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE a_reg (
+    period      int4 NOT NULL,          -- 1
+    comment     text,                   -- 2  varlena, NULL, never requested
+    company_key int4 NOT NULL,          -- 3
+    account_key int8 NOT NULL,          -- 4
+    quantity    int8,                   -- 5  NULL
+    debit       numeric(18,2),          -- 6  NULL
+    credit      numeric(18,2) NOT NULL  -- 7
+);
+INSERT INTO a_reg
+SELECT  g % 12 + 1,
+        CASE WHEN g % 4 = 0 THEN NULL WHEN g % 4 = 1 THEN '' ELSE repeat('c', g % 30) END,
+        g % 5 + 1,
+        (g % 7)::int8 * 3000000000,
+        CASE WHEN g % 9 = 0 THEN NULL ELSE (g % 11)::int8 * 1000000000 END,
+        CASE WHEN g % 6 = 0 THEN NULL ELSE ((g % 977) / 100.0)::numeric(18,2) END,
+        ((g % 383) / 100.0)::numeric(18,2)
+FROM generate_series(1, 20000) g;
+
+CREATE TABLE a_dim (k int4, payload int4);
+INSERT INTO a_dim VALUES (1, 100), (2, 200), (3, NULL), (NULL, 999);
+SQL
+"${PSQL[@]}" -c "SELECT zlfs_build_zone('a_reg', '1,4,5,3', 1, 12)" >/dev/null 2>&1
+
+compare_sql "join + int8 keys + NULL keys + numeric sums, past a varlena" \
+"SELECT md5(string_agg(gkey||':'||nrows||':'||coalesce(sums[1],'N')||':'||coalesce(sums[2],'N'),
+                       ',' ORDER BY gkey)) || ' groups=' || count(*)
+ FROM xpb_typed_report('a_reg', ARRAY[4,5], ARRAY[6,7], 'a_dim', 3, 'deform')" \
+"SELECT md5(string_agg(gkey||':'||nrows||':'||coalesce(d,'N')||':'||coalesce(c,'N'),
+                       ',' ORDER BY gkey)) || ' groups=' || count(*)
+ FROM (SELECT coalesce(d.payload::text,'\\N')||'|'||r.account_key||'|'
+              ||coalesce(r.quantity::text,'\\N') AS gkey,
+              count(*) AS nrows, sum(r.debit)::text AS d, sum(r.credit)::text AS c
+       FROM a_reg r JOIN a_dim d ON d.k = r.company_key
+       GROUP BY d.payload, r.account_key, r.quantity) s"
+
+# The same pipeline from a zone. Integer columns only -- a zone carries no
+# numeric -- which is a stated limitation, not a silent omission.
+compare_sql "same pipeline served from a ZLFS zone" \
+"SELECT md5(string_agg(gkey||':'||nrows||':'||coalesce(sums[1],'N'), ',' ORDER BY gkey))
+        || ' groups=' || count(*)
+ FROM xpb_typed_report('a_reg', ARRAY[4,5], ARRAY[5], NULL, NULL, 'zlfs')" \
+"SELECT md5(string_agg(gkey||':'||nrows||':'||coalesce(q,'N'), ',' ORDER BY gkey))
+        || ' groups=' || count(*)
+ FROM (SELECT account_key||'|'||coalesce(quantity::text,'\\N') AS gkey,
+              count(*) AS nrows, sum(quantity)::text AS q
+       FROM a_reg GROUP BY account_key, quantity) s"
+
+echo
 if [ $fail -eq 0 ]; then
     echo "contract_tests: ALL PASS ($pass_count cases)"
 else
