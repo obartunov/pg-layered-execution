@@ -6,11 +6,17 @@
 #
 # Assumes benchmarks/common/load.sh has run against the same database.
 #
-# Three paths over the same rows:
+# Five paths over the same rows:
 #
-#   vanilla    plain SQL over the heap table (the PostgreSQL executor)
-#   xpb_heap   xp_batch pipeline, heap source
-#   xpb_zlfs   xp_batch pipeline, ZLFS source
+#   vanilla            plain SQL over the heap table          (PostgreSQL executor)
+#   native_columnar    plain SQL over the columnar table      (pgcolumnar custom scan)
+#   xpb_heap           xp_batch pipeline, heap source
+#   xpb_zlfs           xp_batch pipeline, ZLFS source
+#   xpb_pgcolumnar     xp_batch pipeline, pgcolumnar fold source
+#
+# native_columnar is not optional padding: without it the comparison only shows
+# that a batch pipeline beats the row executor, not whether reading through the
+# fold API beats the columnar engine's own scan.
 #
 # The correctness gate runs first. Timings are taken only once it passes, and
 # only from warm runs.
@@ -24,6 +30,9 @@ HI=36
 
 PSQL=(psql -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -X -qAt)
 [ -n "$PGHOST_ARG" ] && PSQL+=(-h "$PGHOST_ARG")
+
+HAVE_COL=$("${PSQL[@]}" -c "SELECT to_regclass('reg_buh_col') IS NOT NULL")
+[ "$HAVE_COL" = "t" ] || echo "!! reg_buh_col absent: columnar paths skipped"
 
 # total_ms is a timing column and must stay out of the checksum, or no two runs
 # of the same path can ever compare equal.
@@ -62,6 +71,18 @@ FROM xpb_batch_join2_groupby($LO, $HI, 'zlfs');
 INSERT INTO ck SELECT 'xpb_zlfs_again', $CK, count(*), 6
 FROM xpb_batch_join2_groupby($LO, $HI, 'zlfs');
 SQL
+if [ "$HAVE_COL" = "t" ]; then
+cat <<SQL
+INSERT INTO ck SELECT 'native_columnar', $CK, count(*), 2
+FROM ($(printf "$SQL_BODY" reg_buh_col)) s;
+
+INSERT INTO ck SELECT 'xpb_pgcolumnar', $CK, count(*), 5
+FROM xpb_batch_join2_groupby($LO, $HI, 'pgcolumnar');
+
+INSERT INTO ck SELECT 'xpb_pgcolumnar_again', $CK, count(*), 7
+FROM xpb_batch_join2_groupby($LO, $HI, 'pgcolumnar');
+SQL
+fi
 cat <<'SQL'
 SELECT rpad(path, 22) || ck || '  groups=' || groups FROM ck ORDER BY ord;
 DO $$
@@ -78,7 +99,8 @@ SQL
 
 echo "=== EXPLAIN: each SQL path takes the plan it is named for ==="
 # same GUCs as the timed runs, or the plan shown is not the plan measured
-for tbl in reg_buh; do
+for tbl in reg_buh reg_buh_col; do
+    [ "$tbl" = "reg_buh_col" ] && [ "$HAVE_COL" != "t" ] && continue
     echo "-- $tbl"
     "${PSQL[@]}" <<SQL | grep -E "Scan|Aggregate|Join" | head -6
 SET max_parallel_workers_per_gather = 0;
@@ -88,7 +110,9 @@ SQL
 done
 
 echo "=== 5 warm runs per xp_batch path ==="
-for mode in heap zlfs; do
+MODES="heap zlfs"
+[ "$HAVE_COL" = "t" ] && MODES="$MODES pgcolumnar"
+for mode in $MODES; do
     for i in 1 2 3 4 5; do
         "${PSQL[@]}" -c "SET max_parallel_workers_per_gather=0; SET jit=off;
                          SELECT count(*) FROM xpb_batch_join2_groupby($LO,$HI,'$mode')" 2>&1 >/dev/null \
@@ -97,7 +121,8 @@ for mode in heap zlfs; do
 done
 
 echo "=== 5 warm runs per SQL path ==="
-for tbl in reg_buh; do
+for tbl in reg_buh reg_buh_col; do
+    [ "$tbl" = "reg_buh_col" ] && [ "$HAVE_COL" != "t" ] && continue
     echo "-- $tbl"
     for i in 1 2 3 4 5; do
         "${PSQL[@]}" <<SQL | grep -i '^time'

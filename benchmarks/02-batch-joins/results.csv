@@ -1,4 +1,6 @@
 dataset,path,median_total_ms,source_ms,join1_ms,join2_ms,agg_ms,runs,groups,checksum
 reconstructed-v1,vanilla,873.4,,,,,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,native_columnar,568.8,,,,,5,200,09e54f9a0108ff447c05f2cf63ca63da
 reconstructed-v1,xpb_heap,216.2,207.1,3.0,2.9,3.3,5,200,09e54f9a0108ff447c05f2cf63ca63da
 reconstructed-v1,xpb_zlfs,8.9,0.0,2.8,2.7,3.3,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,xpb_pgcolumnar,46.0,37.2,2.9,2.7,3.4,5,200,09e54f9a0108ff447c05f2cf63ca63da

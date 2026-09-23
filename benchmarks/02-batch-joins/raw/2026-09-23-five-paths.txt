@@ -1,0 +1,54 @@
+=== setup: ZLFS zone [25..36] ===
+=== correctness gate ===
+vanilla               09e54f9a0108ff447c05f2cf63ca63da  groups=200
+native_columnar       09e54f9a0108ff447c05f2cf63ca63da  groups=200
+xpb_heap              09e54f9a0108ff447c05f2cf63ca63da  groups=200
+xpb_zlfs              09e54f9a0108ff447c05f2cf63ca63da  groups=200
+xpb_pgcolumnar        09e54f9a0108ff447c05f2cf63ca63da  groups=200
+xpb_zlfs_again        09e54f9a0108ff447c05f2cf63ca63da  groups=200
+xpb_pgcolumnar_again  09e54f9a0108ff447c05f2cf63ca63da  groups=200
+NOTICE:  gate PASS
+=== EXPLAIN: each SQL path takes the plan it is named for ===
+-- reg_buh
+Finalize HashAggregate
+  ->  Hash Join
+        ->  Partial HashAggregate
+              ->  Hash Join
+                    ->  Seq Scan on reg_buh r
+                          ->  Seq Scan on dim_period d
+-- reg_buh_col
+Finalize HashAggregate
+  ->  Hash Join
+        ->  Partial HashAggregate
+              ->  Custom Scan (Columnar Runtime Filter Coordinator)
+                    ->  Hash Join
+                          ->  Custom Scan (PgColumnarScan) on reg_buh_col r
+=== 5 warm runs per xp_batch path ===
+[25..36] mode=heap: total=203.1 ms  build=0.2 ms  source=194.0 ms  join1=2.9 ms  join2=2.8 ms  agg=3.4 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=heap: total=213.2 ms  build=0.3 ms  source=204.3 ms  join1=2.8 ms  join2=2.9 ms  agg=3.2 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=heap: total=216.2 ms  build=0.2 ms  source=207.2 ms  join1=3.0 ms  join2=2.7 ms  agg=3.3 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=heap: total=227.7 ms  build=0.2 ms  source=218.2 ms  join1=3.1 ms  join2=3.0 ms  agg=3.3 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=heap: total=216.7 ms  build=0.2 ms  source=207.1 ms  join1=3.0 ms  join2=2.9 ms  agg=3.6 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=zlfs: total=8.9 ms  build=0.2 ms  source=0.0 ms  join1=2.7 ms  join2=2.8 ms  agg=3.3 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=zlfs: total=8.9 ms  build=0.2 ms  source=0.0 ms  join1=2.8 ms  join2=2.6 ms  agg=3.4 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=zlfs: total=8.8 ms  build=0.2 ms  source=0.0 ms  join1=2.9 ms  join2=2.7 ms  agg=3.3 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=zlfs: total=8.7 ms  build=0.2 ms  source=0.0 ms  join1=2.8 ms  join2=2.6 ms  agg=3.3 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=zlfs: total=14.6 ms  build=0.2 ms  source=0.0 ms  join1=4.3 ms  join2=4.4 ms  agg=5.8 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+[25..36] mode=pgcolumnar: total=66.7 ms  build=0.3 ms  source=52.7 ms  join1=4.2 ms  join2=4.4 ms  agg=5.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  rowgroups=8 copied=2 copied_bytes=1600128
+[25..36] mode=pgcolumnar: total=102.3 ms  build=0.2 ms  source=93.5 ms  join1=2.8 ms  join2=2.7 ms  agg=3.2 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  rowgroups=8 copied=2 copied_bytes=1600128
+[25..36] mode=pgcolumnar: total=41.4 ms  build=0.2 ms  source=32.5 ms  join1=3.0 ms  join2=2.6 ms  agg=3.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  rowgroups=8 copied=2 copied_bytes=1600128
+[25..36] mode=pgcolumnar: total=45.9 ms  build=0.2 ms  source=36.0 ms  join1=2.9 ms  join2=3.1 ms  agg=3.9 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  rowgroups=8 copied=2 copied_bytes=1600128
+[25..36] mode=pgcolumnar: total=46.0 ms  build=0.2 ms  source=37.2 ms  join1=2.8 ms  join2=2.7 ms  agg=3.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  rowgroups=8 copied=2 copied_bytes=1600128
+=== 5 warm runs per SQL path ===
+-- reg_buh
+Time: 873.369 ms
+Time: 947.834 ms
+Time: 880.319 ms
+Time: 817.828 ms
+Time: 870.977 ms
+-- reg_buh_col
+Time: 565.634 ms
+Time: 582.580 ms
+Time: 570.197 ms
+Time: 558.830 ms
+Time: 568.799 ms
