@@ -65,6 +65,9 @@
 #include "xpb_zlfs.h"
 
 extern XpBatchSource *xpb_zlfs_source_create(ZlfsZone *zone, int16 *attnos, int ncols);
+extern XpBatchSource *xpcn_source_create(Oid relid, int16 *requested_attnos,
+                                         int ncols, bool has_pred,
+                                         int32 pred_lo, int32 pred_hi);
 
 PG_FUNCTION_INFO_V1(xpb_typed_report);
 
@@ -427,10 +430,10 @@ xpb_typed_report(PG_FUNCTION_ARGS)
     pstr = text_to_cstring(PG_GETARG_TEXT_PP(5));
     path = (strcmp(pstr, "fixed") == 0) ? XPB_HEAP_FIXED : XPB_HEAP_DEFORM;
     if (strcmp(pstr, "fixed") != 0 && strcmp(pstr, "deform") != 0 &&
-        strcmp(pstr, "zlfs") != 0)
+        strcmp(pstr, "zlfs") != 0 && strcmp(pstr, "pgcolumnar") != 0)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("xpb_typed_report: path must be 'fixed', 'deform' or 'zlfs', got \"%s\"",
+                 errmsg("xpb_typed_report: path must be 'fixed', 'deform', 'zlfs' or 'pgcolumnar', got \"%s\"",
                         pstr)));
 
     /*
@@ -499,6 +502,8 @@ xpb_typed_report(PG_FUNCTION_ARGS)
                      errhint("Build one with zlfs_build_zone() first.")));
         src = xpb_zlfs_source_create(zone, attnos, ncols);
     }
+    else if (strcmp(pstr, "pgcolumnar") == 0)
+        src = xpcn_source_create(fact_relid, attnos, ncols, false, 0, 0);
     else
         src = xpb_heap_source_create_ex(fact_relid, attnos, ncols, path,
                                         false, 0, 0);

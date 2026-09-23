@@ -67,6 +67,18 @@ extern bool PgColumnarReadFoldColumn(PgColumnarReadState *readState, int attidx,
                                      const char **validity, const char **packed,
                                      int16 *attlen, const uint32 **vecRawLen);
 
+/* Defined here, used from the pipelines; declared so the definitions are
+ * checked against a prototype. */
+extern XpBatchSource *xpcn_source_create(Oid relid, int16 *requested_attnos,
+                                         int ncols, bool has_pred,
+                                         int32 pred_lo, int32 pred_hi);
+extern void xpcn_source_stats(XpBatchSource *src, int64 *groups,
+                              int64 *groups_copied, int64 *rows,
+                              int64 *bytes_copied);
+extern void xpcn_source_pruning(XpBatchSource *src, int64 *groups_read,
+                                int64 *group_rows_seen,
+                                int64 *rows_vec_skipped, int64 *rows_emitted);
+
 /* ── source state ── */
 
 typedef struct XpcnBatchState
@@ -77,6 +89,8 @@ typedef struct XpcnBatchState
 
     int         ncols;
     int         attidx[XPCB_MAX_COLS];      /* 0-based attribute index */
+    XpbColType  coltype[XPCB_MAX_COLS];     /* int4 or int8 */
+    int16       colwidth[XPCB_MAX_COLS];    /* 4 or 8 bytes                */
 
     /*
      * Range predicate on the FIRST requested column, the same contract the
@@ -93,14 +107,24 @@ typedef struct XpcnBatchState
     int64       group_rows;                 /* rows in the loaded group */
     int64       cursor;                     /* next row of the group to emit */
     bool        borrowed;                   /* group served without a copy */
-    const int32 *bor[XPCB_MAX_COLS];        /* borrowed dense streams */
-    int32      *own[XPCB_MAX_COLS];         /* materialized streams */
+    const void *bor[XPCB_MAX_COLS];         /* borrowed dense streams */
+    void       *own[XPCB_MAX_COLS];         /* materialized streams */
+    uint8      *ownvalid[XPCB_MAX_COLS];    /* validity, when the group has NULLs */
+    bool        has_nulls[XPCB_MAX_COLS];   /* this group, this column */
     int64       own_cap;                    /* rows each own[] can hold */
 
-    /* accounting, so a borrow can be told from a copy in the report */
-    int64       groups_total;
-    int64       groups_copied;
-    int64       rows_total;
+    /*
+     * Accounting.  Only groups the fold reader HANDED US are counted: a group
+     * pgcolumnar eliminated on its zone maps never reaches this source, so
+     * groups_total is "row groups read", not "row groups in the relation".
+     * The total comes from pgcolumnar.row_group, and the difference is what
+     * pruning skipped.  Nothing here is derived from timings.
+     */
+    int64       groups_total;               /* row groups READ              */
+    int64       groups_copied;              /* of those, materialized       */
+    int64       group_rows_seen;            /* rows represented by them     */
+    int64       rows_vec_skipped;           /* rows in ruled-out vectors    */
+    int64       rows_total;                 /* rows emitted into batches    */
     int64       bytes_copied;
 } XpcnBatchState;
 
@@ -148,7 +172,10 @@ xpcn_load_group(XpcnBatchState *st)
 
     st->groups_total++;
     st->group_rows = (int64) nrows;
+    st->group_rows_seen += (int64) nrows;
     st->cursor = 0;
+    for (c = 0; c < st->ncols; c++)
+        st->has_nulls[c] = false;
 
     for (c = 0; c < st->ncols; c++)
     {
@@ -159,12 +186,12 @@ xpcn_load_group(XpcnBatchState *st)
                             st->attidx[c] + 1),
                      errdetail("A row group written before the column was added "
                                "has no stream for it.")));
-        if (attlen != sizeof(int32))
+        if (attlen != st->colwidth[c])
             ereport(ERROR,
-                    (errmsg("xp_batch: column %d has attlen %d, 4 required",
-                            st->attidx[c] + 1, attlen)));
-        if (((uintptr_t) packed[c] & (sizeof(int32) - 1)) != 0)
-            dense = false;      /* unaligned: copy rather than borrow */
+                    (errmsg("xp_batch: column %d has attlen %d, %d expected from its type",
+                            st->attidx[c] + 1, attlen, st->colwidth[c])));
+        if (((uintptr_t) packed[c] & (uintptr_t) (st->colwidth[c] - 1)) != 0)
+            dense = false;      /* unaligned for its width: copy, not borrow */
     }
 
     if (dmask != NULL)
@@ -206,7 +233,7 @@ xpcn_load_group(XpcnBatchState *st)
      */
     if (dense && st->has_pred)
     {
-        const int32 *k = (const int32 *) packed[0];
+        const int32 *k = (const int32 *) packed[0];    /* int4 by construction */
 
         for (r = 0; r < st->group_rows; r++)
             if (k[r] < st->pred_lo || k[r] > st->pred_hi)
@@ -220,7 +247,7 @@ xpcn_load_group(XpcnBatchState *st)
     {
         st->borrowed = true;
         for (c = 0; c < st->ncols; c++)
-            st->bor[c] = (const int32 *) packed[c];
+            st->bor[c] = (const void *) packed[c];
         st->rows_total += st->group_rows;
         return true;
     }
@@ -239,10 +266,16 @@ xpcn_load_group(XpcnBatchState *st)
         {
             if (st->own[c])
                 pfree(st->own[c]);
-            st->own[c] = palloc(st->group_rows * sizeof(int32));
+            st->own[c] = palloc(st->group_rows * st->colwidth[c]);
+            if (st->ownvalid[c])
+                pfree(st->ownvalid[c]);
+            st->ownvalid[c] = palloc(XPCB_VALIDITY_BYTES(st->group_rows));
         }
         st->own_cap = st->group_rows;
     }
+    /* start all-valid; the walk clears a bit when the group says NULL */
+    for (c = 0; c < st->ncols; c++)
+        memset(st->ownvalid[c], 0xFF, XPCB_VALIDITY_BYTES(st->group_rows));
 
     {
         int64   present[XPCB_MAX_COLS];
@@ -260,7 +293,10 @@ xpcn_load_group(XpcnBatchState *st)
                 while (curVec < vcount && r >= (int64) vecStart[curVec + 1])
                     curVec++;
                 if (curVec < vcount && skipVec[curVec])
+                {
                     skip = true;
+                    st->rows_vec_skipped++;
+                }
             }
             if (!skip && dmask != NULL && (uint32) (r >> 3) < dlen &&
                 (dmask[r >> 3] & (1 << (r & 7))) != 0)
@@ -273,19 +309,23 @@ xpcn_load_group(XpcnBatchState *st)
 
                 if (!present_here)
                 {
+                    /*
+                     * A NULL occupies no slot in the dense stream, so
+                     * present[c] must NOT advance here -- that is what keeps
+                     * the following values aligned.  The batch carries the
+                     * NULL in its validity bitmap; there is no sentinel.
+                     */
                     if (!skip)
-                        ereport(ERROR,
-                                (errmsg("xp_batch: NULL in column %d of a "
-                                        "pgcolumnar row group",
-                                        st->attidx[c] + 1),
-                                 errdetail("The compact batch has no null "
-                                           "representation.")));
+                    {
+                        st->ownvalid[c][out >> 3] &= ~(1 << (out & 7));
+                        st->has_nulls[c] = true;
+                    }
                     continue;
                 }
                 if (!skip)
-                    memcpy(&st->own[c][out],
-                           packed[c] + present[c] * sizeof(int32),
-                           sizeof(int32));
+                    memcpy((char *) st->own[c] + out * st->colwidth[c],
+                           packed[c] + present[c] * (size_t) st->colwidth[c],
+                           st->colwidth[c]);
                 present[c]++;
             }
 
@@ -299,9 +339,13 @@ xpcn_load_group(XpcnBatchState *st)
              */
             if (!skip && st->has_pred)
             {
-                int32   key = st->own[0][out];
+                int32   key = ((const int32 *) st->own[0])[out];
 
-                if (key < st->pred_lo || key > st->pred_hi)
+                /* A NULL key passes no range predicate.  The predicate column
+                 * is int4 NOT NULL by construction, so this is a guard, not a
+                 * path the benchmark exercises. */
+                if (((st->ownvalid[0][out >> 3] >> (out & 7)) & 1) == 0 ||
+                    key < st->pred_lo || key > st->pred_hi)
                     skip = true;
             }
 
@@ -311,7 +355,8 @@ xpcn_load_group(XpcnBatchState *st)
 
         st->group_rows = out;
         st->rows_total += out;
-        st->bytes_copied += out * (int64) st->ncols * (int64) sizeof(int32);
+        for (c = 0; c < st->ncols; c++)
+            st->bytes_copied += out * (int64) st->colwidth[c];
         st->groups_copied++;
     }
 
@@ -350,10 +395,33 @@ xpcn_next_batch(XpBatchSource *src, XpColumnBatch *batch)
      * borrows straight into the column, since both use bit-set-means-valid.
      */
     for (c = 0; c < st->ncols; c++)
-        xpcb_col_borrow(&batch->cols[c], XPB_COL_INT4,
-                        st->borrowed ? (int32 *) (st->bor[c] + st->cursor)
-                                     : st->own[c] + st->cursor,
-                        NULL);
+    {
+        void   *data;
+        uint8  *valid = NULL;
+
+        if (st->borrowed)
+        {
+            /* all-present by definition of the borrow test */
+            data = (char *) st->bor[c] + st->cursor * st->colwidth[c];
+        }
+        else
+        {
+            data = (char *) st->own[c] + st->cursor * st->colwidth[c];
+            if (st->has_nulls[c])
+            {
+                /*
+                 * The group's bitmap starts at row 0 of the group, and this
+                 * batch starts at st->cursor.  The chunking below advances
+                 * the cursor by batch->capacity, a multiple of 8, so the
+                 * byte offset is exact; a non-multiple would need the bits
+                 * restated, as the ZLFS source does.
+                 */
+                Assert((st->cursor & 7) == 0);
+                valid = st->ownvalid[c] + (st->cursor >> 3);
+            }
+        }
+        xpcb_col_borrow(&batch->cols[c], st->coltype[c], data, valid);
+    }
 
     st->cursor += chunk;
     return true;
@@ -418,15 +486,59 @@ xpcn_source_create(Oid relid, int16 *requested_attnos, int ncols,
 
     for (c = 0; c < ncols; c++)
     {
-        int attidx = requested_attnos[c] - 1;
+        int                 attidx = requested_attnos[c] - 1;
+        Form_pg_attribute   att;
 
         if (attidx < 0 || attidx >= RelationGetDescr(st->rel)->natts)
             ereport(ERROR, (errmsg("xp_batch: attno %d out of range (1..%d)",
                                    requested_attnos[c],
                                    RelationGetDescr(st->rel)->natts)));
+        att = TupleDescAttr(RelationGetDescr(st->rel), attidx);
+        if (att->attisdropped)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("xp_batch: \"%s\" attnum %d is a dropped column",
+                            RelationGetRelationName(st->rel), attidx + 1)));
+
+        /*
+         * Fixed-width integers only.  A numeric or varlena column reaches
+         * this source as a variable-width dense stream with its own offset
+         * table, which nothing here knows how to walk -- so it is refused by
+         * name rather than read as though it were fixed width.
+         */
+        switch (att->atttypid)
+        {
+            case INT4OID:
+                st->coltype[c] = XPB_COL_INT4;
+                st->colwidth[c] = sizeof(int32);
+                break;
+            case INT8OID:
+                st->coltype[c] = XPB_COL_INT8;
+                st->colwidth[c] = sizeof(int64);
+                break;
+            default:
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("xp_batch: pgcolumnar source cannot carry \"%s\".%s (type %u)",
+                                RelationGetRelationName(st->rel),
+                                NameStr(att->attname), att->atttypid),
+                         errdetail("This source carries int4 and int8.")));
+        }
+
         st->attidx[c] = attidx;
         proj = bms_add_member(proj, attidx);
     }
+
+    /*
+     * The range predicate is applied as an int4 comparison, both in the scan
+     * keys below and in the per-row recheck, so the first requested column
+     * has to be int4.
+     */
+    if (has_pred && st->coltype[0] != XPB_COL_INT4)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("xp_batch: pgcolumnar range predicate needs an int4 first column, got %s",
+                        xpcb_type_name(st->coltype[0]))));
 
     st->has_pred = has_pred;
     st->pred_lo = pred_lo;
@@ -469,4 +581,27 @@ xpcn_source_stats(XpBatchSource *src, int64 *groups, int64 *groups_copied,
     *groups_copied = st->groups_copied;
     *rows = st->rows_total;
     *bytes_copied = st->bytes_copied;
+}
+
+/*
+ * Pruning counters, for benchmark 05-A.
+ *
+ * groups_read is row groups the fold reader HANDED US.  A group pgcolumnar
+ * eliminated on its zone maps never arrives, so this is not the number of
+ * groups in the relation -- that comes from pgcolumnar.row_group, and the
+ * difference is what pruning skipped.  group_rows_seen is the rows those
+ * groups represent, which is what actually had to be decoded; rows_emitted is
+ * what survived the predicate.  Nothing here is inferred from a timing.
+ */
+void
+xpcn_source_pruning(XpBatchSource *src, int64 *groups_read,
+                    int64 *group_rows_seen, int64 *rows_vec_skipped,
+                    int64 *rows_emitted)
+{
+    XpcnBatchState *st = src->private_state;
+
+    *groups_read = st->groups_total;
+    *group_rows_seen = st->group_rows_seen;
+    *rows_vec_skipped = st->rows_vec_skipped;
+    *rows_emitted = st->rows_total;
 }

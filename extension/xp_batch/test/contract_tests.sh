@@ -371,6 +371,64 @@ else
 fi
 
 echo
+echo "=== pgColumnar source: int8 and validity ==="
+
+if "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS pgcolumnar" >/dev/null 2>&1; then
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+-- int8 past 2^31 so a source that truncated to int32 would collapse the
+-- groups together, and NULLs in both a key and a summed column
+CREATE TABLE p_f (k int4 NOT NULL, g int8, s int8, t int4);
+INSERT INTO p_f SELECT g,
+                       CASE WHEN g % 5 = 0 THEN NULL ELSE (g % 3)::int8 * 5000000000 END,
+                       CASE WHEN g % 7 = 0 THEN NULL ELSE g::int8 * 1000000 END,
+                       g % 4
+                FROM generate_series(1, 3000) g;
+CREATE TABLE p_c (LIKE p_f) USING pgcolumnar;
+INSERT INTO p_c SELECT * FROM p_f;
+SQL
+
+    P_PG="SELECT coalesce(g::text,'\\N') || ' ' || count(*) || ' ' || coalesce(sum(s)::text,'NULL')
+          FROM p_f GROUP BY g ORDER BY 1"
+    P_B="SELECT gkey || ' ' || nrows || ' ' || coalesce(sums[1],'NULL')
+         FROM xpb_typed_report('%s', ARRAY[2], ARRAY[3], NULL, NULL, '%s') ORDER BY gkey"
+
+    compare_sql "pgColumnar carries int8 keys and NULLs" \
+        "$(printf "$P_B" p_c pgcolumnar)" "$P_PG"
+    compare_sql "heap deform agrees on the same rows" \
+        "$(printf "$P_B" p_f deform)" "$P_PG"
+
+    # An all-NULL column through the columnar source: the dense stream is
+    # empty, so a walk that advanced its present counter on a NULL would run
+    # off the end of it.
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE p_allnull_f (k int4 NOT NULL, g int4, s int8);
+INSERT INTO p_allnull_f SELECT g, NULL, NULL FROM generate_series(1, 500) g;
+CREATE TABLE p_allnull_c (LIKE p_allnull_f) USING pgcolumnar;
+INSERT INTO p_allnull_c SELECT * FROM p_allnull_f;
+SQL
+    compare_sql "pgColumnar all-NULL column" \
+        "SELECT gkey || ' ' || nrows || ' ' || coalesce(sums[1],'NULL')
+         FROM xpb_typed_report('p_allnull_c', ARRAY[2], ARRAY[3], NULL, NULL, 'pgcolumnar')" \
+        "SELECT '\\N ' || count(*) || ' ' || coalesce(sum(s)::text,'NULL') FROM p_allnull_f"
+
+    # numeric must be refused by name, not read as if it were fixed width
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE p_num_c (k int4 NOT NULL, d numeric(18,2) NOT NULL) USING pgcolumnar;
+INSERT INTO p_num_c SELECT g, (g/100.0)::numeric(18,2) FROM generate_series(1,100) g;
+SQL
+    out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_typed_report('p_num_c', ARRAY[1], ARRAY[2], NULL, NULL, 'pgcolumnar')" 2>&1)
+    if grep -q "cannot carry" <<<"$out"; then
+        echo "  PASS  pgColumnar refuses numeric by name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  pgColumnar numeric not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        fail=1
+    fi
+else
+    echo "  SKIP  pgcolumnar extension not available"
+fi
+
+echo
 echo "=== the whole row shape, end to end ==="
 
 # Everything at once, on the layout that used to corrupt: the varlena sits at
