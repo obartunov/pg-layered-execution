@@ -112,3 +112,8 @@ RETURNS TABLE(company_group int, account_group int, company_key int,
               net_turnover bigint, total_ms float8)
 LANGUAGE C STRICT
 AS '$libdir/xp_batch', 'xpb_v2_register_report';
+
+-- Benchmark 05-B: the same report over two heap layouts holding identical
+-- rows, with the source path forced rather than auto-selected.
+-- source_mode: heap | bad[-deform|-fixed] | fixedlayout[-deform|-fixed]
+--            | pgcolumnar | zlfs

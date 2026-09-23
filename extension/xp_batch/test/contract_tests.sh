@@ -463,6 +463,64 @@ compare "int8 via the deform path, same rows" f_i8 "ARRAY[1,2,3]" deform \
 compare "fixed prefix, varlena after it" f_i8 "ARRAY[1,2]" fixed \
         "(0,a::text),(1,b::text)"
 
+echo
+echo "=== benchmark-only source-mode forcing ==="
+echo "    (proved by a counter the fixed path cannot increment, not by the flag)"
+
+if "${PSQL[@]}" -c "SELECT 1 FROM pg_proc WHERE proname='xpb_v2_register_report'" \
+        2>/dev/null | grep -q 1; then
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE reg2_fixed (period int4 NOT NULL, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL,
+    quantity int8, debit numeric(18,2), credit numeric(18,2) NOT NULL, comment text);
+CREATE TABLE reg2_bad (period int4 NOT NULL, comment text, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, quantity int8, debit numeric(18,2),
+    credit numeric(18,2) NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL);
+INSERT INTO reg2_fixed SELECT g % 12 + 1, g % 5 + 1, 4000000000 + g % 200,
+       g * 3, g * 2, NULL, NULL, 1.00, CASE WHEN g % 3 = 0 THEN NULL ELSE 'c' END
+FROM generate_series(1, 5000) g;
+INSERT INTO reg2_bad SELECT period, comment, company_key, account_key, quantity,
+       debit, credit, debit_cents, credit_cents FROM reg2_fixed;
+CREATE TABLE dim_company (company_key int4 NOT NULL, company_group int4 NOT NULL);
+INSERT INTO dim_company SELECT id, (id-1)/10+1 FROM generate_series(1,50) id;
+CREATE TABLE dim_account2 (account_key int8 NOT NULL, account_group int4 NOT NULL);
+INSERT INTO dim_account2 SELECT 4000000000+id, (id-1)/50+1 FROM generate_series(0,200) id;
+SQL
+
+    # DEFORM forced on a layout where FIXED is eligible must genuinely deform
+    d=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_v2_register_report(1,12,'fixedlayout-deform')" 2>&1 \
+        | sed -n 's/.*tuples_deformed=\([0-9]*\).*/\1/p')
+    f=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_v2_register_report(1,12,'fixedlayout-fixed')" 2>&1 \
+        | sed -n 's/.*tuples_deformed=\([0-9]*\).*/\1/p')
+    if [ "$d" = "5000" ] && [ "$f" = "0" ]; then
+        echo "  PASS  forced deform deforms (5000 tuples), forced fixed does not (0)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  mode forcing: deform counted '$d' (want 5000), fixed counted '$f' (want 0)"
+        fail=1
+    fi
+
+    # FIXED on an incompatible layout must error, naming the reason
+    out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_v2_register_report(1,12,'bad-fixed')" 2>&1)
+    if grep -q 'column "comment" is variable-width' <<<"$out"; then
+        echo "  PASS  forced fixed refuses an unaddressable layout, by reason"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  bad-fixed not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        fail=1
+    fi
+
+    # the two layouts must agree, which is what makes B-C meaningful
+    compare_sql "both layouts give the same report" \
+      "SELECT company_group||','||account_group||','||company_key||','||debit_turnover
+       FROM xpb_v2_register_report(1,12,'fixedlayout-fixed') ORDER BY 1" \
+      "SELECT company_group||','||account_group||','||company_key||','||debit_turnover
+       FROM xpb_v2_register_report(1,12,'bad-deform') ORDER BY 1"
+else
+    echo "  SKIP  xpb_v2_register_report not installed"
+fi
+
+echo
 echo "=== the whole row shape, end to end ==="
 
 # Everything at once, on the layout that used to corrupt: the varlena sits at

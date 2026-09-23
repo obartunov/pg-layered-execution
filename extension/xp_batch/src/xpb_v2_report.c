@@ -221,7 +221,14 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     Oid             fact_relid,
                     dim1_relid,
                     dim2_relid;
-    int16           attnos[V2_NCOLS] = {1, 3, 4, 8, 9};
+    /*
+     * The batch's column ORDER is the same for every layout --
+     * [period, company_key, account_key, debit_cents, credit_cents] -- so the
+     * pipeline below is identical.  Only which attnums carry them differs.
+     */
+    int16           attnos_bad[V2_NCOLS] = {1, 3, 4, 8, 9};
+    int16           attnos_fixed[V2_NCOLS] = {1, 2, 3, 4, 5};
+    int16          *attnos;
     XpBatchSource  *src;
     XpColumnBatch   batch;
     V2Dim1         *dim1;
@@ -234,6 +241,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     int64           rows_in = 0;
     int             nbatches = 0;
     bool            is_pgcn = (strcmp(mode, "pgcolumnar") == 0);
+    bool            is_heap = false;
     const char     *heap_path_used = "n/a";
     instr_time      t0, t1, tp, tn;
     double          build_ms = 0, open_ms = 0, source_ms = 0,
@@ -245,7 +253,21 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("xpb_v2_register_report: set-valued context required")));
 
-    fact_relid = RelnameGetRelid(is_pgcn ? "reg2_col" : "reg2");
+    /*
+     * 05-B compares two physical layouts holding identical rows, so the fact
+     * table is selectable.  reg2 remains the default, which is what 05-A
+     * measured.
+     */
+    if (is_pgcn)
+        fact_relid = RelnameGetRelid("reg2_col");
+    else if (strncmp(mode, "bad", 3) == 0)
+        fact_relid = RelnameGetRelid("reg2_bad");
+    else if (strncmp(mode, "fixedlayout", 11) == 0)
+        fact_relid = RelnameGetRelid("reg2_fixed");
+    else
+        fact_relid = RelnameGetRelid("reg2");
+
+    attnos = (strncmp(mode, "fixedlayout", 11) == 0) ? attnos_fixed : attnos_bad;
     dim1_relid = RelnameGetRelid("dim_company");
     dim2_relid = RelnameGetRelid("dim_account2");
     if (!OidIsValid(fact_relid) || !OidIsValid(dim1_relid) || !OidIsValid(dim2_relid))
@@ -325,19 +347,55 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     else
     {
         /*
-         * The v2 row shape has a varlena at attnum 2 and nullable columns, so
-         * the fixed-offset path cannot address it.  Ask which path the layout
-         * admits and record the answer rather than assuming one.
+         * Three heap modes.
+         *
+         * The mode is "<table>" or "<table>-<path>":
+         *
+         *   table    heap        reg2         (05-A's table)
+         *            bad         reg2_bad     varlena ahead of the projection
+         *            fixedlayout reg2_fixed   projection is a fixed prefix
+         *   path     (none)      whatever the layout admits, preferring fixed
+         *            -deform     force the generic path even where fixed is
+         *                        eligible.  Benchmark-only, and the whole
+         *                        point of 05-B: it makes deform and fixed
+         *                        comparable on ONE physical table.
+         *            -fixed      force the fixed path.  Errors on a layout
+         *                        that cannot support it -- never a silent
+         *                        downgrade.
+         *
+         * Nothing here changes production path selection: 'heap' behaves
+         * exactly as before, and the two forcing modes exist only for this
+         * measurement.
          */
-        char *why = NULL;
-        Relation rel = table_open(fact_relid, AccessShareLock);
-        bool can_fixed = xpb_heap_layout_supports_fixed(rel, attnos, V2_NCOLS, &why);
+        char       *why = NULL;
+        Relation    rel = table_open(fact_relid, AccessShareLock);
+        bool        can_fixed = xpb_heap_layout_supports_fixed(rel, attnos,
+                                                               V2_NCOLS, &why);
+        XpbHeapPath want;
 
         table_close(rel, AccessShareLock);
-        heap_path_used = can_fixed ? "XPB_HEAP_FIXED" : "deform";
-        src = xpb_heap_source_create_ex(fact_relid, attnos, V2_NCOLS,
-                                        can_fixed ? XPB_HEAP_FIXED : XPB_HEAP_DEFORM,
+
+        {
+            const char *dash = strrchr(mode, '-');
+
+            if (dash == NULL)
+                want = can_fixed ? XPB_HEAP_FIXED : XPB_HEAP_DEFORM;
+            else if (strcmp(dash, "-deform") == 0)
+                want = XPB_HEAP_DEFORM;
+            else if (strcmp(dash, "-fixed") == 0)
+                want = XPB_HEAP_FIXED;
+            else
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
+                                mode),
+                         errhint("<table>[-deform|-fixed], where table is heap, bad or fixedlayout; or pgcolumnar, or zlfs.")));
+        }
+
+        heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed" : "deform";
+        src = xpb_heap_source_create_ex(fact_relid, attnos, V2_NCOLS, want,
                                         true, lo, hi);
+        is_heap = true;
     }
 
     INSTR_TIME_SET_CURRENT(tn);
@@ -464,8 +522,18 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                              " rows_emitted=" INT64_FORMAT,
                              gr, grs, vskip, remit);
         }
-        else if (strcmp(mode, "heap") == 0)
-            appendStringInfo(&extra, "  heap_path=%s", heap_path_used);
+        else if (is_heap)
+        {
+            int64   td_, ad_;
+            int     ar_;
+            bool    isdef;
+
+            xpb_heap_source_deform_stats(src, &td_, &ad_, &ar_, &isdef);
+            appendStringInfo(&extra,
+                             "  heap_path=%s  tuples_deformed=" INT64_FORMAT
+                             " attrs_deformed=" INT64_FORMAT " attrs_requested=%d",
+                             heap_path_used, td_, ad_, ar_);
+        }
 
         elog(NOTICE,
              "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
