@@ -201,13 +201,78 @@ xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,
 
     /* Compute byte offsets from TupleDesc */
     TupleDesc td = RelationGetDescr(st->rel);
+
+    /*
+     * The offsets below are computed once and then applied to every tuple, so
+     * they are only valid for a layout in which each attribute sits at the same
+     * place in every tuple.  That holds only while every attribute up to the
+     * highest one we read is fixed-width and NOT NULL:
+     *
+     *   - a varlena (attlen = -1) has no fixed width, and the loop would add
+     *     -1 to the running offset;
+     *   - a NULL attribute occupies no storage, so one NULL anywhere before a
+     *     column we read shifts that column in that tuple only;
+     *   - a dropped column is NULL in every tuple written after the drop, so
+     *     it shifts the same way.
+     *
+     * None of these announce themselves.  Without this check the source
+     * silently returns values read from the wrong bytes -- with the right row
+     * count, the right group count, and an internally consistent result.  The
+     * caller's per-attnum type check cannot catch it: it asks about the
+     * attributes we read, and the ones that break the layout are the ones in
+     * between.  Verified by test/heap_layout_guard.sh.
+     *
+     * Attributes after the last one we read are unconstrained: they can shift
+     * freely without moving anything we address.  t_hoff is read per tuple, so
+     * the null bitmap's own effect on the data start is already handled.
+     */
+    int16 max_attno = 0;
     for (int i = 0; i < ncols; i++)
     {
         int16 attno = requested_attnos[i];
         if (attno < 1 || attno > td->natts)
-            ereport(ERROR, (errmsg("HeapBatchSource: attno %d out of range", attno)));
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("HeapBatchSource: attno %d out of range (1..%d) for \"%s\"",
+                            attno, td->natts, RelationGetRelationName(st->rel))));
+        if (attno > max_attno)
+            max_attno = attno;
+    }
 
+    for (int a = 0; a < max_attno; a++)
+    {
+        Form_pg_attribute att = TupleDescAttr(td, a);
+
+        if (att->attisdropped)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("HeapBatchSource: \"%s\" has a dropped column at attnum %d",
+                            RelationGetRelationName(st->rel), a + 1),
+                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
+                               max_attno)));
+        if (att->attlen <= 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("HeapBatchSource: \"%s\".%s is variable-width (attlen %d)",
+                            RelationGetRelationName(st->rel),
+                            NameStr(att->attname), att->attlen),
+                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
+                               max_attno)));
+        if (!att->attnotnull)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("HeapBatchSource: \"%s\".%s is nullable",
+                            RelationGetRelationName(st->rel),
+                            NameStr(att->attname)),
+                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
+                               max_attno)));
+    }
+
+    for (int i = 0; i < ncols; i++)
+    {
+        int16 attno = requested_attnos[i];
         int offset = 0;
+
         for (int a = 0; a < attno - 1; a++)
         {
             Form_pg_attribute prev = TupleDescAttr(td, a);
