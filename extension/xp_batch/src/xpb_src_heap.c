@@ -56,6 +56,7 @@
 typedef struct HeapColDef
 {
     int     offset;     /* byte offset from tuple data start */
+    int     width;      /* 4 or 8; the fixed path copies exactly this many */
 } HeapColDef;
 
 typedef struct HeapBatchState
@@ -93,6 +94,18 @@ typedef struct HeapBatchState
     int64           pages_scanned;
     int64           tuples_visited;
     int64           tuples_passed;
+
+    /*
+     * Deform accounting, observational and outside the row loop's inner work.
+     * heap_deform_tuple() deforms EVERY attribute of the tuple descriptor,
+     * not just the ones requested and not just up to the highest requested
+     * attnum -- so attrs_deformed grows with the width of the table rather
+     * than with the projection.  Counted so that can be stated from a
+     * measurement instead of from reading the source.
+     */
+    int64           tuples_deformed;
+    int64           attrs_deformed;
+    int             attrs_requested;
 } HeapBatchState;
 
 /* ── Type mapping ── */
@@ -134,12 +147,23 @@ xpb_heap_layout_supports_fixed(Relation rel, const int16 *attnos, int ncols,
                                 attnos[i], td->natts);
             return false;
         }
-        if (TupleDescAttr(td, attnos[i] - 1)->atttypid != INT4OID)
         {
-            if (why)
-                *why = psprintf("column \"%s\" is not int4",
-                                NameStr(TupleDescAttr(td, attnos[i] - 1)->attname));
-            return false;
+            Oid t = TupleDescAttr(td, attnos[i] - 1)->atttypid;
+
+            /*
+             * Fixed-offset extraction copies a fixed number of bytes from a
+             * computed offset, so it can serve any by-value fixed-width type
+             * the batch carries -- int4 and int8.  A numeric or varlena has
+             * no fixed width and is excluded by the prefix rule below in any
+             * case.
+             */
+            if (t != INT4OID && t != INT8OID)
+            {
+                if (why)
+                    *why = psprintf("column \"%s\" is not int4 or int8",
+                                    NameStr(TupleDescAttr(td, attnos[i] - 1)->attname));
+                return false;
+            }
         }
         if (attnos[i] > max_attno)
             max_attno = attnos[i];
@@ -268,6 +292,8 @@ xpb_heap_deform_next_batch(XpBatchSource *src, XpColumnBatch *batch)
         st->tuples_visited++;
 
         heap_deform_tuple(tup, td, st->dvalues, st->dnulls);
+        st->tuples_deformed++;
+        st->attrs_deformed += td->natts;
 
         /* Predicate on the first requested column */
         if (st->has_pred)
@@ -331,14 +357,16 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
     for (int c = 0; c < st->ncols; c++)
     {
         if (!batch->cols[c].data)
-            xpcb_col_alloc(&batch->cols[c], XPB_COL_INT4, batch->capacity, false);
+            xpcb_col_alloc(&batch->cols[c], st->coltypes[c], batch->capacity, false);
     }
 
     /* Type dispatch happens here, once per batch -- never in the row loop. */
-    int32 *out[XPCB_MAX_COLS];
+    void *out[XPCB_MAX_COLS];
 
     for (int c = 0; c < st->ncols; c++)
-        out[c] = xpcb_i32(batch, c);
+        out[c] = (st->coltypes[c] == XPB_COL_INT8)
+            ? (void *) xpcb_i64(batch, c)
+            : (void *) xpcb_i32(batch, c);
 
     int nrows = 0;
     int cap = batch->capacity;
@@ -388,9 +416,17 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 
             st->tuples_passed++;
 
-            /* Extract all columns */
+            /* Extract all columns.  One predictable branch per column on a
+             * width fixed at setup; no per-value dispatch. */
             for (int c = 0; c < st->ncols; c++)
-                out[c][nrows] = *(int32 *)(d + st->coldefs[c].offset);
+            {
+                const char *p = d + st->coldefs[c].offset;
+
+                if (st->coldefs[c].width == 8)
+                    ((int64 *) out[c])[nrows] = *(const int64 *) p;
+                else
+                    ((int32 *) out[c])[nrows] = *(const int32 *) p;
+            }
 
             nrows++;
         }
@@ -431,6 +467,8 @@ xpb_heap_rescan(XpBatchSource *src)
     st->pages_scanned = 0;
     st->tuples_visited = 0;
     st->tuples_passed = 0;
+    st->tuples_deformed = 0;
+    st->attrs_deformed = 0;
 
     if (st->path == XPB_HEAP_DEFORM)
     {
@@ -525,6 +563,7 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
                      errmsg("HeapBatchSource: \"%s\" attnum %d is a dropped column",
                             RelationGetRelationName(st->rel), attno)));
 
+        st->attrs_requested = ncols;
         st->attnos[i] = attno;
         st->coltypes[i] = xpb_heap_coltype_for(att->atttypid);
         if (st->coltypes[i] == XPB_COL_UNSET)
@@ -616,6 +655,7 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
         Form_pg_attribute attr = TupleDescAttr(td, attno - 1);
         offset = att_align_nominal(offset, attr->attalign);
         st->coldefs[i].offset = offset;
+        st->coldefs[i].width = attr->attlen;
     }
 
     st->has_pred = has_pred;
@@ -638,4 +678,23 @@ xpb_heap_source_stats(XpBatchSource *src, int64 *pages_rej, int64 *pages_scan,
     *pages_scan = st->pages_scanned;
     *tuples_vis = st->tuples_visited;
     *tuples_pass = st->tuples_passed;
+}
+
+/*
+ * Deform accounting.  tuples_deformed is zero on the fixed-offset path by
+ * construction -- it never calls heap_deform_tuple -- so a caller can prove
+ * from the outside which mechanism actually ran, rather than trusting the
+ * flag it passed in.
+ */
+void
+xpb_heap_source_deform_stats(XpBatchSource *src, int64 *tuples_deformed,
+                             int64 *attrs_deformed, int *attrs_requested,
+                             bool *is_deform_path)
+{
+    HeapBatchState *st = src->private_state;
+
+    *tuples_deformed = st->tuples_deformed;
+    *attrs_deformed = st->attrs_deformed;
+    *attrs_requested = st->attrs_requested;
+    *is_deform_path = (st->path == XPB_HEAP_DEFORM);
 }

@@ -54,6 +54,12 @@ extern XpBatchSource *xpb_heap_source_create(Oid relid, int16 *requested_attnos,
                                              int ncols, bool has_pred,
                                              int32 pred_lo, int32 pred_hi);
 
+extern void xpb_heap_source_deform_stats(XpBatchSource *src,
+                                         int64 *tuples_deformed,
+                                         int64 *attrs_deformed,
+                                         int *attrs_requested,
+                                         bool *is_deform_path);
+
 extern void xpb_heap_source_stats(XpBatchSource *src, int64 *pages_rej,
                                   int64 *pages_scan, int64 *tuples_vis,
                                   int64 *tuples_pass);

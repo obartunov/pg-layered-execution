@@ -103,6 +103,10 @@ INSERT INTO t_i8 VALUES
 
 CREATE TABLE t_mix (a int4 NOT NULL, b int8 NOT NULL, c int4 NOT NULL);
 INSERT INTO t_mix SELECT g, g::int8 * 4000000000, g * 7 FROM generate_series(1, 500) g;
+
+-- fixed-width prefix, but the requested column itself is variable-width
+CREATE TABLE n_fixed (a int4 NOT NULL, d numeric(18,2) NOT NULL);
+INSERT INTO n_fixed SELECT g, (g/100.0)::numeric(18,2) FROM generate_series(1,200) g;
 SQL
 
 compare "int4 only, deform"      t_i4  "ARRAY[1,2]"   deform "(0,a::text),(1,b::text)"
@@ -110,8 +114,13 @@ compare "int4 only, fixed"       t_i4  "ARRAY[1,2]"   fixed  "(0,a::text),(1,b::
 compare "int8 only, deform"      t_i8  "ARRAY[1,2]"   deform "(0,a::text),(1,b::text)"
 compare "mixed int4/int8"        t_mix "ARRAY[1,2,3]" deform "(0,a::text),(1,b::text),(2,c::text)"
 
-must_error "int8 refused by the fixed path" t_i8 "ARRAY[1,2]" fixed \
-           'column "a" is not int4'
+# int8 IS addressable by fixed offsets -- it is fixed-width and by-value --
+# and became so in 05-B. What the fixed path still cannot address is a
+# variable-width type, because it has no fixed width to step over.
+compare "int8 accepted by the fixed path" t_i8 "ARRAY[1,2]" fixed \
+        "(0,a::text),(1,b::text)"
+must_error "numeric refused by the fixed path, by type" n_fixed "ARRAY[1,2]" fixed \
+           'is not int4 or int8'
 
 echo
 echo "=== validity ==="
@@ -237,11 +246,13 @@ echo "=== GROUP BY and SUM semantics ==="
 # per group as "gkey n=<rows> sums={...}"
 compare_sql() {
     local name="$1" got want
-    # WARNING lines are dropped: the shared ZLFS directory accumulates zone
-    # files belonging to other databases, and scanning it warns about every
-    # one of them. ERROR lines are kept, so a real failure still shows.
-    got=$("${PSQL[@]}" -c "$2" 2>&1 | grep -v '^WARNING:')
-    want=$("${PSQL[@]}" -c "$3" 2>&1 | grep -v '^WARNING:')
+    # WARNING and NOTICE lines are dropped. The shared ZLFS directory
+    # accumulates zone files belonging to other databases and warns about each
+    # one, and the report functions print a NOTICE carrying their mode name and
+    # timings -- neither is part of the result being compared. ERROR lines are
+    # kept, so a real failure still shows.
+    got=$("${PSQL[@]}" -c "$2" 2>&1 | grep -vE '^(WARNING|NOTICE):')
+    want=$("${PSQL[@]}" -c "$3" 2>&1 | grep -vE '^(WARNING|NOTICE):')
 
     if [ "$got" = "$want" ] && [ -n "$got" ] && [[ ! "$got" =~ ERROR ]]; then
         echo "  PASS  $name"
@@ -429,6 +440,29 @@ else
 fi
 
 echo
+echo "=== heap source: int8 through the fixed-offset path ==="
+
+# The fixed path used to be int4-only. int8 values past 2^31 on both signs:
+# a path that truncated to int32 could not reproduce these.
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE f_i8 (a int4 NOT NULL, b int8 NOT NULL, c int8 NOT NULL, note text);
+INSERT INTO f_i8 VALUES
+    (1,  2147483648, -2147483649, 'x'),
+    (2,  5000000000, -5000000000, NULL),
+    (3,  9223372036854775807, -9223372036854775808, ''),
+    (4,  0, 0, 'y');
+SQL
+compare "int8 via the fixed-offset path" f_i8 "ARRAY[1,2,3]" fixed \
+        "(0,a::text),(1,b::text),(2,c::text)"
+compare "int8 via the deform path, same rows" f_i8 "ARRAY[1,2,3]" deform \
+        "(0,a::text),(1,b::text),(2,c::text)"
+
+# A varlena AFTER the projection leaves the fixed prefix addressable, so the
+# fixed path must still be eligible -- the guard constrains the prefix, not
+# the whole tuple.
+compare "fixed prefix, varlena after it" f_i8 "ARRAY[1,2]" fixed \
+        "(0,a::text),(1,b::text)"
+
 echo "=== the whole row shape, end to end ==="
 
 # Everything at once, on the layout that used to corrupt: the varlena sits at
