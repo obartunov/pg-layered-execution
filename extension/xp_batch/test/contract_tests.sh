@@ -237,8 +237,11 @@ echo "=== GROUP BY and SUM semantics ==="
 # per group as "gkey n=<rows> sums={...}"
 compare_sql() {
     local name="$1" got want
-    got=$("${PSQL[@]}" -c "$2" 2>&1)
-    want=$("${PSQL[@]}" -c "$3" 2>&1)
+    # WARNING lines are dropped: the shared ZLFS directory accumulates zone
+    # files belonging to other databases, and scanning it warns about every
+    # one of them. ERROR lines are kept, so a real failure still shows.
+    got=$("${PSQL[@]}" -c "$2" 2>&1 | grep -v '^WARNING:')
+    want=$("${PSQL[@]}" -c "$3" 2>&1 | grep -v '^WARNING:')
 
     if [ "$got" = "$want" ] && [ -n "$got" ] && [[ ! "$got" =~ ERROR ]]; then
         echo "  PASS  $name"
@@ -321,6 +324,50 @@ if [ "$got" = "$want" ] && [ "$got" = "4" ]; then
 else
     echo "  FAIL  NULL join: batch=$got postgresql=$want (expected 4)"
     fail=1
+fi
+
+echo
+echo "=== ZLFS v2: typed zone, same answers as heap ==="
+
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+-- a nullable int8 column in a zone: not representable in the old format
+CREATE TABLE z_f (k int4 NOT NULL, g int8, s int4);
+INSERT INTO z_f SELECT g,
+                       CASE WHEN g % 5 = 0 THEN NULL ELSE (g % 3)::int8 * 5000000000 END,
+                       CASE WHEN g % 7 = 0 THEN NULL ELSE g END
+                FROM generate_series(1, 3000) g;
+SQL
+"${PSQL[@]}" -c "SELECT zlfs_build_zone('z_f', '1,2,3', 1, 3000)" >/dev/null 2>&1
+
+Z_BATCH="SELECT gkey || ' ' || nrows || ' ' || coalesce(sums[1],'NULL')
+         FROM xpb_typed_report('z_f', ARRAY[2], ARRAY[3], NULL, NULL, '%s') ORDER BY gkey"
+Z_PG="SELECT coalesce(g::text,'\\N') || ' ' || count(*) || ' ' || coalesce(sum(s)::text,'NULL')
+      FROM z_f GROUP BY g ORDER BY 1"
+
+compare_sql "zone carries nullable int8" "$(printf "$Z_BATCH" zlfs)" "$Z_PG"
+compare_sql "heap deform agrees with the zone" "$(printf "$Z_BATCH" deform)" "$Z_PG"
+
+# An old-format file must be refused by name, never reinterpreted. Patching
+# the version field to the untyped value is the whole test: if the reader
+# accepted it, the int32 payload would be read as typed columns.
+zpath=$("${PSQL[@]}" -c "SELECT setting || '/zlfs' FROM pg_settings WHERE name='data_directory'")
+zfile=$(ls "$zpath"/zone_*.zlfs 2>/dev/null | head -1)
+if [ -n "$zfile" ] && [ -w "$zfile" ]; then
+    cp "$zfile" "$zfile.bak"
+    # version is the second uint32 of the header
+    printf '\2\0\0\0' | dd of="$zfile" bs=1 seek=4 conv=notrunc status=none
+    out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_typed_report('z_f', ARRAY[2], ARRAY[3], NULL, NULL, 'zlfs')" 2>&1)
+    mv "$zfile.bak" "$zfile"
+
+    if grep -qi "format version 2" <<<"$out"; then
+        echo "  PASS  untyped zone file refused by name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  untyped zone file not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-100)"
+        fail=1
+    fi
+else
+    echo "  SKIP  untyped-file rejection (zone file not writable from here)"
 fi
 
 echo

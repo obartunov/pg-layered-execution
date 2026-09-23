@@ -62,6 +62,9 @@
 
 #include "xpb_colbatch.h"
 #include "xpb_src_heap.h"
+#include "xpb_zlfs.h"
+
+extern XpBatchSource *xpb_zlfs_source_create(ZlfsZone *zone, int16 *attnos, int ncols);
 
 PG_FUNCTION_INFO_V1(xpb_typed_report);
 
@@ -423,6 +426,12 @@ xpb_typed_report(PG_FUNCTION_ARGS)
 
     pstr = text_to_cstring(PG_GETARG_TEXT_PP(5));
     path = (strcmp(pstr, "fixed") == 0) ? XPB_HEAP_FIXED : XPB_HEAP_DEFORM;
+    if (strcmp(pstr, "fixed") != 0 && strcmp(pstr, "deform") != 0 &&
+        strcmp(pstr, "zlfs") != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xpb_typed_report: path must be 'fixed', 'deform' or 'zlfs', got \"%s\"",
+                        pstr)));
 
     /*
      * Batch layout: group keys, then sum columns, then the join key last so
@@ -462,8 +471,37 @@ xpb_typed_report(PG_FUNCTION_ARGS)
 
     ht = palloc0(TP_GRP_CAP * sizeof(TpGroup));
 
-    src = xpb_heap_source_create_ex(fact_relid, attnos, ncols, path,
-                                    false, 0, 0);
+    if (strcmp(pstr, "zlfs") == 0)
+    {
+        /*
+         * Serve from a materialized zone instead of the heap.  Same columns,
+         * same contract -- the point of the exercise is that the consumer
+         * below does not change.  The zone must already exist and be VALID;
+         * there is no implicit build, because building one here would hide
+         * which representation the numbers came from.
+         */
+        ZlfsZone *zone = NULL;
+
+        zlfs_ensure_registry();
+        zlfs_scan_directory();
+        if (zlfs_reg)
+            for (int i = 0; i < zlfs_reg->nzones; i++)
+                if (zlfs_reg->zones[i]->source_relid == fact_relid &&
+                    zlfs_reg->zones[i]->freshness == ZLFS_VALID)
+                {
+                    zone = zlfs_reg->zones[i];
+                    break;
+                }
+        if (zone == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_OBJECT),
+                     errmsg("xpb_typed_report: no VALID ZLFS zone for this relation"),
+                     errhint("Build one with zlfs_build_zone() first.")));
+        src = xpb_zlfs_source_create(zone, attnos, ncols);
+    }
+    else
+        src = xpb_heap_source_create_ex(fact_relid, attnos, ncols, path,
+                                        false, 0, 0);
 
     memset(&batch, 0, sizeof(batch));
     batch.capacity = 1024;

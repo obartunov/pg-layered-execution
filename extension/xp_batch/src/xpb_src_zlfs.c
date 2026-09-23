@@ -34,15 +34,64 @@ zlfs_next_batch(XpBatchSource *src, XpColumnBatch *batch)
      * whole pipeline rather than only until the next next_batch().  That is
      * stronger than the contract promises; consumers must not rely on it.
      *
-     * A v1 zone is int32-only and has no NULLs by construction -- the builder
-     * refuses a nullable or variable-width column -- so every column is
-     * XPB_COL_INT4 with validity NULL.
+     * Validity is the one thing that cannot always be borrowed.  The zone's
+     * bitmap covers the WHOLE zone, so a batch starting at row `cursor` needs
+     * bits [cursor, cursor+chunk) starting at bit 0.  When cursor is a
+     * multiple of 8 that is just a shifted pointer; otherwise the bits have
+     * to be restated into a small owned buffer.  Consumers cannot tell the
+     * difference, which is the point of per-column ownership.
      */
     batch->nrows = chunk;
     batch->ncols = st->cols_used;
+
     for (int c = 0; c < st->cols_used; c++)
-        xpcb_col_borrow(&batch->cols[c], XPB_COL_INT4,
-                        zz->cols[st->col_map[c]] + st->cursor, NULL);
+    {
+        int             zc = st->col_map[c];
+        XpBatchColumn  *bc = &batch->cols[c];
+        uint8          *valid = NULL;
+        bool            valid_owned = false;
+
+        if (zz->col_validity[zc] != NULL)
+        {
+            if ((st->cursor & 7) == 0)
+            {
+                valid = zz->col_validity[zc] + (st->cursor >> 3);
+            }
+            else
+            {
+                size_t  nb = XPCB_VALIDITY_BYTES(chunk);
+                uint8  *buf = palloc0(nb);
+
+                for (int r = 0; r < chunk; r++)
+                {
+                    int64 z = st->cursor + r;
+
+                    if (zz->col_validity[zc][z >> 3] & (1 << (z & 7)))
+                        buf[r >> 3] |= (1 << (r & 7));
+                }
+                valid = buf;
+                valid_owned = true;
+            }
+        }
+
+        switch (zz->col_types[zc])
+        {
+            case ZLFS_COL_INT4:
+                xpcb_col_borrow(bc, XPB_COL_INT4,
+                                (int32 *) zz->cols[zc] + st->cursor, valid);
+                break;
+            case ZLFS_COL_INT8:
+                xpcb_col_borrow(bc, XPB_COL_INT8,
+                                (int64 *) zz->cols[zc] + st->cursor, valid);
+                break;
+            default:
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("ZLFS source: zone column %d has unsupported type %d",
+                                zc, (int) zz->col_types[zc])));
+        }
+        bc->owns_validity = valid_owned;
+    }
 
     batch->selection = NULL;
     batch->nselected = 0;

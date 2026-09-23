@@ -24,6 +24,8 @@
 #include "storage/fd.h"
 
 #include "xpb_zlfs.h"
+#include "xpb_colbatch.h"
+#include "xpb_src_heap.h"
 #include "utils/tuplestore.h"
 
 #include <sys/stat.h>
@@ -68,46 +70,6 @@ zlfs_compute_schema_hash(Oid relid, int16 *attnos, int ncols)
     return h;
 }
 
-/* Compute byte offsets for given attnos in a fixed-width NOT NULL tuple.
- * Uses att_align_nominal for correct alignment handling. */
-static void
-zlfs_compute_offsets(Oid relid, int16 *attnos, int ncols, int *offsets_out)
-{
-    Relation rel = table_open(relid, AccessShareLock);
-    TupleDesc td = RelationGetDescr(rel);
-
-    for (int i = 0; i < ncols; i++)
-    {
-        int16 attno = attnos[i];
-        if (attno < 1 || attno > td->natts)
-            ereport(ERROR, (errmsg("ZLFS: attno %d out of range (1..%d)", attno, td->natts)));
-        Form_pg_attribute attr = TupleDescAttr(td, attno - 1);
-
-        if (attr->attlen < 1)
-            ereport(ERROR, (errmsg("ZLFS: column attno %d has variable length (%d), "
-                                    "only fixed-width supported",
-                                    attno, attr->attlen)));
-        if (!attr->attnotnull)
-            ereport(ERROR, (errmsg("ZLFS: column attno %d is nullable", attno)));
-
-        /* Walk preceding attributes with alignment */
-        int offset = 0;
-        for (int a = 0; a < attno - 1; a++)
-        {
-            Form_pg_attribute prev = TupleDescAttr(td, a);
-            if (prev->attlen < 1)
-                ereport(ERROR, (errmsg("ZLFS: preceding column attno %d has variable length, "
-                                        "cannot compute fixed offset for attno %d",
-                                        a + 1, attno)));
-            offset = att_align_nominal(offset, prev->attalign);
-            offset += prev->attlen;
-        }
-        /* Align the target column itself */
-        offset = att_align_nominal(offset, attr->attalign);
-        offsets_out[i] = offset;
-    }
-    table_close(rel, AccessShareLock);
-}
 
 /* ── Registry ── */
 
@@ -142,17 +104,32 @@ zlfs_write_file(ZlfsZone *zone)
     hdr.pred_hi = zone->pred_hi;
     hdr.ncols = zone->ncols;
     hdr.nrows = zone->nrows;
-    hdr.col_width = sizeof(int32);
+    hdr.col_width = 0;          /* v2-only field; types are per column now */
     hdr.build_time = zone->build_time;
     hdr.freshness = (uint32)zone->freshness;
     hdr.schema_hash = zone->schema_hash;
     memcpy(hdr.col_attnos, zone->col_attnos, sizeof(hdr.col_attnos));
+    for (int c = 0; c < zone->ncols; c++)
+    {
+        hdr.col_types[c] = (uint8) zone->col_types[c];
+        hdr.col_widths[c] = zone->col_widths[c];
+        hdr.col_flags[c] = zone->col_validity[c] ? ZLFS_COLFLAG_VALIDITY : 0;
+    }
 
     if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) goto write_err;
     for (int c = 0; c < zone->ncols; c++)
     {
-        if (fwrite(zone->cols[c], sizeof(int32), zone->nrows, f) != (size_t)zone->nrows)
+        size_t n = (size_t) zone->nrows * zone->col_widths[c];
+
+        if (zone->nrows > 0 && fwrite(zone->cols[c], 1, n, f) != n)
             goto write_err;
+        if (zone->col_validity[c] != NULL)
+        {
+            size_t vb = ZLFS_VALIDITY_BYTES(zone->nrows);
+
+            if (vb > 0 && fwrite(zone->col_validity[c], 1, vb, f) != vb)
+                goto write_err;
+        }
     }
     if (fflush(f) != 0) goto write_err;
     if (pg_fsync(fileno(f)) != 0)
@@ -200,7 +177,26 @@ zlfs_load_file(const char *filepath)
     ZlfsFileHeader hdr;
     if (fread(&hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return NULL; }
     if (hdr.magic != ZLFS_MAGIC) { fclose(f); return NULL; }
-    if (hdr.version != ZLFS_VERSION) { fclose(f); return NULL; }
+
+    /*
+     * An incompatible version is refused BY NAME, not passed over as if the
+     * file were missing.  Reinterpreting a version-2 file as a version-3 one
+     * would read its int32 data as typed columns with no validity and is
+     * exactly the silent misreading this format change exists to prevent.
+     */
+    if (hdr.version != ZLFS_VERSION)
+    {
+        fclose(f);
+        ereport(WARNING,
+                (errmsg("ZLFS: %s is format version %u, this build reads version %d",
+                        filepath, hdr.version, ZLFS_VERSION),
+                 errdetail(hdr.version == ZLFS_VERSION_UNTYPED
+                           ? "Version %d is the untyped int32-only layout, which carries no column types or validity and is not read."
+                           : "Unknown version.",
+                           ZLFS_VERSION_UNTYPED),
+                 errhint("Drop and rebuild the zone with zlfs_build_zone().")));
+        return NULL;
+    }
     if (hdr.ncols > ZLFS_MAX_COLS) { fclose(f); return NULL; }
 
     MemoryContext old = MemoryContextSwitchTo(zlfs_reg->mcxt);
@@ -219,12 +215,42 @@ zlfs_load_file(const char *filepath)
 
     for (int c = 0; c < (int)hdr.ncols; c++)
     {
-        z->cols[c] = palloc(hdr.nrows * sizeof(int32));
-        if (fread(z->cols[c], sizeof(int32), hdr.nrows, f) != (size_t)hdr.nrows)
+        size_t n;
+
+        z->col_types[c] = (ZlfsColType) hdr.col_types[c];
+        z->col_widths[c] = hdr.col_widths[c];
+
+        if ((z->col_types[c] != ZLFS_COL_INT4 && z->col_types[c] != ZLFS_COL_INT8) ||
+            z->col_widths[c] != (z->col_types[c] == ZLFS_COL_INT8 ? 8 : 4))
+        {
+            fclose(f);
+            MemoryContextSwitchTo(old);
+            ereport(WARNING,
+                    (errmsg("ZLFS: %s column %d has type %u width %u, which do not agree",
+                            filepath, c, hdr.col_types[c], hdr.col_widths[c])));
+            return NULL;
+        }
+
+        n = (size_t) hdr.nrows * z->col_widths[c];
+        z->cols[c] = palloc(Max(n, 1));
+        if (n > 0 && fread(z->cols[c], 1, n, f) != n)
         {
             fclose(f);
             MemoryContextSwitchTo(old);
             return NULL;
+        }
+
+        if (hdr.col_flags[c] & ZLFS_COLFLAG_VALIDITY)
+        {
+            size_t vb = ZLFS_VALIDITY_BYTES(hdr.nrows);
+
+            z->col_validity[c] = palloc(Max(vb, 1));
+            if (vb > 0 && fread(z->col_validity[c], 1, vb, f) != vb)
+            {
+                fclose(f);
+                MemoryContextSwitchTo(old);
+                return NULL;
+            }
         }
     }
     fclose(f);
@@ -370,9 +396,12 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     if (ncols < 1)
         ereport(ERROR, (errmsg("ZLFS: need at least 1 column")));
 
-    /* Compute offsets and schema hash */
-    int offsets[ZLFS_MAX_COLS];
-    zlfs_compute_offsets(relid, attnos, ncols, offsets);
+    /*
+     * No offset computation here any more: the batch source addresses the
+     * tuple, and it is the only place that knows how.  The schema hash still
+     * fingerprints (attnos + types), so a zone built against one table shape
+     * is not served for another.
+     */
     uint32 schema_hash = zlfs_compute_schema_hash(relid, attnos, ncols);
 
     zlfs_ensure_registry();
@@ -401,73 +430,147 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     zone->ncols = ncols;
     zone->schema_hash = schema_hash;
     memcpy(zone->col_attnos, attnos, ncols * sizeof(int16));
-    memcpy(zone->col_offsets, offsets, ncols * sizeof(int));
     zone->mcxt = zlfs_reg->mcxt;
 
-    int64 capacity = 2000000;
-    for (int c = 0; c < ncols; c++)
-        zone->cols[c] = palloc(capacity * sizeof(int32));
-    MemoryContextSwitchTo(old);
+    /*
+     * Fill the zone by draining a typed batch source rather than walking
+     * blocks here.  The builder used to keep its own copy of the fixed-offset
+     * tuple decoding -- a second place with the same assumptions about
+     * layout, alignment and NULLs, which had already drifted from the heap
+     * source's copy.  Going through XpBatchSource means ZLFS inherits the
+     * source's guards and its types instead of re-deriving them.
+     *
+     * XPB_HEAP_DEFORM, not the fixed path: a zone may now hold int8 and
+     * nullable columns, and the deform path is the one that can read them.
+     * The predicate is pushed into the source, so only rows in [lo, hi]
+     * arrive.
+     */
+    XpBatchSource  *src;
+    XpColumnBatch   batch;
+    int64           capacity = 0;
+    int64           nrows = 0;
 
-    /* Scan heap */
-    Relation rel = table_open(relid, AccessShareLock);
-    Snapshot snap = GetActiveSnapshot();
-    BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
-    Oid rel_oid = RelationGetRelid(rel);
-    Buffer vmbuf = InvalidBuffer;
-    int64 nrows = 0;
+    src = xpb_heap_source_create_ex(relid, attnos, ncols, XPB_HEAP_DEFORM,
+                                    true, lo, hi);
 
-    for (BlockNumber blkno = 0; blkno < nblocks; blkno++)
+    memset(&batch, 0, sizeof(batch));
+    batch.capacity = XPCB_BATCH_CAP;
+    batch.ncols = ncols;
+
+    while (src->ops->next_batch(src, &batch))
     {
-        Buffer buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
-        LockBuffer(buf, BUFFER_LOCK_SHARE);
-        Page page = BufferGetPage(buf);
-        bool all_visible = (visibilitymap_get_status(rel, blkno, &vmbuf) &
-                            VISIBILITYMAP_ALL_VISIBLE) != 0;
-        OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+        MemoryContext o2;
 
-        for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+        if (nrows == 0)
         {
-            ItemId lp = PageGetItemId(page, off);
-            if (!ItemIdIsNormal(lp)) continue;
-            HeapTupleHeader htup = (HeapTupleHeader) PageGetItem(page, lp);
-
-            if (!all_visible)
-            {
-                HeapTupleData td;
-                td.t_data = htup; td.t_len = ItemIdGetLength(lp);
-                td.t_tableOid = rel_oid;
-                ItemPointerSet(&td.t_self, blkno, off);
-                if (!HeapTupleSatisfiesVisibility(&td, snap, buf)) continue;
-            }
-
-            if (htup->t_infomask & HEAP_HASNULL)
-                ereport(ERROR, (errmsg("ZLFS build: tuple has null bitmap")));
-
-            char *d = (char *)htup + htup->t_hoff;
-            int32 pred_val = *(int32 *)(d + offsets[0]);
-            if (pred_val < lo || pred_val > hi) continue;
-
-            /* Grow if needed */
-            if (nrows >= capacity)
-            {
-                int64 newcap = capacity * 2;
-                MemoryContext o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
-                for (int c = 0; c < ncols; c++)
-                    zone->cols[c] = repalloc(zone->cols[c], newcap * sizeof(int32));
-                MemoryContextSwitchTo(o2);
-                capacity = newcap;
-            }
-
+            /* First batch fixes the zone's types; later batches must agree. */
+            o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
             for (int c = 0; c < ncols; c++)
-                zone->cols[c][nrows] = *(int32 *)(d + offsets[c]);
-            nrows++;
+            {
+                switch (batch.cols[c].type)
+                {
+                    case XPB_COL_INT4:
+                        zone->col_types[c] = ZLFS_COL_INT4;
+                        zone->col_widths[c] = sizeof(int32);
+                        break;
+                    case XPB_COL_INT8:
+                        zone->col_types[c] = ZLFS_COL_INT8;
+                        zone->col_widths[c] = sizeof(int64);
+                        break;
+                    default:
+                        MemoryContextSwitchTo(o2);
+                        ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                 errmsg("ZLFS: column attno %d is %s; a zone carries int4 or int8",
+                                        attnos[c], xpcb_type_name(batch.cols[c].type))));
+                }
+            }
+            MemoryContextSwitchTo(o2);
         }
-        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(buf);
+
+        if (nrows + batch.nrows > capacity)
+        {
+            int64 newcap = Max(capacity * 2, Max(nrows + batch.nrows, 65536));
+
+            o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
+            for (int c = 0; c < ncols; c++)
+            {
+                zone->cols[c] = zone->cols[c]
+                    ? repalloc(zone->cols[c], newcap * zone->col_widths[c])
+                    : palloc(newcap * zone->col_widths[c]);
+                if (zone->col_validity[c])
+                    zone->col_validity[c] =
+                        repalloc(zone->col_validity[c], ZLFS_VALIDITY_BYTES(newcap));
+            }
+            MemoryContextSwitchTo(o2);
+            capacity = newcap;
+        }
+
+        for (int c = 0; c < ncols; c++)
+        {
+            const XpBatchColumn *bc = &batch.cols[c];
+
+            if (bc->type != (zone->col_types[c] == ZLFS_COL_INT8
+                             ? XPB_COL_INT8 : XPB_COL_INT4))
+                ereport(ERROR,
+                        (errmsg("ZLFS: column attno %d changed type mid-scan",
+                                attnos[c])));
+
+            /*
+             * A column only gets a bitmap once a NULL actually turns up, and
+             * the rows already copied are retroactively marked valid -- they
+             * were, or they would have allocated it themselves.
+             */
+            if (bc->validity != NULL && zone->col_validity[c] == NULL)
+            {
+                o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
+                zone->col_validity[c] = palloc(ZLFS_VALIDITY_BYTES(capacity));
+                memset(zone->col_validity[c], 0xFF, ZLFS_VALIDITY_BYTES(capacity));
+                MemoryContextSwitchTo(o2);
+            }
+
+            if (zone->col_types[c] == ZLFS_COL_INT8)
+                memcpy((int64 *) zone->cols[c] + nrows, bc->data,
+                       batch.nrows * sizeof(int64));
+            else
+                memcpy((int32 *) zone->cols[c] + nrows, bc->data,
+                       batch.nrows * sizeof(int32));
+
+            if (zone->col_validity[c] != NULL)
+            {
+                uint8 *dst = zone->col_validity[c];
+
+                for (int r = 0; r < batch.nrows; r++)
+                {
+                    int64 z = nrows + r;
+
+                    if (xpcb_isnull(&batch, c, r))
+                        dst[z >> 3] &= ~(1 << (z & 7));
+                    else
+                        dst[z >> 3] |= (1 << (z & 7));
+                }
+            }
+        }
+
+        nrows += batch.nrows;
+        xpcb_release_owned(&batch);
     }
-    if (vmbuf != InvalidBuffer) ReleaseBuffer(vmbuf);
-    table_close(rel, AccessShareLock);
+    src->ops->end(src);
+
+    /* A zone with no rows still has to have well-defined columns. */
+    if (nrows == 0)
+    {
+        MemoryContext o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
+
+        for (int c = 0; c < ncols; c++)
+            if (zone->col_types[c] == ZLFS_COL_NONE)
+            {
+                zone->col_types[c] = ZLFS_COL_INT4;
+                zone->col_widths[c] = sizeof(int32);
+                zone->cols[c] = palloc(1);
+            }
+        MemoryContextSwitchTo(o2);
+    }
 
     zone->nrows = nrows;
     zone->freshness = ZLFS_VALID;
