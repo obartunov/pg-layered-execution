@@ -23,6 +23,7 @@
 
 #include "xpb_colbatch.h"
 #include "xpb_zlfs.h"
+#include "utils/tuplestore.h"
 
 extern XpBatchSource *xpb_zlfs_source_create(ZlfsZone *zone, int16 *requested_attnos, int ncols);
 extern XpBatchSource *xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,

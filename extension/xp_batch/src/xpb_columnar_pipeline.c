@@ -30,6 +30,7 @@
 #include "utils/snapmgr.h"
 
 #include "xpb_columnar_tr.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(ctr_pipeline);
 

@@ -17,6 +17,7 @@
 
 #include "xpb_colbatch.h"
 #include "xpb_zlfs.h"
+#include "utils/tuplestore.h"
 
 /* Provider constructors (defined in xpb_src_*.c) */
 extern XpBatchSource *xpb_zlfs_source_create(ZlfsZone *zone, int16 *requested_attnos, int ncols);

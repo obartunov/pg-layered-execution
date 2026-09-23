@@ -25,6 +25,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(projection_experiment);
 

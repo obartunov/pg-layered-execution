@@ -220,6 +220,7 @@ typedef struct {
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 extern void xpb_dim_check_shape(Relation rel, int nrequired, const char *what);
 

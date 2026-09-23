@@ -24,6 +24,7 @@
 #include "storage/fd.h"
 
 #include "xpb_zlfs.h"
+#include "utils/tuplestore.h"
 
 #include <sys/stat.h>
 #include <dirent.h>

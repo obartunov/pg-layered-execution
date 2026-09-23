@@ -46,6 +46,7 @@
 #include "utils/snapmgr.h"
 
 #include "xpb_colbatch.h"
+#include "access/table.h"
 
 /* ── pgcolumnar fold reader API (see the export patch) ── */
 
