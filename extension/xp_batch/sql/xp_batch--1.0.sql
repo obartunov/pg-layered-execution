@@ -88,3 +88,16 @@ CREATE OR REPLACE FUNCTION xpb_contract_probe(relname text, attnos int[], path t
 RETURNS TABLE(rownum bigint, col int, coltype text, is_null bool, val text)
 LANGUAGE C STRICT
 AS '$libdir/xp_batch', 'xpb_contract_probe';
+
+-- Typed pipeline: join + GROUP BY + SUM over the typed batch contract, with
+-- PostgreSQL NULL semantics (join: NULL matches nothing; GROUP BY: NULLs are
+-- one group; SUM: skips NULLs, all-NULL group sums to NULL). Separate from
+-- xpb_1c_register_report() on purpose -- that one is what benchmarks 02/04
+-- measure and it stays on the int4 fixed-offset fast path.
+CREATE OR REPLACE FUNCTION xpb_typed_report(
+    fact text, group_attnos int[], sum_attnos int[],
+    dim text DEFAULT NULL, join_attno int DEFAULT NULL,
+    path text DEFAULT 'deform')
+RETURNS TABLE(gkey text, nrows bigint, sums text[])
+LANGUAGE C
+AS '$libdir/xp_batch', 'xpb_typed_report';

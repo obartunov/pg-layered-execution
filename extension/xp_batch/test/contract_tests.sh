@@ -231,6 +231,99 @@ compare "external (toasted) varlena" w_toast "ARRAY[1,2,3]" deform \
         "(0,a::text),(1,big),(2,b::text)"
 
 echo
+echo "=== GROUP BY and SUM semantics ==="
+
+# $1 name  $2 batch-pipeline SQL  $3 PostgreSQL SQL -- both render one line
+# per group as "gkey n=<rows> sums={...}"
+compare_sql() {
+    local name="$1" got want
+    got=$("${PSQL[@]}" -c "$2" 2>&1)
+    want=$("${PSQL[@]}" -c "$3" 2>&1)
+
+    if [ "$got" = "$want" ] && [ -n "$got" ] && [[ ! "$got" =~ ERROR ]]; then
+        echo "  PASS  $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  $name"
+        echo "        batch      : $(tr '\n' ' ' <<<"$got" | cut -c1-140)"
+        echo "        postgresql : $(tr '\n' ' ' <<<"$want" | cut -c1-140)"
+        fail=1
+    fi
+}
+
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE g_f (g1 int4, g2 int8, s1 int4, s2 int8, s3 numeric(18,2));
+INSERT INTO g_f VALUES
+ (1,    10,   5,    5000000000,   10.37),
+ (1,    10,   NULL, NULL,         NULL),      -- partial NULLs inside a group
+ (1,    10,   7,    5000000000,    0.01),
+ (NULL, 10,   3,    1,          1234.56),     -- NULL in the first key
+ (NULL, 10,   4,    2,             0.00),
+ (1,    NULL, 1,    1,             0.01),     -- NULL in the second key
+ (NULL, NULL, NULL, NULL,         NULL),      -- every input NULL
+ (NULL, NULL, NULL, NULL,         NULL);
+SQL
+
+compare_sql "GROUP BY with NULL keys, SUM over int4/int8/numeric" \
+"SELECT gkey || ' n=' || nrows || ' sums=' || sums::text
+ FROM xpb_typed_report('g_f', ARRAY[1,2], ARRAY[3,4,5]) ORDER BY gkey" \
+"SELECT coalesce(g1::text,'\\N') || '|' || coalesce(g2::text,'\\N')
+        || ' n=' || count(*)
+        || ' sums={' || coalesce(sum(s1)::text,'NULL')
+        || ',' || coalesce(sum(s2)::text,'NULL')
+        || ',' || coalesce(sum(s3)::text,'NULL') || '}'
+ FROM g_f GROUP BY g1, g2 ORDER BY 1"
+
+# A group whose every input is NULL must sum to NULL. Summing to 0 is the
+# classic wrong answer and it is invisible unless a test says so out loud.
+compare_sql "all-NULL group sums to NULL, not 0" \
+"SELECT gkey || ' ' || coalesce(sums[1],'NULL')
+ FROM xpb_typed_report('g_f', ARRAY[1,2], ARRAY[3]) WHERE gkey = '\\N|\\N'" \
+"SELECT '\\N|\\N ' || coalesce(sum(s1)::text,'NULL')
+ FROM g_f WHERE g1 IS NULL AND g2 IS NULL"
+
+echo
+echo "=== join NULL semantics ==="
+
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+-- dimension: one NULL key (must never match), one NULL payload (ordinary)
+CREATE TABLE j_d (k int4, payload int4);
+INSERT INTO j_d VALUES (1, 100), (2, 200), (3, NULL), (NULL, 999);
+
+CREATE TABLE j_f (jk int4, g1 int4, s1 int4);
+INSERT INTO j_f VALUES
+ (1,    7, 1),      -- matches
+ (1,    7, 2),      -- matches, same group
+ (2,    8, 4),      -- matches
+ (3,    9, 8),      -- matches a NULL payload
+ (4,    9, 16),     -- no such dimension key
+ (NULL, 7, 32),     -- NULL fact key: matches nothing, including j_d's NULL
+ (NULL, 7, 64);
+SQL
+
+compare_sql "inner join, NULL on both sides" \
+"SELECT gkey || ' n=' || nrows || ' ' || coalesce(sums[1],'NULL')
+ FROM xpb_typed_report('j_f', ARRAY[2], ARRAY[3], 'j_d', 1) ORDER BY gkey" \
+"SELECT coalesce(d.payload::text,'\\N') || '|' || coalesce(f.g1::text,'\\N')
+        || ' n=' || count(*) || ' ' || coalesce(sum(f.s1)::text,'NULL')
+ FROM j_f f JOIN j_d d ON d.k = f.jk
+ GROUP BY d.payload, f.g1 ORDER BY 1"
+
+# Stated separately because it is the rule most easily got wrong: a NULL fact
+# key must not find the dimension's NULL key. If it did, rows 6 and 7 would
+# join to payload 999 and appear above.
+got=$("${PSQL[@]}" -c "SELECT coalesce(sum(nrows),0)
+                       FROM xpb_typed_report('j_f', ARRAY[2], ARRAY[3], 'j_d', 1)")
+want=$("${PSQL[@]}" -c "SELECT count(*) FROM j_f f JOIN j_d d ON d.k = f.jk")
+if [ "$got" = "$want" ] && [ "$got" = "4" ]; then
+    echo "  PASS  NULL key joins to nothing (4 of 7 rows survive)"
+    pass_count=$((pass_count + 1))
+else
+    echo "  FAIL  NULL join: batch=$got postgresql=$want (expected 4)"
+    fail=1
+fi
+
+echo
 if [ $fail -eq 0 ]; then
     echo "contract_tests: ALL PASS ($pass_count cases)"
 else
