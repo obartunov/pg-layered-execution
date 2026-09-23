@@ -34,10 +34,23 @@ echo "-- COPY $CSV"
 "${PSQL[@]}" -c "COPY reg_buh FROM '$CSV' WITH (FORMAT csv, HEADER true)" >/dev/null
 
 echo "-- analyze"
+# The columnar copy is optional: without pgcolumnar the benchmark still runs
+# its heap and ZLFS paths.
+if "${PSQL[@]}" -qAt -c \
+   "SELECT 1 FROM pg_available_extensions WHERE name='pgcolumnar'" | grep -q 1
+then
+    echo "-- columnar copy (reg_buh_col)"
+    "${PSQL[@]}" -f "$HERE/schema-columnar.sql" >/dev/null
+else
+    echo "-- pgcolumnar not available, skipping reg_buh_col"
+fi
+
 # one VACUUM per -c: psql wraps a multi-statement -c in a transaction block
 for t in reg_buh dim_period dim_account; do
     "${PSQL[@]}" -c "VACUUM ANALYZE $t" >/dev/null
 done
+"${PSQL[@]}" -qAt -c "SELECT to_regclass('reg_buh_col')" | grep -q . && \
+    "${PSQL[@]}" -c "ANALYZE reg_buh_col" >/dev/null
 
 "${PSQL[@]}" -qAt -c "
 SELECT 'fact rows:    ' || count(*) FROM reg_buh

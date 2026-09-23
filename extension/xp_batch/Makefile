@@ -7,6 +7,7 @@ OBJS = src/xp_batch.o src/xpb_groupagg2.o src/xpb_pageagg.o \
        src/xpb_projection.o \
        src/xpb_zlfs.o \
        src/xpb_src_zlfs.o src/xpb_src_heap.o \
+       src/xpb_src_pgcolumnar.o \
        src/xpb_batch_groupagg.o \
        src/xpb_batch_hashjoin.o \
        src/xpb_batch_partition.o

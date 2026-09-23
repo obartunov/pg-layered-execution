@@ -1,0 +1,65 @@
+Subject: [PATCH] export the six reader/fold symbols xp_batch links against
+
+Local experiment, not for upstream. PostgreSQL builds extension modules with
+-fvisibility=hidden (CFLAGS_SL_MODULE), so everything in pgcolumnar.so that is
+not PGDLLEXPORT is a local symbol and cannot be resolved from another module.
+This marks exactly the six the pgcolumnar batch source needs and nothing else.
+
+Applies to commandprompt/pgcolumnar at 5b20ae8 (VERSION 1.0-alpha5).
+
+The long-term shape is a versioned entry point on pgcolumnar's side -- one
+pgcolumnar_get_batch_api() returning a struct of function pointers with a
+version stamp -- so a consumer fails to negotiate instead of failing to link,
+and the fold contract has somewhere to be documented. This patch is the
+minimum needed to measure; it is not a proposal.
+
+--- a/src/columnar.h
++++ b/src/columnar.h
+@@ -458,7 +458,7 @@
+ struct SMgrRelationData;
+ 
+ extern void PgColumnarReadMetapage(Relation rel, PgColumnarMetapage *meta);
+-extern uint64 PgColumnarStorageId(Relation rel);
++extern PGDLLEXPORT uint64 PgColumnarStorageId(Relation rel);
+ 
+ /* row number <-> item pointer (spec 6) */
+ extern void PgColumnarRowNumberToItemPointer(uint64 rowNumber, ItemPointer tid);
+@@ -678,7 +678,7 @@
+  * ------------------------------------------------------------------------- */
+ typedef struct PgColumnarReadState PgColumnarReadState;
+ 
+-extern PgColumnarReadState *PgColumnarBeginRead(Relation rel, Snapshot snapshot,
++extern PGDLLEXPORT PgColumnarReadState *PgColumnarBeginRead(Relation rel, Snapshot snapshot,
+ 											ParallelTableScanDesc parallelScan,
+ 											Bitmapset *projectedColumns,
+ 											int nkeys, ScanKey keys);
+@@ -703,7 +703,7 @@
+ typedef bool (*PgColumnarRowFilter) (void *arg);
+ 
+ extern void PgColumnarRescanRead(PgColumnarReadState *readState);
+-extern void PgColumnarEndRead(PgColumnarReadState *readState);
++extern PGDLLEXPORT void PgColumnarEndRead(PgColumnarReadState *readState);
+ 
+ /*
+  * Batch-fold accessors (#289): expose the current loaded group's decoded buffer
+--- a/src/columnar_reader.h
++++ b/src/columnar_reader.h
+@@ -32,15 +32,15 @@
+ 
+ extern uint64 PgColumnarRowsFilteredEarly(PgColumnarReadState *readState);
+ 
+-extern bool PgColumnarReadFoldNextGroup(PgColumnarReadState *readState);
++extern PGDLLEXPORT bool PgColumnarReadFoldNextGroup(PgColumnarReadState *readState);
+ 
+-extern void PgColumnarReadFoldGroupInfo(PgColumnarReadState *readState, uint64 *nrows,
++extern PGDLLEXPORT void PgColumnarReadFoldGroupInfo(PgColumnarReadState *readState, uint64 *nrows,
+ 									  const char **deleteMask, uint32 *deleteMaskLen,
+ 									  const bool **skipVec, bool *decodeSkipped,
+ 									  const uint32 **vecStart,
+ 									  int *vectorCount);
+ 
+-extern bool PgColumnarReadFoldColumn(PgColumnarReadState *readState, int attidx,
++extern PGDLLEXPORT bool PgColumnarReadFoldColumn(PgColumnarReadState *readState, int attidx,
+ 								   const char **validity, const char **packed,
+ 								   int16 *attlen, const uint32 **vecRawLen);
+ 

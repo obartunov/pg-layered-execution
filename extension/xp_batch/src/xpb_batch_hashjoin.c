@@ -26,6 +26,10 @@
 extern XpBatchSource *xpb_zlfs_source_create(ZlfsZone *zone, int16 *requested_attnos, int ncols);
 extern XpBatchSource *xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,
                                               bool has_pred, int32 pred_lo, int32 pred_hi);
+extern XpBatchSource *xpcn_source_create(Oid relid, int16 *requested_attnos, int ncols,
+                                         bool has_pred, int32 pred_lo, int32 pred_hi);
+extern void xpcn_source_stats(XpBatchSource *src, int64 *groups, int64 *groups_copied,
+                              int64 *rows, int64 *bytes_copied);
 
 /* ── Dimension hash table (build side) ── */
 
@@ -605,6 +609,21 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
         int16 heap_attnos[4] = { 1, 2, 3, 6 };
         source = xpb_heap_source_create(fact_relid, heap_attnos, 4, true, lo, hi);
     }
+    else if (strcmp(mode, "pgcolumnar") == 0)
+    {
+        /*
+         * The columnar arm reads reg_buh_col: the same rows as reg_buh, stored
+         * USING pgcolumnar. Two tables rather than one because the comparison
+         * is between storage layers, and a table has exactly one.
+         */
+        int16 pgcn_attnos[4] = { 1, 2, 3, 6 };
+        Oid   col_relid = RelnameGetRelid("reg_buh_col");
+
+        if (!OidIsValid(col_relid))
+            ereport(ERROR, (errmsg("reg_buh_col not found"),
+                            errhint("Create it with benchmarks/common/schema-columnar.sql.")));
+        source = xpcn_source_create(col_relid, pgcn_attnos, 4, true, lo, hi);
+    }
     else
         ereport(ERROR, (errmsg("unknown mode: %s", mode)));
 
@@ -730,13 +749,33 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
         tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, vals, nulls);
     }
 
-    elog(NOTICE, "batch_join2_groupby [%d..%d] mode=%s: "
-         "total=%.1f ms  build=%.1f ms  source=%.1f ms  "
-         "join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
-         "rows=%ld  batches=%d  groups=%d  dim1=%d dim2=%d",
-         lo, hi, mode,
-         total_ms, build_ms, src_ms, j1_ms, j2_ms, agg_ms,
-         total_rows, nbatches, ngroups, dim1.nentries, dim2.nentries);
+    {
+        /*
+         * For the columnar source, say how much of the scan was borrowed and
+         * how much had to be materialized: it is the first split of the source
+         * time and it costs nothing to report.
+         */
+        char    srcinfo[128] = "";
+
+        if (strcmp(mode, "pgcolumnar") == 0)
+        {
+            int64 g, gc, rws, bc;
+
+            xpcn_source_stats(source, &g, &gc, &rws, &bc);
+            snprintf(srcinfo, sizeof(srcinfo),
+                     "  rowgroups=%ld copied=%ld copied_bytes=%ld",
+                     (long) g, (long) gc, (long) bc);
+        }
+
+        elog(NOTICE, "batch_join2_groupby [%d..%d] mode=%s: "
+             "total=%.1f ms  build=%.1f ms  source=%.1f ms  "
+             "join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
+             "rows=%ld  batches=%d  groups=%d  dim1=%d dim2=%d%s",
+             lo, hi, mode,
+             total_ms, build_ms, src_ms, j1_ms, j2_ms, agg_ms,
+             total_rows, nbatches, ngroups, dim1.nentries, dim2.nentries,
+             srcinfo);
+    }
 
     source->ops->end(source);
     pfree(ht);
