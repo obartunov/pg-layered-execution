@@ -431,6 +431,13 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     zone->schema_hash = schema_hash;
     memcpy(zone->col_attnos, attnos, ncols * sizeof(int16));
     zone->mcxt = zlfs_reg->mcxt;
+    /*
+     * Back to the caller's context immediately.  Only the zone's own storage
+     * belongs in the registry context; the scan below allocates freely and
+     * none of that should land in a context that is never reset.  The
+     * explicit switches around each zone allocation say which is which.
+     */
+    MemoryContextSwitchTo(old);
 
     /*
      * Fill the zone by draining a typed batch source rather than walking

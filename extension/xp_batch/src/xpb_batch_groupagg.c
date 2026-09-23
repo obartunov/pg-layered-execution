@@ -164,15 +164,43 @@ batch_aggregate(XpBatchSource *source, BatchAggResult *res)
  * Measures the cost of converting compact columns back to row representation.
  * Uses Virtual slots (Datum/isnull arrays) — the cheapest slot type.
  */
+/*
+ * Both control paths below read a zone's first three columns as int4.  Since
+ * ZLFS v2 a zone column carries its own type, so that assumption has to be
+ * checked rather than made: an int8 column read through an int32 * returns
+ * half of each value, silently and with the right row count.
+ */
+static void
+zlfs_require_int4_cols(ZlfsZone *zone, int ncols, const char *what)
+{
+    if (zone->ncols < ncols)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("%s: zone has %d columns, %d required",
+                        what, zone->ncols, ncols)));
+    for (int c = 0; c < ncols; c++)
+        if (zone->col_types[c] != ZLFS_COL_INT4)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("%s: zone column %d is not int4", what, c)));
+        else if (zone->col_validity[c] != NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("%s: zone column %d has NULLs, which this control path does not carry",
+                            what, c)));
+}
+
 static void
 slot_aggregate(ZlfsZone *zone, BatchAggResult *res)
 {
     CGroupEntry *ht = palloc0(GRP_CAP * sizeof(CGroupEntry));
     int ngroups = 0;
+    int32 *col_pk, *col_ck, *col_dt;
 
-    int32 *col_pk = zone->cols[0];
-    int32 *col_ck = zone->cols[1];
-    int32 *col_dt = zone->cols[2];
+    zlfs_require_int4_cols(zone, 3, "slot_aggregate");
+    col_pk = zone->cols[0];
+    col_ck = zone->cols[1];
+    col_dt = zone->cols[2];
 
     /* Create a virtual TupleTableSlot with 3 columns */
     TupleDesc tdesc = CreateTemplateTupleDesc(3);
@@ -272,9 +300,12 @@ copy_batch_aggregate(ZlfsZone *zone, BatchAggResult *res)
     int64 cursor = 0;
     int cap = XPCB_BATCH_CAP;
 
-    int32 *buf_pk = palloc(cap * sizeof(int32));
-    int32 *buf_ck = palloc(cap * sizeof(int32));
-    int32 *buf_dt = palloc(cap * sizeof(int32));
+    int32 *buf_pk, *buf_ck, *buf_dt;
+
+    zlfs_require_int4_cols(zone, 3, "copy_aggregate");
+    buf_pk = palloc(cap * sizeof(int32));
+    buf_ck = palloc(cap * sizeof(int32));
+    buf_dt = palloc(cap * sizeof(int32));
 
     instr_time t0, t1;
     double copy_accum = 0.0, agg_accum = 0.0;
@@ -290,9 +321,15 @@ copy_batch_aggregate(ZlfsZone *zone, BatchAggResult *res)
 
         /* Copy phase */
         INSTR_TIME_SET_CURRENT(t_phase);
-        memcpy(buf_pk, zone->cols[0] + cursor, chunk * sizeof(int32));
-        memcpy(buf_ck, zone->cols[1] + cursor, chunk * sizeof(int32));
-        memcpy(buf_dt, zone->cols[2] + cursor, chunk * sizeof(int32));
+        /*
+         * zone->cols is void * since ZLFS v2, so it must be cast before the
+         * offset is applied -- pointer arithmetic on void * advances by
+         * BYTES, which would have read cursor/4 of the way into the column.
+         * This control path assumes int4, so it checks rather than assumes.
+         */
+        memcpy(buf_pk, (int32 *) zone->cols[0] + cursor, chunk * sizeof(int32));
+        memcpy(buf_ck, (int32 *) zone->cols[1] + cursor, chunk * sizeof(int32));
+        memcpy(buf_dt, (int32 *) zone->cols[2] + cursor, chunk * sizeof(int32));
         {
             instr_time t_now;
             INSTR_TIME_SET_CURRENT(t_now);
