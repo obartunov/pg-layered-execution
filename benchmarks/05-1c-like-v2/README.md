@@ -355,3 +355,191 @@ Not tested:
 * Scale beyond 1M rows.
 * JIT, which this build does not have.
 * Anything about 1C.
+
+---
+
+# Benchmark 05-B — Heap Deform Cost
+
+05-A left an asymmetry: benchmark 04's *narrow fixed-layout* heap source beat
+pgColumnar, while 05-A's *wide generic-deform* heap source lost to it. That
+comparison is confounded — width, types, NULLability, attribute order, source
+path and generator all differ between the two. 05-B isolates one variable.
+
+> How much of the 05-A heap-source cost is tuple deformation, and how much is
+> the wider physical row itself?
+
+**Answer: it is overwhelmingly deformation.** On one physical table, generic
+`heap_deform_tuple` costs **2.2–2.5× fixed-offset extraction**. The difficult
+attribute layout adds only a few percent beyond that.
+
+## The three arms
+
+Two heap tables, **logically identical rows, same order, same payload**,
+differing only in whether the five columns the report reads form a
+fixed-width NOT NULL prefix. Definitions in `schema-layouts.sql`.
+
+| arm | table | path | why |
+|---|---|---|---|
+| **A** | `reg2_bad` | deform | `comment` (varlena) at attnum 2, ahead of the projection — fixed *cannot* address it |
+| **B** | `reg2_fixed` | deform **forced** | same rows, projection is a fixed prefix; deform forced anyway |
+| **C** | `reg2_fixed` | fixed | the same table through fixed-offset extraction |
+
+`B − C` is the strongest estimate of deformation cost: same physical table,
+same rows, same pipeline. `A − B` is the layout effect beyond the mechanism.
+
+The mode is **proved from outside**, by a counter the fixed path cannot
+increment, not by trusting the flag passed in:
+
+```
+fixedlayout-deform   heap_path=deform  tuples_deformed=1000008  attrs_deformed=9000072
+fixedlayout-fixed    heap_path=fixed   tuples_deformed=0        attrs_deformed=0
+bad-fixed            ERROR: "reg2_bad" cannot use the fixed-offset path:
+                            column "comment" is variable-width
+```
+
+Forcing exists only for this benchmark. Production path selection is
+unchanged, there is no GUC, and `-fixed` on an unaddressable layout errors
+rather than downgrading.
+
+## Proof of equivalence
+
+`verify-layouts.sql`, before any timing:
+
+```
+logical checksum IDENTICAL: a5fdd715c60cab8cbe03a5525bbc4df1   (all 9 columns, 1 000 008 rows)
+period / company / account / payload-length / NULL distributions   all identical
+SQL report identical over both layouts (200 groups)
+```
+
+The SQL equivalence is checked **before xp_batch is involved**, so a generator
+or load mistake cannot be mistaken for a source-path effect.
+
+### Physical size is *not* identical — recorded, not hidden
+
+Reordering attributes changes alignment padding:
+
+| | relation | pages | avg_width | buffers on a full scan |
+|---|---|---|---|---|
+| `reg2_bad` | 95 MB | 12 150 | 65 | `shared hit=12150` |
+| `reg2_fixed` | 92 MB | 11 795 | 65 | `shared hit=11795` |
+
+`reg2_fixed` is **2.92% smaller**. So `A − B` is "layout *and* a 3% size
+difference", not layout alone. `B − C` is unaffected — it is the same table.
+
+Both scans are fully cached (`shared hit` only, no `read=`), so no disk I/O is
+being read as deform cost.
+
+## Results
+
+Warm cache, 1 warm-up + 5 measured runs, median (min–max). Same GUCs as 05-A,
+set explicitly: `work_mem=64MB`, `enable_hashjoin=on`, `jit=off`,
+`max_parallel_workers_per_gather=0`.
+
+| predicate | arm | total | min | max | **source** | operators | rows selected |
+|---|---|---|---|---|---|---|---|
+| empty (90..91) | A bad / deform | 49.5 | 48.6 | 56.6 | **49.0** | 0.0 | 0 |
+| | B fixed / deform | 47.7 | 45.6 | 51.0 | **47.2** | 0.0 | 0 |
+| | C fixed / fixed | 19.0 | 18.0 | 20.4 | **18.6** | 0.0 | 0 |
+| 1/12 | A bad / deform | 54.4 | 53.1 | 55.0 | **53.0** | 0.9 | 83 334 |
+| | B fixed / deform | 49.4 | 48.2 | 60.5 | **47.9** | 0.9 | 83 334 |
+| | C fixed / fixed | 22.3 | 22.1 | 23.9 | **20.9** | 0.8 | 83 334 |
+| | *pgColumnar (context)* | *10.0* | *9.9* | *15.9* | *8.4* | *0.8* | *83 334* |
+| 12/12 | A bad / deform | 81.8 | 78.2 | 83.3 | **74.0** | 7.4 | 1 000 008 |
+| | B fixed / deform | 77.6 | 74.0 | 79.6 | **69.5** | 7.5 | 1 000 008 |
+| | C fixed / fixed | 42.2 | 39.3 | 43.9 | **32.1** | 7.5 | 1 000 008 |
+| | *pgColumnar (context)* | *44.1* | *42.0* | *76.1* | *36.0* | *7.3* | *1 000 008* |
+
+### The two estimates
+
+| predicate | A | B | C | **B − C** (deform) | **A − B** (layout) |
+|---|---|---|---|---|---|
+| empty | 49.0 | 47.2 | 18.6 | **28.6 ms, 2.54×** | 1.8 ms |
+| 1/12 | 53.0 | 47.9 | 20.9 | **27.0 ms, 2.29×** | 5.1 ms |
+| 12/12 | 74.0 | 69.5 | 32.1 | **37.4 ms, 2.17×** | 4.5 ms |
+
+This is **Case 1**: `B >> C`. Generic tuple deformation is the dominant source
+penalty.
+
+**The empty range is the cleanest measurement in the experiment.** No rows are
+emitted, no batch is materialized, no operator runs — it is scan plus tuple
+access plus predicate evaluation and nothing else. Deform still costs 28.6 ms
+more than fixed offsets, for a million tuples every one of which is rejected.
+Deformation is being paid before any row survives.
+
+`A − B` is 1.8–5.1 ms against a 2.92% (≈2.8 MB) size difference between the
+tables, so most of it is plausibly the size, not the attribute order. The
+honest statement is that the difficult layout costs **little beyond forcing
+the deform path in the first place** — which it does absolutely, since fixed
+cannot address it at all.
+
+## Where the deform work goes
+
+The counters answer §10 directly:
+
+```
+attrs_requested   5
+attrs_deformed    9 000 072  =  9 attributes x 1 000 008 tuples
+```
+
+`heap_deform_tuple()` deforms **every attribute of the tuple descriptor** —
+not only the requested ones, and not only up to the highest requested attnum.
+On `reg2_fixed` the projection is attnums 1..5, yet all 9 are deformed, including
+the two numerics and the varlena that nothing reads.
+
+*Follow-up hypothesis, not implemented and not measured:* a deform bounded to
+the highest requested attnum (as `slot_getsomeattrs` does) would cut this from
+9 attributes to 5 on `reg2_fixed`, and from 9 to 9 on `reg2_bad` — so it would
+help exactly the layouts that are already fast, and not the difficult one.
+Left alone per the no-optimization rule.
+
+## What this does to the 05-A conclusion
+
+05-A reported that pgColumnar beat heap at every selectivity point. With the
+heap source on **fixed offsets over the same wide row**, that reverses at full
+scan:
+
+| | 1/12 | 12/12 |
+|---|---|---|
+| heap, deform (05-A's arm) | 53.0 | 74.0 |
+| heap, fixed offsets | 20.9 | **32.1** |
+| pgColumnar | **8.4** | 36.0 |
+
+At 12/12 the fixed-offset heap source is now *faster* than pgColumnar (32.1 vs
+36.0), restoring benchmark 04's ordering on a row shape ten times wider. At
+1/12 pgColumnar still wins by 2.5×, and that margin is rowgroup pruning, which
+the heap has none of.
+
+So **05-A was substantially measuring deform cost, not a columnar advantage.**
+The columnar advantage that survives is the one attributable to pruning.
+
+This is also partly **Case 4**: pgColumnar's win at 1/12 is *not* caused by
+heap deform, because it persists against the fixed-offset arm.
+
+## Correctness gate
+
+All three arms plus the SQL form over *both* physical tables, on the empty
+range, 1/12 and 12/12. Checksums are identical to 05-A's, which is itself a
+check that the two new layouts carry the same data:
+
+```
+range 90..91  d41d8cd98f00b204e9800998ecf8427e   0 groups
+range 1..1    06ee205763e88a4c69acc3500e485869   200 groups
+range 1..12   135d70b3a7b8f075335c56de08a27a39   200 groups
+```
+
+`sum(debit) − sum(credit) = sum(debit − credit)` holds everywhere.
+
+## Limitations
+
+* `A − B` carries a 2.92% relation-size confound; `B − C` does not.
+* No `filter_ms` / `materialize_ms` split — isolating those needs hot-loop
+  instrumentation that would change what is being measured. Recorded as not
+  measured rather than estimated.
+* Warm cache only. No cold-cache experiment was run.
+* Only 3 of the 4 selectivity points; 3/12 and 6/12 were not needed, since the
+  three measured points were unambiguous.
+* The fixed-offset path was widened from int4 to int8 for this benchmark —
+  without it arm C could not exist at all, since the report reads three int8
+  columns. That is a capability addition to the *fixed* path, not an
+  optimization of the deform path being measured.
+* No optimization was applied during measurement.

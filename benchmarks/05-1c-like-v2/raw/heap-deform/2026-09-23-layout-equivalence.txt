@@ -1,0 +1,19 @@
+--- row counts and logical equivalence ---
+reg2_fixed rows    1000008
+reg2_bad   rows    1000008
+logical checksum IDENTICAL: a5fdd715c60cab8cbe03a5525bbc4df1
+
+--- distributions must match ---
+period distribution   identical
+company distribution  identical
+account distribution  identical
+payload length distr  identical
+NULL counts           identical
+
+--- PHYSICAL size: reordering changes padding, so this is measured ---
+reg2_bad     relation     95 MB  total     95 MB  pages   12150  avg_width    65
+reg2_fixed   relation     92 MB  total     92 MB  pages   11795  avg_width    65
+size difference (fixed - bad): -2908160 bytes, -2.92%
+
+--- the same SQL report over both tables must agree, before xp_batch ---
+SQL report identical over both layouts (200 groups)

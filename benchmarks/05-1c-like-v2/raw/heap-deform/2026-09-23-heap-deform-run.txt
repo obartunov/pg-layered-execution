@@ -1,0 +1,130 @@
+############ Benchmark 05-B — heap deform cost ############
+
+=== layout equivalence and physical sizes ===
+--- row counts and logical equivalence ---
+reg2_fixed rows    1000008
+reg2_bad   rows    1000008
+logical checksum IDENTICAL: a5fdd715c60cab8cbe03a5525bbc4df1
+
+--- distributions must match ---
+period distribution   identical
+company distribution  identical
+account distribution  identical
+payload length distr  identical
+NULL counts           identical
+
+--- PHYSICAL size: reordering changes padding, so this is measured ---
+reg2_bad     relation     95 MB  total     95 MB  pages   12150  avg_width    65
+reg2_fixed   relation     92 MB  total     92 MB  pages   11795  avg_width    65
+size difference (fixed - bad): -2908160 bytes, -2.92%
+
+--- the same SQL report over both tables must agree, before xp_batch ---
+SQL report identical over both layouts (200 groups)
+
+############ source-mode proof ############
+The mode is proved from the OUTSIDE, by a counter the fixed path cannot
+increment, not by trusting the flag that was passed in.
+
+[1..12] mode=fixedlayout-deform: total=83.2 ms  build=0.5 ms  open=0.0 ms  source=74.5 ms  join1=2.2 ms  join2=2.6 ms  agg=3.4 ms  operators=8.2 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+[1..12] mode=fixedlayout-fixed: total=38.1 ms  build=0.2 ms  open=0.0 ms  source=29.4 ms  join1=2.2 ms  join2=2.3 ms  agg=2.7 ms  operators=7.2 ms  rows=1000008  batches=16  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 attrs_requested=5
+
+-- fixed mode on a layout that cannot support it must ERROR, not downgrade:
+ERROR:  HeapBatchSource: "reg2_bad" cannot use the fixed-offset path: column "comment" is variable-width
+HINT:  Use XPB_HEAP_DEFORM for this layout.
+
+############ correctness gate ############
+All three arms, every predicate. Timing is not taken if this fails.
+
+NOTICE:  v2_register_report [90..91] mode=bad-deform: total=53.8 ms  build=0.4 ms  open=0.0 ms  source=53.4 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-deform: total=47.9 ms  build=0.3 ms  open=0.1 ms  source=47.5 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-fixed: total=16.4 ms  build=0.2 ms  open=0.0 ms  source=16.1 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=bad-deform: total=53.8 ms  build=0.2 ms  open=0.0 ms  source=52.7 ms  join1=0.3 ms  join2=0.3 ms  agg=0.3 ms  operators=0.8 ms  rows=83334  batches=2  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-deform: total=50.1 ms  build=0.2 ms  open=0.0 ms  source=49.1 ms  join1=0.3 ms  join2=0.3 ms  agg=0.3 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-fixed: total=18.1 ms  build=0.2 ms  open=0.0 ms  source=16.8 ms  join1=0.3 ms  join2=0.3 ms  agg=0.3 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=bad-deform: total=71.9 ms  build=0.2 ms  open=0.0 ms  source=63.8 ms  join1=2.2 ms  join2=2.8 ms  agg=3.0 ms  operators=7.9 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-deform: total=61.8 ms  build=0.1 ms  open=0.0 ms  source=54.6 ms  join1=1.9 ms  join2=2.4 ms  agg=2.9 ms  operators=7.1 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-fixed: total=38.1 ms  build=0.1 ms  open=0.0 ms  source=25.9 ms  join1=2.9 ms  join2=3.5 ms  agg=5.7 ms  operators=12.1 ms  rows=1000008  batches=16  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 attrs_requested=5
+90..91 bad-deform            d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 fixedlayout-deform    d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 fixedlayout-fixed     d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 sql_reg2_bad          d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 sql_reg2_fixed        d41d8cd98f00b204e9800998ecf8427e  groups=0
+1..1   bad-deform            06ee205763e88a4c69acc3500e485869  groups=200
+1..1   fixedlayout-deform    06ee205763e88a4c69acc3500e485869  groups=200
+1..1   fixedlayout-fixed     06ee205763e88a4c69acc3500e485869  groups=200
+1..1   sql_reg2_bad          06ee205763e88a4c69acc3500e485869  groups=200
+1..1   sql_reg2_fixed        06ee205763e88a4c69acc3500e485869  groups=200
+1..12  bad-deform            135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  fixedlayout-deform    135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  fixedlayout-fixed     135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  sql_reg2_bad          135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  sql_reg2_fixed        135d70b3a7b8f075335c56de08a27a39  groups=200
+NOTICE:  05-B gate PASS: three arms and both SQL layouts agree on every range
+
+############ buffer residency ############
+Both tables must be operating under comparable cache conditions, or a
+difference in reads would be read as deform cost.
+  reg2_bad: shared hit=12150
+  reg2_fixed: shared hit=11795
+
+############ timings: 1 warm-up + 5 measured runs ############
+# arm,lo,hi,run,total_ms,open_ms,source_ms,operators_ms,rows,heap_path,tuples_deformed,attrs_deformed,attrs_requested
+bad-deform,90,91,1,49.5,0.0,49.0,0.0,0,deform,1000008,9000072,5
+bad-deform,90,91,2,48.6,0.0,48.0,0.0,0,deform,1000008,9000072,5
+bad-deform,90,91,3,49.0,0.0,48.5,0.0,0,deform,1000008,9000072,5
+bad-deform,90,91,4,56.3,0.0,55.9,0.0,0,deform,1000008,9000072,5
+bad-deform,90,91,5,56.6,0.0,56.1,0.0,0,deform,1000008,9000072,5
+fixedlayout-deform,90,91,1,47.7,0.0,47.2,0.0,0,deform,1000008,9000072,5
+fixedlayout-deform,90,91,2,45.9,0.0,45.5,0.0,0,deform,1000008,9000072,5
+fixedlayout-deform,90,91,3,45.6,0.0,45.1,0.0,0,deform,1000008,9000072,5
+fixedlayout-deform,90,91,4,51.0,0.0,50.5,0.0,0,deform,1000008,9000072,5
+fixedlayout-deform,90,91,5,47.9,0.0,47.5,0.0,0,deform,1000008,9000072,5
+fixedlayout-fixed,90,91,1,19.0,0.0,18.6,0.0,0,fixed,0,0,5
+fixedlayout-fixed,90,91,2,18.0,0.0,17.5,0.0,0,fixed,0,0,5
+fixedlayout-fixed,90,91,3,20.3,0.0,19.8,0.0,0,fixed,0,0,5
+fixedlayout-fixed,90,91,4,18.2,0.0,17.7,0.0,0,fixed,0,0,5
+fixedlayout-fixed,90,91,5,20.4,0.0,20.0,0.0,0,fixed,0,0,5
+bad-deform,1,1,1,53.1,0.0,51.8,0.9,83334,deform,1000008,9000072,5
+bad-deform,1,1,2,53.1,0.0,51.6,0.9,83334,deform,1000008,9000072,5
+bad-deform,1,1,3,54.4,0.0,53.0,0.9,83334,deform,1000008,9000072,5
+bad-deform,1,1,4,54.9,0.0,53.4,0.9,83334,deform,1000008,9000072,5
+bad-deform,1,1,5,55.0,0.0,53.8,0.8,83334,deform,1000008,9000072,5
+fixedlayout-deform,1,1,1,49.4,0.0,47.9,0.9,83334,deform,1000008,9000072,5
+fixedlayout-deform,1,1,2,48.2,0.0,46.9,0.9,83334,deform,1000008,9000072,5
+fixedlayout-deform,1,1,3,51.5,0.0,49.8,1.1,83334,deform,1000008,9000072,5
+fixedlayout-deform,1,1,4,60.5,0.0,59.1,0.9,83334,deform,1000008,9000072,5
+fixedlayout-deform,1,1,5,48.4,0.0,46.9,0.9,83334,deform,1000008,9000072,5
+fixedlayout-fixed,1,1,1,22.2,0.0,20.7,0.8,83334,fixed,0,0,5
+fixedlayout-fixed,1,1,2,22.1,0.0,20.7,0.8,83334,fixed,0,0,5
+fixedlayout-fixed,1,1,3,22.3,0.0,20.9,0.8,83334,fixed,0,0,5
+fixedlayout-fixed,1,1,4,22.4,0.0,21.0,0.8,83334,fixed,0,0,5
+fixedlayout-fixed,1,1,5,23.9,0.0,22.4,0.9,83334,fixed,0,0,5
+bad-deform,1,12,1,81.8,0.0,74.0,7.4,1000008,deform,1000008,9000072,5
+bad-deform,1,12,2,83.3,0.0,75.3,7.6,1000008,deform,1000008,9000072,5
+bad-deform,1,12,3,83.3,0.0,75.0,7.8,1000008,deform,1000008,9000072,5
+bad-deform,1,12,4,79.5,0.0,71.6,7.3,1000008,deform,1000008,9000072,5
+bad-deform,1,12,5,78.2,0.0,70.5,7.2,1000008,deform,1000008,9000072,5
+fixedlayout-deform,1,12,1,74.0,0.0,66.3,7.1,1000008,deform,1000008,9000072,5
+fixedlayout-deform,1,12,2,75.4,0.0,67.6,7.3,1000008,deform,1000008,9000072,5
+fixedlayout-deform,1,12,3,79.6,0.0,71.4,7.7,1000008,deform,1000008,9000072,5
+fixedlayout-deform,1,12,4,77.6,0.0,69.5,7.5,1000008,deform,1000008,9000072,5
+fixedlayout-deform,1,12,5,78.5,0.0,69.9,8.0,1000008,deform,1000008,9000072,5
+fixedlayout-fixed,1,12,1,39.3,0.0,30.2,7.3,1000008,fixed,0,0,5
+fixedlayout-fixed,1,12,2,41.0,0.0,32.1,7.3,1000008,fixed,0,0,5
+fixedlayout-fixed,1,12,3,43.9,0.0,33.9,8.0,1000008,fixed,0,0,5
+fixedlayout-fixed,1,12,4,42.2,0.0,31.9,8.4,1000008,fixed,0,0,5
+fixedlayout-fixed,1,12,5,42.8,0.0,33.4,7.5,1000008,fixed,0,0,5
+
+# pgColumnar context, same two predicates, unchanged code
+pgcolumnar,1,1,1,10.2,0.2,8.7,0.8,83334,n/a,,,
+pgcolumnar,1,1,2,10.0,0.2,8.3,0.9,83334,n/a,,,
+pgcolumnar,1,1,3,15.9,0.3,13.4,1.5,83334,n/a,,,
+pgcolumnar,1,1,4,10.0,0.3,8.4,0.8,83334,n/a,,,
+pgcolumnar,1,1,5,9.9,0.2,8.4,0.8,83334,n/a,,,
+pgcolumnar,1,12,1,76.1,0.3,61.4,13.8,1000008,n/a,,,
+pgcolumnar,1,12,2,43.2,0.3,35.3,7.1,1000008,n/a,,,
+pgcolumnar,1,12,3,44.2,0.2,36.2,7.3,1000008,n/a,,,
+pgcolumnar,1,12,4,42.0,0.2,34.2,7.1,1000008,n/a,,,
+pgcolumnar,1,12,5,44.1,0.2,36.0,7.3,1000008,n/a,,,
+
+############ done ############

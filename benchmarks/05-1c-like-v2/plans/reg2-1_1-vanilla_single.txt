@@ -1,33 +1,33 @@
-Finalize HashAggregate (actual time=90.102..90.174 rows=200.00 loops=1)
+Finalize HashAggregate (actual time=83.406..83.479 rows=200.00 loops=1)
   Group Key: c.company_group, a.account_group, r.company_key
   Batches: 1  Memory Usage: 129kB
   Buffers: shared hit=12203
-  ->  Hash Join (actual time=76.312..86.645 rows=10000.00 loops=1)
+  ->  Hash Join (actual time=73.967..80.492 rows=10000.00 loops=1)
         Hash Cond: (r.account_key = a.account_key)
         Buffers: shared hit=12203
-        ->  Hash Join (actual time=76.257..83.771 rows=10000.00 loops=1)
+        ->  Hash Join (actual time=73.907..79.332 rows=10000.00 loops=1)
               Hash Cond: (r.company_key = c.company_key)
               Buffers: shared hit=12201
-              ->  Partial HashAggregate (actual time=76.223..82.365 rows=10000.00 loops=1)
+              ->  Partial HashAggregate (actual time=73.875..78.237 rows=10000.00 loops=1)
                     Group Key: r.company_key, r.account_key
                     Batches: 1  Memory Usage: 5393kB
                     Buffers: shared hit=12200
-                    ->  Seq Scan on reg2 r (actual time=0.011..58.025 rows=83334.00 loops=1)
+                    ->  Seq Scan on reg2 r (actual time=0.008..55.722 rows=83334.00 loops=1)
                           Filter: ((period >= 1) AND (period <= 1))
                           Rows Removed by Filter: 916674
                           Buffers: shared hit=12200
-              ->  Hash (actual time=0.019..0.020 rows=50.00 loops=1)
+              ->  Hash (actual time=0.018..0.018 rows=50.00 loops=1)
                     Buckets: 1024  Batches: 1  Memory Usage: 10kB
                     Buffers: shared hit=1
                     ->  Seq Scan on dim_company c (actual time=0.010..0.012 rows=50.00 loops=1)
                           Buffers: shared hit=1
-        ->  Hash (actual time=0.042..0.042 rows=200.00 loops=1)
+        ->  Hash (actual time=0.045..0.046 rows=200.00 loops=1)
               Buckets: 1024  Batches: 1  Memory Usage: 18kB
               Buffers: shared hit=2
-              ->  Seq Scan on dim_account2 a (actual time=0.011..0.020 rows=200.00 loops=1)
+              ->  Seq Scan on dim_account2 a (actual time=0.015..0.024 rows=200.00 loops=1)
                     Buffers: shared hit=2
 Settings: work_mem = '64MB', max_parallel_workers_per_gather = '0'
 Planning:
   Buffers: shared hit=206
-Planning Time: 0.577 ms
-Execution Time: 90.735 ms
+Planning Time: 0.605 ms
+Execution Time: 84.108 ms
