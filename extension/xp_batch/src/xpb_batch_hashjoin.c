@@ -11,6 +11,7 @@
 #include "postgres.h"
 #include "funcapi.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
@@ -34,7 +35,6 @@ typedef struct DimEntry
 {
     int32   key;        /* period_key */
     int32   year;       /* payload */
-    int32   quarter;
     bool    occupied;
 } DimEntry;
 
@@ -44,12 +44,59 @@ typedef struct DimHashTable
     int      nentries;
 } DimHashTable;
 
+/*
+ * The dimension readers address attributes by fixed attnum, which is the
+ * contract the benchmark schema satisfies.  A table that does not satisfy it
+ * must be refused here: heap_getattr() past natts reaches getmissingattr(),
+ * which dereferences attrmiss for an attribute that has no entry and crashes
+ * the backend.  A dropped attribute is equally unusable -- its values are gone
+ * and its type is 0 -- and a non-int4 attribute would be read as an int4 Datum,
+ * which silently returns nonsense for a by-reference type.
+ *
+ * Only the attnums actually READ are required.  dim_build used to read attnum 3
+ * of dim_period into a `quarter` field that nothing ever consumed, which turned
+ * a third column into a load-bearing requirement for no reason -- and the
+ * original benchmark schema has `month` there, not a quarter.
+ *
+ * Not static: xpb_batch_partition.c builds the same dimensions.
+ */
+void
+xpb_dim_check_shape(Relation rel, int nrequired, const char *what)
+{
+    TupleDesc   desc = RelationGetDescr(rel);
+
+    if (desc->natts < nrequired)
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("%s: \"%s\" has %d columns, %d required",
+                        what, RelationGetRelationName(rel),
+                        desc->natts, nrequired)));
+
+    for (int i = 0; i < nrequired; i++)
+    {
+        Form_pg_attribute att = TupleDescAttr(desc, i);
+
+        if (att->attisdropped)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("%s: \"%s\" column %d is dropped",
+                            what, RelationGetRelationName(rel), i + 1)));
+        if (att->atttypid != INT4OID)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("%s: \"%s\".%s is type %u, integer required",
+                            what, RelationGetRelationName(rel),
+                            NameStr(att->attname), att->atttypid)));
+    }
+}
+
 static void
 dim_build(DimHashTable *dim, Oid dim_relid)
 {
     memset(dim, 0, sizeof(*dim));
 
     Relation rel = table_open(dim_relid, AccessShareLock);
+    xpb_dim_check_shape(rel, 2, "dim_build");
     Snapshot snap = GetActiveSnapshot();
     TableScanDesc scan = table_beginscan(rel, snap, 0, NULL, 0);
     HeapTuple tup;
@@ -60,8 +107,6 @@ dim_build(DimHashTable *dim, Oid dim_relid)
         int32 pk = DatumGetInt32(heap_getattr(tup, 1, RelationGetDescr(rel), &isnull));
         if (isnull) continue;
         int32 yr = DatumGetInt32(heap_getattr(tup, 2, RelationGetDescr(rel), &isnull));
-        if (isnull) continue;
-        int32 qt = DatumGetInt32(heap_getattr(tup, 3, RelationGetDescr(rel), &isnull));
         if (isnull) continue;
 
         if (dim->nentries >= DIM_CAP * 3 / 4)
@@ -76,7 +121,6 @@ dim_build(DimHashTable *dim, Oid dim_relid)
             {
                 dim->entries[idx].key = pk;
                 dim->entries[idx].year = yr;
-                dim->entries[idx].quarter = qt;
                 dim->entries[idx].occupied = true;
                 dim->nentries++;
                 break;
@@ -396,6 +440,7 @@ dim2_build(Dim2HashTable *dim, Oid dim_relid)
 {
     memset(dim, 0, sizeof(*dim));
     Relation rel = table_open(dim_relid, AccessShareLock);
+    xpb_dim_check_shape(rel, 2, "dim2_build");
     Snapshot snap = GetActiveSnapshot();
     TableScanDesc scan = table_beginscan(rel, snap, 0, NULL, 0);
     HeapTuple tup;

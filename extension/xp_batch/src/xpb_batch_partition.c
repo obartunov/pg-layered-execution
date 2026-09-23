@@ -182,7 +182,7 @@ create_partition_source(Oid part_oid, int16 *attnos, int ncols,
 #define GRP_CAP  16384
 #define GRP_MAX_LOAD (GRP_CAP * 3 / 4)
 
-typedef struct { int32 key, year, quarter; bool occupied; } PDimEntry;
+typedef struct { int32 key, year; bool occupied; } PDimEntry;
 typedef struct { int32 key, payload; bool occupied; } ADimEntry;
 
 typedef struct {
@@ -207,11 +207,14 @@ typedef struct {
 #include "access/tableam.h"
 #include "utils/snapmgr.h"
 
+extern void xpb_dim_check_shape(Relation rel, int nrequired, const char *what);
+
 static void
 pdim_build(PDimHash *d, Oid relid)
 {
     memset(d, 0, sizeof(*d));
     Relation rel = table_open(relid, AccessShareLock);
+    xpb_dim_check_shape(rel, 2, "pdim_build");
     TableScanDesc scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, 0);
     HeapTuple tup;
     while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
@@ -219,14 +222,13 @@ pdim_build(PDimHash *d, Oid relid)
         bool n;
         int32 pk = DatumGetInt32(heap_getattr(tup, 1, RelationGetDescr(rel), &n)); if(n) continue;
         int32 yr = DatumGetInt32(heap_getattr(tup, 2, RelationGetDescr(rel), &n)); if(n) continue;
-        int32 qt = DatumGetInt32(heap_getattr(tup, 3, RelationGetDescr(rel), &n)); if(n) continue;
         if (d->nentries >= DIM_CAP * 3 / 4)
             ereport(ERROR, (errmsg("pdim overflow")));
         uint32 h = (uint32)pk * 2654435761u;
         for (int i = 0; i < DIM_CAP; i++) {
             int idx = (h+i) & (DIM_CAP-1);
             if (!d->entries[idx].occupied) {
-                d->entries[idx] = (PDimEntry){pk, yr, qt, true};
+                d->entries[idx] = (PDimEntry){pk, yr, true};
                 d->nentries++; break;
             }
         }
@@ -240,6 +242,7 @@ adim_build(ADimHash *d, Oid relid)
 {
     memset(d, 0, sizeof(*d));
     Relation rel = table_open(relid, AccessShareLock);
+    xpb_dim_check_shape(rel, 2, "adim_build");
     TableScanDesc scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL, 0);
     HeapTuple tup;
     while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)

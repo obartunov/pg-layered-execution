@@ -261,30 +261,63 @@ zlfs_scan_directory(void)
         ZlfsZone *z = zlfs_load_file(fpath);
         if (z && zlfs_reg->nzones < ZLFS_MAX_ZONES)
         {
-            /* Validate schema hash against current catalog */
+            /*
+             * Validate schema hash against current catalog.
+             *
+             * Nothing may leave this block by continue/break/return/goto:
+             * PG_END_TRY() is what pops PG_exception_stack and
+             * error_context_stack, and skipping it leaves them pointing into
+             * this frame after it is gone, so the NEXT ereport(ERROR) anywhere
+             * in the session longjmps into a dead frame.  Two `continue`s used
+             * to do exactly that; the symptom was a SIGSEGV in a later,
+             * unrelated call in the same backend (a stale zone file left by a
+             * dropped table was enough to arm it).  Record the verdict, leave
+             * the block normally, act afterwards.
+             *
+             * The catch arm also restores CurrentMemoryContext: on longjmp it
+             * is whatever the thrower left current, and allocations made after
+             * that land in a context this loop does not own.
+             */
+            bool    zone_usable = true;
+            bool    validate_failed = false;
+            uint32  current_hash = 0;
+
             if (OidIsValid(z->source_relid) && z->ncols > 0)
             {
+                MemoryContext caller_cx = CurrentMemoryContext;
+
                 PG_TRY();
                 {
-                    uint32 current_hash = zlfs_compute_schema_hash(
+                    current_hash = zlfs_compute_schema_hash(
                         z->source_relid, z->col_attnos, z->ncols);
-                    if (current_hash != z->schema_hash)
-                    {
-                        elog(WARNING, "ZLFS: schema mismatch for %s "
-                             "(stored=%08x, current=%08x), skipping",
-                             fpath, z->schema_hash, current_hash);
-                        continue;  /* don't register stale zone */
-                    }
                 }
                 PG_CATCH();
                 {
-                    /* Table may have been dropped — skip zone */
+                    /* the source table may have been dropped since the build */
+                    MemoryContextSwitchTo(caller_cx);
                     FlushErrorState();
-                    elog(WARNING, "ZLFS: cannot validate schema for %s, skipping", fpath);
-                    continue;
+                    validate_failed = true;
                 }
                 PG_END_TRY();
+
+                if (validate_failed)
+                {
+                    elog(WARNING, "ZLFS: cannot validate schema for %s "
+                         "(source relation gone?), skipping", fpath);
+                    zone_usable = false;
+                }
+                else if (current_hash != z->schema_hash)
+                {
+                    elog(WARNING, "ZLFS: schema mismatch for %s "
+                         "(stored=%08x, current=%08x), skipping",
+                         fpath, z->schema_hash, current_hash);
+                    zone_usable = false;
+                }
             }
+
+            if (!zone_usable)
+                continue;       /* outside the TRY block: legal */
+
             zlfs_reg->zones[zlfs_reg->nzones++] = z;
         }
     }
