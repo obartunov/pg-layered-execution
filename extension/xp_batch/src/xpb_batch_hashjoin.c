@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 #include "funcapi.h"
+#include "access/relation.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "access/heapam.h"
@@ -85,6 +86,44 @@ xpb_dim_check_shape(Relation rel, int nrequired, const char *what)
                     (errcode(ERRCODE_DATATYPE_MISMATCH),
                      errmsg("%s: \"%s\" column %d is dropped",
                             what, RelationGetRelationName(rel), i + 1)));
+        if (att->atttypid != INT4OID)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("%s: \"%s\".%s is type %u, integer required",
+                            what, RelationGetRelationName(rel),
+                            NameStr(att->attname), att->atttypid)));
+    }
+}
+
+/*
+ * Same check for an explicit list of attnums rather than the first N: the fact
+ * table is read at 1,2,3,6,7, so "the first five columns" would be the wrong
+ * question to ask of it.
+ *
+ * Not static: the 1C register report checks both its fact tables with it.
+ */
+void
+xpb_check_attnos(Relation rel, const int16 *attnos, int n, const char *what)
+{
+    TupleDesc   desc = RelationGetDescr(rel);
+
+    for (int i = 0; i < n; i++)
+    {
+        int16       attno = attnos[i];
+        Form_pg_attribute att;
+
+        if (attno < 1 || attno > desc->natts)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("%s: attno %d out of range (1..%d) for \"%s\"",
+                            what, attno, desc->natts,
+                            RelationGetRelationName(rel))));
+        att = TupleDescAttr(desc, attno - 1);
+        if (att->attisdropped)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("%s: \"%s\" attno %d is dropped",
+                            what, RelationGetRelationName(rel), attno)));
         if (att->atttypid != INT4OID)
             ereport(ERROR,
                     (errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -768,6 +807,265 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
         }
 
         elog(NOTICE, "batch_join2_groupby [%d..%d] mode=%s: "
+             "total=%.1f ms  build=%.1f ms  source=%.1f ms  "
+             "join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
+             "rows=%ld  batches=%d  groups=%d  dim1=%d dim2=%d%s",
+             lo, hi, mode,
+             total_ms, build_ms, src_ms, j1_ms, j2_ms, agg_ms,
+             total_rows, nbatches, ngroups, dim1.nentries, dim2.nentries,
+             srcinfo);
+    }
+
+    source->ops->end(source);
+    pfree(ht);
+    pfree(js1->year_buf); pfree(js1->sel_buf); pfree(js1);
+    pfree(acct_group_buf);
+
+    return (Datum) 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 1C-like analytical register report (benchmarks/04-1c-like-register)
+ *
+ * Same pipeline shape as above, but carrying TWO resources and producing
+ * THREE aggregates in one pass:
+ *
+ *   source(period, company, account, amount_dt, amount_kt)
+ *     -> BatchHashJoin(dim_period)   period  -> year
+ *     -> BatchHashJoin(dim_account)  account -> account_group
+ *     -> Agg GROUP BY year, account_group, company
+ *            SUM(amount_dt), SUM(amount_kt), SUM(amount_dt - amount_kt)
+ *
+ * net is derived at emit time from the two sums that were accumulated, not by
+ * running the query twice and subtracting outside: a second pass would read
+ * and join the rows again, which is exactly the cost being measured.
+ *
+ * Both sums are int64. For this benchmark the money columns are integers and
+ * int64 accumulation is exact for them; that is a property of the dataset, not
+ * support for PostgreSQL numeric.
+ *
+ * The existing 4-column entry point is left alone -- benchmark 02 and its
+ * published checksum depend on it.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct RegGroupEntry
+{
+    int32   year;
+    int32   account_group;
+    int32   company_key;
+    int64   debit;
+    int64   credit;
+    bool    occupied;
+} RegGroupEntry;
+
+PG_FUNCTION_INFO_V1(xpb_1c_register_report);
+
+Datum
+xpb_1c_register_report(PG_FUNCTION_ARGS)
+{
+    int32 lo = PG_GETARG_INT32(0);
+    int32 hi = PG_GETARG_INT32(1);
+    char *mode = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+    /* attnums this function reads from the fact table, in batch column order */
+    int16 fact_attnos[5] = { 1, 2, 3, 6, 7 };
+
+    InitMaterializedSRF(fcinfo, 0);
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+    Oid fact_relid = RelnameGetRelid("reg_buh");
+    Oid dim_period_relid = RelnameGetRelid("dim_period");
+    Oid dim_account_relid = RelnameGetRelid("dim_account");
+    if (!OidIsValid(fact_relid) || !OidIsValid(dim_period_relid) ||
+        !OidIsValid(dim_account_relid))
+        ereport(ERROR, (errmsg("reg_buh, dim_period, or dim_account not found")));
+
+    /*
+     * Check the fact table's shape before anything addresses it by attnum.
+     * The sources take attnos on trust; reading one past natts reaches
+     * getmissingattr() and takes the backend down, which is how the dim_build
+     * crash presented. Same check, applied to the side that was still unguarded.
+     */
+    {
+        Relation frel = relation_open(fact_relid, AccessShareLock);
+
+        xpb_check_attnos(frel, fact_attnos, 5, "1c_register_report(reg_buh)");
+        relation_close(frel, AccessShareLock);
+    }
+
+    instr_time tb0, tb1;
+    INSTR_TIME_SET_CURRENT(tb0);
+    DimHashTable dim1;
+    dim_build(&dim1, dim_period_relid);
+    Dim2HashTable dim2;
+    dim2_build(&dim2, dim_account_relid);
+    INSTR_TIME_SET_CURRENT(tb1);
+    double build_ms = INSTR_TIME_GET_MILLISEC(tb1) - INSTR_TIME_GET_MILLISEC(tb0);
+
+    XpBatchSource *source;
+    if (strcmp(mode, "zlfs") == 0)
+    {
+        zlfs_ensure_registry();
+        zlfs_scan_directory();
+        ZlfsZone *zone = zlfs_lookup_valid_zone(fact_relid, lo, hi);
+        if (!zone)
+            ereport(ERROR, (errmsg("no valid ZLFS zone for [%d..%d]", lo, hi)));
+        source = xpb_zlfs_source_create(zone, fact_attnos, 5);
+    }
+    else if (strcmp(mode, "heap") == 0)
+        source = xpb_heap_source_create(fact_relid, fact_attnos, 5, true, lo, hi);
+    else if (strcmp(mode, "pgcolumnar") == 0)
+    {
+        Oid col_relid = RelnameGetRelid("reg_buh_col");
+
+        if (!OidIsValid(col_relid))
+            ereport(ERROR, (errmsg("reg_buh_col not found"),
+                            errhint("Load the dataset with its schema-columnar.sql.")));
+        {
+            Relation crel = relation_open(col_relid, AccessShareLock);
+
+            xpb_check_attnos(crel, fact_attnos, 5,
+                             "1c_register_report(reg_buh_col)");
+            relation_close(crel, AccessShareLock);
+        }
+        source = xpcn_source_create(col_relid, fact_attnos, 5, true, lo, hi);
+    }
+    else
+        ereport(ERROR, (errmsg("unknown mode: %s", mode)));
+
+    BatchJoinState *js1 = batch_join_create(&dim1, XPCB_BATCH_CAP);
+    int32 *acct_group_buf = palloc(XPCB_BATCH_CAP * sizeof(int32));
+    RegGroupEntry *ht = palloc0(GRP_CAP * sizeof(RegGroupEntry));
+    int ngroups = 0;
+    int64 total_rows = 0;
+    int nbatches = 0;
+
+    XpColumnBatch in_batch, j1_out, j2_out;
+    memset(&in_batch, 0, sizeof(in_batch));
+    in_batch.ncols = 5;
+    in_batch.capacity = XPCB_BATCH_CAP;
+    memset(&j1_out, 0, sizeof(j1_out));
+    memset(&j2_out, 0, sizeof(j2_out));
+
+    instr_time t0, t1, tp;
+    double src_ms = 0, j1_ms = 0, j2_ms = 0, agg_ms = 0;
+
+    INSTR_TIME_SET_CURRENT(t0);
+
+    while (true)
+    {
+        in_batch.nrows = 0;
+
+        INSTR_TIME_SET_CURRENT(tp);
+        bool got = source->ops->next_batch(source, &in_batch);
+        { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
+          src_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
+        if (!got) break;
+        nbatches++;
+
+        INSTR_TIME_SET_CURRENT(tp);
+        batch_join_probe(js1, &in_batch, &j1_out);
+        { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
+          j1_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
+
+        INSTR_TIME_SET_CURRENT(tp);
+        batch_join2_probe(&dim2, 2, 2, &j1_out, &j2_out, acct_group_buf);
+        { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
+          j2_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
+
+        INSTR_TIME_SET_CURRENT(tp);
+        {
+            int nrows = j2_out.nrows;
+            int32 *col_yr = j2_out.int32_cols[0];
+            int32 *col_ck = j2_out.int32_cols[1];
+            int32 *col_ag = j2_out.int32_cols[2];
+            int32 *col_dt = j2_out.int32_cols[3];
+            int32 *col_kt = j2_out.int32_cols[4];
+
+            for (int i = 0; i < nrows; i++)
+            {
+                int32 yr = col_yr[i], ag = col_ag[i], ck = col_ck[i];
+                int64 dt = (int64) col_dt[i];
+                int64 kt = (int64) col_kt[i];
+                uint32 h = (uint32)yr * 2654435761u ^ (uint32)ag * 2246822519u
+                         ^ (uint32)ck * 0x45d9f3bu;
+                int sl = (int)(h & (GRP_CAP - 1));
+
+                for (int pr = 0; pr < GRP_CAP; pr++)
+                {
+                    int idx = (sl + pr) & (GRP_CAP - 1);
+                    RegGroupEntry *g = &ht[idx];
+
+                    if (!g->occupied)
+                    {
+                        if (ngroups >= GRP_MAX_LOAD)
+                            ereport(ERROR, (errmsg("1c_register_report: hash overflow "
+                                                   "(%d groups, cap %d)",
+                                                   ngroups, GRP_CAP)));
+                        g->year = yr; g->account_group = ag; g->company_key = ck;
+                        g->debit = dt; g->credit = kt;
+                        g->occupied = true; ngroups++; break;
+                    }
+                    if (g->year == yr && g->account_group == ag &&
+                        g->company_key == ck)
+                    { g->debit += dt; g->credit += kt; break; }
+                }
+            }
+            total_rows += nrows;
+        }
+        { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
+          agg_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
+
+        if (j2_out.owns_data)
+        {
+            for (int c = 0; c < j2_out.ncols; c++)
+                if (j2_out.int32_cols[c]) pfree(j2_out.int32_cols[c]);
+            j2_out.owns_data = false;
+        }
+        if (j1_out.owns_data)
+        {
+            for (int c = 0; c < j1_out.ncols; c++)
+                if (j1_out.int32_cols[c]) pfree(j1_out.int32_cols[c]);
+            j1_out.owns_data = false;
+        }
+    }
+
+    INSTR_TIME_SET_CURRENT(t1);
+    double total_ms = INSTR_TIME_GET_MILLISEC(t1) - INSTR_TIME_GET_MILLISEC(t0);
+
+    {
+        Datum vals[7];
+        bool nulls[7] = {false, false, false, false, false, false, false};
+
+        for (int i = 0; i < GRP_CAP; i++)
+        {
+            RegGroupEntry *g = &ht[i];
+
+            if (!g->occupied) continue;
+            vals[0] = Int32GetDatum(g->year);
+            vals[1] = Int32GetDatum(g->account_group);
+            vals[2] = Int32GetDatum(g->company_key);
+            vals[3] = Int64GetDatum(g->debit);
+            vals[4] = Int64GetDatum(g->credit);
+            vals[5] = Int64GetDatum(g->debit - g->credit);
+            vals[6] = Float8GetDatum(total_ms);
+            tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, vals, nulls);
+        }
+    }
+
+    {
+        char srcinfo[128] = "";
+
+        if (strcmp(mode, "pgcolumnar") == 0)
+        {
+            int64 g, gc, rws, bc;
+
+            xpcn_source_stats(source, &g, &gc, &rws, &bc);
+            snprintf(srcinfo, sizeof(srcinfo),
+                     "  rowgroups=%ld copied=%ld copied_bytes=%ld",
+                     (long) g, (long) gc, (long) bc);
+        }
+        elog(NOTICE, "1c_register_report [%d..%d] mode=%s: "
              "total=%.1f ms  build=%.1f ms  source=%.1f ms  "
              "join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
              "rows=%ld  batches=%d  groups=%d  dim1=%d dim2=%d%s",

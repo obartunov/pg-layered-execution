@@ -70,3 +70,12 @@ CREATE OR REPLACE FUNCTION xpb_partition_join2_groupby(
 RETURNS TABLE(year int, account_group int, company_key int, total_amt bigint, total_ms float8)
 LANGUAGE C STRICT
 AS '$libdir/xp_batch', 'xpb_partition_join2_groupby';
+
+-- 1C-like analytical register report (benchmarks/04-1c-like-register):
+-- two resources carried through the pipeline, three aggregates in one pass.
+CREATE OR REPLACE FUNCTION xpb_1c_register_report(lo int, hi int, source_mode text)
+RETURNS TABLE(year int, account_group int, company_key int,
+              debit_turnover bigint, credit_turnover bigint,
+              net_turnover bigint, total_ms float8)
+LANGUAGE C STRICT
+AS '$libdir/xp_batch', 'xpb_1c_register_report';
