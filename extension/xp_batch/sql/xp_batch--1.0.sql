@@ -79,3 +79,12 @@ RETURNS TABLE(year int, account_group int, company_key int,
               net_turnover bigint, total_ms float8)
 LANGUAGE C STRICT
 AS '$libdir/xp_batch', 'xpb_1c_register_report';
+
+-- Contract test harness: read a relation through the batch contract and hand
+-- back what the batch actually held, per column, including type and
+-- NULLability. Not part of any pipeline; used by test/contract_tests.sh to
+-- compare the batch layer against PostgreSQL's own view of the same table.
+CREATE OR REPLACE FUNCTION xpb_contract_probe(relname text, attnos int[], path text)
+RETURNS TABLE(rownum bigint, col int, coltype text, is_null bool, val text)
+LANGUAGE C STRICT
+AS '$libdir/xp_batch', 'xpb_contract_probe';

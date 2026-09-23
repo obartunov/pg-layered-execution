@@ -1,18 +1,56 @@
 /*
  * xpb_src_heap.c — HeapBatchSource: scans heap into compact column batches.
  *
- * Uses raw fixed-offset access for NOT NULL int32 columns with
+ * TWO PATHS, CHOSEN EXPLICITLY
+ * ---------------------------
+ * XPB_HEAP_FIXED    Raw fixed-offset access.  Computes each column's byte
+ *                   offset once and applies it to every tuple, which is only
+ *                   valid while every attribute up to the highest one read is
+ *                   fixed-width and NOT NULL.  int4 columns only.  This is
+ *                   the path benchmarks 02 and 04 measure.
+ *
+ * XPB_HEAP_DEFORM   PostgreSQL tuple deformation.  Handles nullable
+ *                   attributes, varlena before a requested column, and mixed
+ *                   fixed-width types.  Slower per row; correct on any
+ *                   layout the type set covers.
+ *
+ * The caller states which one it wants.  There is no fallback hidden inside
+ * the scan loop: xpb_heap_layout_supports_fixed() answers whether a layout is
+ * eligible, and the caller decides.  Asking for XPB_HEAP_FIXED on a layout
+ * that cannot support it is an error, not a silent downgrade -- that guard is
+ * what 326b116 added and it is not weakened by the generic path existing.
+ *
+ * LOCKING
+ * -------
+ * The fixed path walks blocks itself and holds a share lock on the page while
+ * copying, which is safe because it only ever reads fixed-width byval data.
+ * The deform path cannot do that: a varlena may be external, and detoasting
+ * under a buffer lock is not allowed.  It therefore goes through the table AM
+ * (table_beginscan/heap_getnext), which hands back a tuple whose buffer is
+ * pinned but unlocked -- the same position any ordinary executor node
+ * deforms from.
+ *
+ * OWNERSHIP ON THE DEFORM PATH
+ * ----------------------------
+ * Column arrays and every numeric/varlena payload they point at are
+ * allocated in the source's own per-batch context, which is reset at the top
+ * of each next_batch().  Columns are therefore marked BORROWED: valid until
+ * the next next_batch()/rescan()/end(), exactly the contract's borrow window.
+ * That keeps the pointer-valued types out of per-value pfree() entirely.
  */
 #include "postgres.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "catalog/pg_type.h"
 #include "storage/bufmgr.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #include "xpb_colbatch.h"
+#include "xpb_src_heap.h"
 
 /* Column offsets for reg_buh fixed schema */
 typedef struct HeapColDef
@@ -31,9 +69,19 @@ typedef struct HeapBatchState
     Oid             rel_oid;
     bool            done;
 
+    XpbHeapPath     path;
+
     /* Column extraction */
     int             ncols;
-    HeapColDef      coldefs[XPCB_MAX_COLS];
+    HeapColDef      coldefs[XPCB_MAX_COLS];     /* fixed path only  */
+    int16           attnos[XPCB_MAX_COLS];
+    XpbColType      coltypes[XPCB_MAX_COLS];
+
+    /* Deform path */
+    TableScanDesc   scan;
+    MemoryContext   batch_cxt;      /* reset per batch; owns payloads */
+    Datum          *dvalues;        /* heap_deform_tuple scratch      */
+    bool           *dnulls;
 
     /* Optional predicate on first column (period_key range) */
     bool            has_pred;
@@ -47,10 +95,226 @@ typedef struct HeapBatchState
     int64           tuples_passed;
 } HeapBatchState;
 
+/* ── Type mapping ── */
+
+XpbColType
+xpb_heap_coltype_for(Oid atttypid)
+{
+    switch (atttypid)
+    {
+        case INT4OID:       return XPB_COL_INT4;
+        case INT8OID:       return XPB_COL_INT8;
+        case NUMERICOID:    return XPB_COL_NUMERIC;
+        case TEXTOID:
+        case VARCHAROID:
+        case BPCHAROID:
+        case BYTEAOID:      return XPB_COL_VARLENA;
+        default:            return XPB_COL_UNSET;
+    }
+}
+
+/* ── Fixed-path eligibility ── */
+
+bool
+xpb_heap_layout_supports_fixed(Relation rel, const int16 *attnos, int ncols,
+                               char **why)
+{
+    TupleDesc   td = RelationGetDescr(rel);
+    int16       max_attno = 0;
+
+    if (why)
+        *why = NULL;
+
+    for (int i = 0; i < ncols; i++)
+    {
+        if (attnos[i] < 1 || attnos[i] > td->natts)
+        {
+            if (why)
+                *why = psprintf("attnum %d is out of range (1..%d)",
+                                attnos[i], td->natts);
+            return false;
+        }
+        if (TupleDescAttr(td, attnos[i] - 1)->atttypid != INT4OID)
+        {
+            if (why)
+                *why = psprintf("column \"%s\" is not int4",
+                                NameStr(TupleDescAttr(td, attnos[i] - 1)->attname));
+            return false;
+        }
+        if (attnos[i] > max_attno)
+            max_attno = attnos[i];
+    }
+
+    for (int a = 0; a < max_attno; a++)
+    {
+        Form_pg_attribute att = TupleDescAttr(td, a);
+
+        if (att->attisdropped)
+        {
+            if (why)
+                *why = psprintf("attnum %d is a dropped column", a + 1);
+            return false;
+        }
+        if (att->attlen <= 0)
+        {
+            if (why)
+                *why = psprintf("column \"%s\" is variable-width",
+                                NameStr(att->attname));
+            return false;
+        }
+        if (!att->attnotnull)
+        {
+            if (why)
+                *why = psprintf("column \"%s\" is nullable", NameStr(att->attname));
+            return false;
+        }
+    }
+    return true;
+}
+
+/* ── Deform path ── */
+
+/*
+ * Copy one attribute into batch column 'c' at row 'r'.
+ *
+ * Pointer-valued types are detoasted and copied into the caller's current
+ * context, which is the source's per-batch context.  Nothing here is freed
+ * per value; the context reset at the top of the next next_batch() releases
+ * the lot.
+ */
+static void
+xpb_heap_store_value(HeapBatchState *st, XpColumnBatch *batch, int c, int r,
+                     Datum value, bool isnull)
+{
+    XpBatchColumn *col = &batch->cols[c];
+
+    if (isnull)
+    {
+        /* First NULL in this column: the bitmap appears only when needed. */
+        xpcb_col_add_validity(col, batch->capacity);
+        /*
+         * The bitmap was allocated in the source's per-batch context along
+         * with everything else this batch points at, so it is borrowed like
+         * the data.  Leaving owns_validity set would have a consumer pfree()
+         * it and the context reset free it again on the next batch.
+         */
+        col->owns_validity = false;
+        xpcb_set_null(col, r);
+        /*
+         * Leave the data slot untouched.  It is never read for a NULL row,
+         * and writing a placeholder is how sentinels get invented.
+         */
+        return;
+    }
+
+    if (col->validity)
+        xpcb_set_valid(col, r);
+
+    switch (col->type)
+    {
+        case XPB_COL_INT4:
+            ((int32 *) col->data)[r] = DatumGetInt32(value);
+            break;
+        case XPB_COL_INT8:
+            ((int64 *) col->data)[r] = DatumGetInt64(value);
+            break;
+        case XPB_COL_NUMERIC:
+        case XPB_COL_VARLENA:
+            /* detoast and copy: the tuple's buffer is only pinned */
+            ((Datum *) col->data)[r] =
+                PointerGetDatum(PG_DETOAST_DATUM_COPY(value));
+            break;
+        case XPB_COL_UNSET:
+            elog(ERROR, "xp_batch: heap source column %d has no type", c);
+    }
+}
+
+static bool
+xpb_heap_deform_next_batch(XpBatchSource *src, XpColumnBatch *batch)
+{
+    HeapBatchState *st = src->private_state;
+    TupleDesc       td = RelationGetDescr(st->rel);
+    MemoryContext   old;
+    HeapTuple       tup;
+    int             nrows = 0;
+
+    if (st->done)
+        return false;
+
+    xpcb_reset(batch);
+    batch->ncols = st->ncols;
+
+    /*
+     * Everything this batch points at lives here, and the previous batch's
+     * payloads die here.  Borrowed-until-next-call, as documented.
+     */
+    MemoryContextReset(st->batch_cxt);
+    old = MemoryContextSwitchTo(st->batch_cxt);
+
+    for (int c = 0; c < st->ncols; c++)
+    {
+        XpBatchColumn *col = &batch->cols[c];
+
+        col->type = st->coltypes[c];
+        col->data = palloc(batch->capacity * xpcb_type_width(col->type));
+        col->validity = NULL;           /* allocated on the first NULL */
+        col->owns_data = false;         /* the context owns it, not the batch */
+        col->owns_validity = false;
+    }
+
+    while (nrows < batch->capacity &&
+           (tup = heap_getnext(st->scan, ForwardScanDirection)) != NULL)
+    {
+        st->tuples_visited++;
+
+        heap_deform_tuple(tup, td, st->dvalues, st->dnulls);
+
+        /* Predicate on the first requested column */
+        if (st->has_pred)
+        {
+            int     a0 = st->attnos[0] - 1;
+            int32   key;
+
+            if (st->dnulls[a0])
+                continue;               /* NULL passes no range predicate */
+            key = DatumGetInt32(st->dvalues[a0]);
+            if (key < st->pred_lo || key > st->pred_hi)
+                continue;
+        }
+
+        st->tuples_passed++;
+
+        for (int c = 0; c < st->ncols; c++)
+        {
+            int a = st->attnos[c] - 1;
+
+            xpb_heap_store_value(st, batch, c, nrows,
+                                 st->dvalues[a], st->dnulls[a]);
+        }
+        nrows++;
+    }
+
+    MemoryContextSwitchTo(old);
+
+    if (nrows == 0)
+    {
+        st->done = true;
+        return false;
+    }
+
+    batch->nrows = nrows;
+    return true;
+}
+
+/* ── Fixed path ── */
+
 static bool
 xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 {
     HeapBatchState *st = src->private_state;
+
+    if (st->path == XPB_HEAP_DEFORM)
+        return xpb_heap_deform_next_batch(src, batch);
 
     if (st->done)
         return false;
@@ -167,12 +431,29 @@ xpb_heap_rescan(XpBatchSource *src)
     st->pages_scanned = 0;
     st->tuples_visited = 0;
     st->tuples_passed = 0;
+
+    if (st->path == XPB_HEAP_DEFORM)
+    {
+        /* Ends the borrow window for anything the last batch handed out. */
+        table_rescan(st->scan, NULL);
+        MemoryContextReset(st->batch_cxt);
+    }
 }
 
 static void
 xpb_heap_end(XpBatchSource *src)
 {
     HeapBatchState *st = src->private_state;
+
+    if (st->path == XPB_HEAP_DEFORM)
+    {
+        if (st->scan)
+            table_endscan(st->scan);
+        st->scan = NULL;
+        if (st->batch_cxt)
+            MemoryContextDelete(st->batch_cxt);
+        st->batch_cxt = NULL;
+    }
     if (st->vmbuf != InvalidBuffer)
         ReleaseBuffer(st->vmbuf);
     table_close(st->rel, AccessShareLock);
@@ -185,20 +466,23 @@ static const XpBatchSourceOps heap_batch_ops = {
 };
 
 /*
- * Create a HeapBatchSource.
- * offsets: byte offsets of columns in tuple data.
- * ncols: number of columns.
- * pred_lo/pred_hi: predicate range on first column (or has_pred=false).
- */
-/*
- * Create a HeapBatchSource.
- * requested_attnos: logical attribute numbers to extract.
- * ncols: number of columns.
- * Predicate on first requested column (range filter).
+ * Fixed-path constructor.  Unchanged contract for existing callers: the
+ * benchmark pipelines ask for this path by name and must keep getting the
+ * error, not a quiet downgrade, on a layout it cannot address.
  */
 XpBatchSource *
 xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,
                         bool has_pred, int32 pred_lo, int32 pred_hi)
+{
+    return xpb_heap_source_create_ex(relid, requested_attnos, ncols,
+                                     XPB_HEAP_FIXED, has_pred,
+                                     pred_lo, pred_hi);
+}
+
+XpBatchSource *
+xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
+                          XpbHeapPath path, bool has_pred,
+                          int32 pred_lo, int32 pred_hi)
 {
     HeapBatchState *st = palloc0(sizeof(HeapBatchState));
     st->rel = table_open(relid, AccessShareLock);
@@ -208,9 +492,74 @@ xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,
     st->vmbuf = InvalidBuffer;
     st->ncols = ncols;
     st->cur_offset = FirstOffsetNumber;
+    st->path = path;
+
+    if (ncols < 1 || ncols > XPCB_MAX_COLS)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("HeapBatchSource: %d columns requested (1..%d)",
+                        ncols, XPCB_MAX_COLS)));
 
     /* Compute byte offsets from TupleDesc */
     TupleDesc td = RelationGetDescr(st->rel);
+
+    /*
+     * Derive the batch column types from the relation, so a batch always
+     * describes what it actually holds rather than what a caller hoped for.
+     */
+    for (int i = 0; i < ncols; i++)
+    {
+        int16               attno = requested_attnos[i];
+        Form_pg_attribute   att;
+
+        if (attno < 1 || attno > td->natts)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("HeapBatchSource: attno %d out of range (1..%d) for \"%s\"",
+                            attno, td->natts, RelationGetRelationName(st->rel))));
+
+        att = TupleDescAttr(td, attno - 1);
+        if (att->attisdropped)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("HeapBatchSource: \"%s\" attnum %d is a dropped column",
+                            RelationGetRelationName(st->rel), attno)));
+
+        st->attnos[i] = attno;
+        st->coltypes[i] = xpb_heap_coltype_for(att->atttypid);
+        if (st->coltypes[i] == XPB_COL_UNSET)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("HeapBatchSource: \"%s\".%s has type %u, which the batch contract does not carry",
+                            RelationGetRelationName(st->rel),
+                            NameStr(att->attname), att->atttypid),
+                     errdetail("Supported: int4, int8, numeric, and text/varchar/bpchar/bytea as varlena.")));
+    }
+
+    if (has_pred && st->coltypes[0] != XPB_COL_INT4)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("HeapBatchSource: range predicate needs an int4 first column, got %s",
+                        xpcb_type_name(st->coltypes[0]))));
+
+    if (path == XPB_HEAP_DEFORM)
+    {
+        st->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                              "xpb heap deform batch",
+                                              ALLOCSET_DEFAULT_SIZES);
+        st->dvalues = palloc(td->natts * sizeof(Datum));
+        st->dnulls = palloc(td->natts * sizeof(bool));
+        st->scan = table_beginscan(st->rel, st->snap, 0, NULL, 0);
+
+        st->has_pred = has_pred;
+        st->pred_lo = pred_lo;
+        st->pred_hi = pred_hi;
+
+        XpBatchSource *dsrc = palloc(sizeof(XpBatchSource));
+        dsrc->ops = &heap_batch_ops;
+        dsrc->private_state = st;
+        return dsrc;
+    }
 
     /*
      * The offsets below are computed once and then applied to every tuple, so
@@ -235,47 +584,22 @@ xpb_heap_source_create(Oid relid, int16 *requested_attnos, int ncols,
      * Attributes after the last one we read are unconstrained: they can shift
      * freely without moving anything we address.  t_hoff is read per tuple, so
      * the null bitmap's own effect on the data start is already handled.
+     *
+     * The eligibility rule lives in xpb_heap_layout_supports_fixed() so that
+     * the guard here and the answer a caller gets when it asks which path to
+     * use cannot drift apart.
      */
-    int16 max_attno = 0;
-    for (int i = 0; i < ncols; i++)
     {
-        int16 attno = requested_attnos[i];
-        if (attno < 1 || attno > td->natts)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATATYPE_MISMATCH),
-                     errmsg("HeapBatchSource: attno %d out of range (1..%d) for \"%s\"",
-                            attno, td->natts, RelationGetRelationName(st->rel))));
-        if (attno > max_attno)
-            max_attno = attno;
-    }
+        char *why = NULL;
 
-    for (int a = 0; a < max_attno; a++)
-    {
-        Form_pg_attribute att = TupleDescAttr(td, a);
-
-        if (att->attisdropped)
+        if (!xpb_heap_layout_supports_fixed(st->rel, requested_attnos, ncols,
+                                            &why))
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("HeapBatchSource: \"%s\" has a dropped column at attnum %d",
-                            RelationGetRelationName(st->rel), a + 1),
-                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
-                               max_attno)));
-        if (att->attlen <= 0)
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("HeapBatchSource: \"%s\".%s is variable-width (attlen %d)",
-                            RelationGetRelationName(st->rel),
-                            NameStr(att->attname), att->attlen),
-                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
-                               max_attno)));
-        if (!att->attnotnull)
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("HeapBatchSource: \"%s\".%s is nullable",
-                            RelationGetRelationName(st->rel),
-                            NameStr(att->attname)),
-                     errdetail("Fixed-offset access requires every attribute up to attnum %d to be fixed-width and NOT NULL.",
-                               max_attno)));
+                     errmsg("HeapBatchSource: \"%s\" cannot use the fixed-offset path: %s",
+                            RelationGetRelationName(st->rel), why),
+                     errdetail("Fixed-offset access requires every requested column to be int4 and every attribute up to the highest one read to be fixed-width and NOT NULL."),
+                     errhint("Use XPB_HEAP_DEFORM for this layout.")));
     }
 
     for (int i = 0; i < ncols; i++)
