@@ -227,7 +227,7 @@ static void
 batch_join_probe(BatchJoinState *js, XpColumnBatch *in, XpColumnBatch *out)
 {
     int nrows = in->nrows;
-    int32 *col_pk = in->int32_cols[0];
+    int32 *col_pk = xpcb_i32(in, 0);        /* dispatch once, not per row */
     int nsel = 0;
 
     /* Probe: lookup each period_key, build selection + year column */
@@ -245,28 +245,41 @@ batch_join_probe(BatchJoinState *js, XpColumnBatch *in, XpColumnBatch *out)
     /* Build output batch: replace col0 (join key) with year, pass through rest */
     out->nrows = nsel;
     out->ncols = in->ncols;
-    out->owns_data = false;
 
-    /* year replaces join key (col 0) */
-    out->int32_cols[0] = js->year_buf;
+    /*
+     * col 0 is always BORROWED from the join state's year_buf, whatever
+     * happens to the other columns.  Under the old batch-level owns_data this
+     * was not expressible: the gather branch below set owns_data = true for
+     * the whole batch while col 0 still pointed into js->year_buf, so a
+     * consumer that had honoured that flag would have pfree()d memory the
+     * join state owns and reuses on the next batch.  Per-column ownership is
+     * what makes the mixed case sayable.
+     */
+    xpcb_col_borrow(&out->cols[0], XPB_COL_INT4, js->year_buf, NULL);
 
-    /* Pass through remaining columns */
     if (nsel == nrows)
     {
-        /* All rows matched — borrow directly */
+        /* All rows matched -- borrow the passthrough columns directly */
         for (int c = 1; c < in->ncols; c++)
-            out->int32_cols[c] = in->int32_cols[c];
+            xpcb_col_borrow(&out->cols[c], in->cols[c].type,
+                            in->cols[c].data, in->cols[c].validity);
     }
     else
     {
-        /* Partial match — gather selected rows */
-        out->owns_data = true;
+        /* Partial match -- gather selected rows into owned buffers */
         for (int c = 1; c < in->ncols; c++)
         {
-            int32 *buf = palloc(nsel * sizeof(int32));
+            int32  *src = xpcb_i32(in, c);
+            int32  *buf = palloc(nsel * sizeof(int32));
+
             for (int i = 0; i < nsel; i++)
-                buf[i] = in->int32_cols[c][js->sel_buf[i]];
-            out->int32_cols[c] = buf;
+                buf[i] = src[js->sel_buf[i]];
+
+            out->cols[c].type = XPB_COL_INT4;
+            out->cols[c].data = buf;
+            out->cols[c].validity = NULL;
+            out->cols[c].owns_data = true;
+            out->cols[c].owns_validity = false;
         }
     }
 }
@@ -377,9 +390,9 @@ xpb_batch_join_groupby(PG_FUNCTION_ARGS)
         /* Aggregate: GROUP BY year, company_key */
         INSTR_TIME_SET_CURRENT(tp);
         int nrows = join_out.nrows;
-        int32 *col_yr = join_out.int32_cols[0];
-        int32 *col_ck = join_out.int32_cols[1];
-        int32 *col_dt = join_out.int32_cols[2];
+        int32 *col_yr = xpcb_i32(&join_out, 0);
+        int32 *col_ck = xpcb_i32(&join_out, 1);
+        int32 *col_dt = xpcb_i32(&join_out, 2);
 
         for (int i = 0; i < nrows; i++)
         {
@@ -409,14 +422,9 @@ xpb_batch_join_groupby(PG_FUNCTION_ARGS)
 
         total_rows += nrows;
 
-        /* Free gathered buffers if join created them */
-        if (join_out.owns_data)
-        {
-            for (int c = 1; c < join_out.ncols; c++)
-                if (join_out.int32_cols[c])
-                    pfree(join_out.int32_cols[c]);
-            join_out.owns_data = false;
-        }
+        /* Free whatever the join gathered. col 0 is borrowed from the join
+         * state's year_buf, so its flag keeps it out of this. */
+        xpcb_release_owned(&join_out);
     }
 
     INSTR_TIME_SET_CURRENT(t1);
@@ -540,7 +548,7 @@ batch_join2_probe(Dim2HashTable *dim, int key_col, int payload_col,
                   int32 *payload_buf)
 {
     int nrows = in->nrows;
-    int32 *col_key = in->int32_cols[key_col];
+    int32 *col_key = xpcb_i32(in, key_col);     /* dispatch once, not per row */
     int nout = 0;
 
     /* Build selection: which input rows matched the dimension */
@@ -562,32 +570,38 @@ batch_join2_probe(Dim2HashTable *dim, int key_col, int payload_col,
 
     if (nout == nrows)
     {
-        /* All rows matched — borrow input columns, replace key with payload */
-        out->owns_data = false;
+        /* All rows matched -- borrow input columns, replace key with payload */
         for (int c = 0; c < in->ncols; c++)
-            out->int32_cols[c] = in->int32_cols[c];
-        out->int32_cols[payload_col] = payload_buf;
+            xpcb_col_borrow(&out->cols[c], in->cols[c].type,
+                            in->cols[c].data, in->cols[c].validity);
+        /* payload_buf belongs to the caller: borrowed, never freed here */
+        xpcb_col_borrow(&out->cols[payload_col], XPB_COL_INT4, payload_buf, NULL);
     }
     else
     {
-        /* Partial match — gather ALL columns through selection vector */
-        out->owns_data = true;
+        /* Partial match -- gather ALL columns through the selection vector */
         for (int c = 0; c < in->ncols; c++)
         {
+            int32 *buf = palloc(nout * sizeof(int32));
+
             if (c == payload_col)
             {
                 /* Payload column already dense in payload_buf */
-                int32 *buf = palloc(nout * sizeof(int32));
                 memcpy(buf, payload_buf, nout * sizeof(int32));
-                out->int32_cols[c] = buf;
             }
             else
             {
-                int32 *buf = palloc(nout * sizeof(int32));
+                int32 *src = xpcb_i32(in, c);
+
                 for (int i = 0; i < nout; i++)
-                    buf[i] = in->int32_cols[c][sel[i]];
-                out->int32_cols[c] = buf;
+                    buf[i] = src[sel[i]];
             }
+
+            out->cols[c].type = XPB_COL_INT4;
+            out->cols[c].data = buf;
+            out->cols[c].validity = NULL;
+            out->cols[c].owns_data = true;
+            out->cols[c].owns_validity = false;
         }
     }
     pfree(sel);
@@ -723,10 +737,10 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
         /* Aggregate: GROUP BY year(0), account_group(2), company_key(1) → SUM(amount_dt(3)) */
         INSTR_TIME_SET_CURRENT(tp);
         int nrows = j2_out.nrows;
-        int32 *col_yr = j2_out.int32_cols[0];
-        int32 *col_ck = j2_out.int32_cols[1];
-        int32 *col_ag = j2_out.int32_cols[2];
-        int32 *col_dt = j2_out.int32_cols[3];
+        int32 *col_yr = xpcb_i32(&j2_out, 0);
+        int32 *col_ck = xpcb_i32(&j2_out, 1);
+        int32 *col_ag = xpcb_i32(&j2_out, 2);
+        int32 *col_dt = xpcb_i32(&j2_out, 3);
 
         for (int i = 0; i < nrows; i++)
         {
@@ -754,20 +768,14 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
 
         total_rows += nrows;
 
-        /* Free gathered buffers from join2 partial match */
-        if (j2_out.owns_data)
-        {
-            for (int c = 0; c < j2_out.ncols; c++)
-                if (j2_out.int32_cols[c]) pfree(j2_out.int32_cols[c]);
-            j2_out.owns_data = false;
-        }
-        /* Free gathered buffers from join1 partial match */
-        if (j1_out.owns_data)
-        {
-            for (int c = 0; c < j1_out.ncols; c++)
-                if (j1_out.int32_cols[c]) pfree(j1_out.int32_cols[c]);
-            j1_out.owns_data = false;
-        }
+        /*
+         * Free whatever the two joins gathered, and nothing else.  The old
+         * batch-level flag made this loop free column 0 of j1_out as well,
+         * which on the all-matched path is the join state's own year_buf --
+         * borrowed memory the next batch still reads.
+         */
+        xpcb_release_owned(&j2_out);
+        xpcb_release_owned(&j1_out);
     }
 
     INSTR_TIME_SET_CURRENT(t1);
@@ -976,11 +984,11 @@ xpb_1c_register_report(PG_FUNCTION_ARGS)
         INSTR_TIME_SET_CURRENT(tp);
         {
             int nrows = j2_out.nrows;
-            int32 *col_yr = j2_out.int32_cols[0];
-            int32 *col_ck = j2_out.int32_cols[1];
-            int32 *col_ag = j2_out.int32_cols[2];
-            int32 *col_dt = j2_out.int32_cols[3];
-            int32 *col_kt = j2_out.int32_cols[4];
+            int32 *col_yr = xpcb_i32(&j2_out, 0);
+            int32 *col_ck = xpcb_i32(&j2_out, 1);
+            int32 *col_ag = xpcb_i32(&j2_out, 2);
+            int32 *col_dt = xpcb_i32(&j2_out, 3);
+            int32 *col_kt = xpcb_i32(&j2_out, 4);
 
             for (int i = 0; i < nrows; i++)
             {
@@ -1016,18 +1024,8 @@ xpb_1c_register_report(PG_FUNCTION_ARGS)
         { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
           agg_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
 
-        if (j2_out.owns_data)
-        {
-            for (int c = 0; c < j2_out.ncols; c++)
-                if (j2_out.int32_cols[c]) pfree(j2_out.int32_cols[c]);
-            j2_out.owns_data = false;
-        }
-        if (j1_out.owns_data)
-        {
-            for (int c = 0; c < j1_out.ncols; c++)
-                if (j1_out.int32_cols[c]) pfree(j1_out.int32_cols[c]);
-            j1_out.owns_data = false;
-        }
+        xpcb_release_owned(&j2_out);
+        xpcb_release_owned(&j1_out);
     }
 
     INSTR_TIME_SET_CURRENT(t1);

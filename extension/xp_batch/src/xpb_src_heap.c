@@ -56,15 +56,25 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
         return false;
 
     xpcb_reset(batch);
-    batch->owns_data = true;
     batch->ncols = st->ncols;
 
-    /* Allocate column arrays if consumer didn't pre-allocate */
+    /*
+     * Allocate owned column arrays if the consumer did not pre-allocate.
+     * This path only runs on layouts the guard in xpb_heap_source_create()
+     * accepted: every addressed attribute fixed-width and NOT NULL.  So every
+     * column is int4 with no validity bitmap -- the cheap case.
+     */
     for (int c = 0; c < st->ncols; c++)
     {
-        if (!batch->int32_cols[c])
-            batch->int32_cols[c] = palloc(batch->capacity * sizeof(int32));
+        if (!batch->cols[c].data)
+            xpcb_col_alloc(&batch->cols[c], XPB_COL_INT4, batch->capacity, false);
     }
+
+    /* Type dispatch happens here, once per batch -- never in the row loop. */
+    int32 *out[XPCB_MAX_COLS];
+
+    for (int c = 0; c < st->ncols; c++)
+        out[c] = xpcb_i32(batch, c);
 
     int nrows = 0;
     int cap = batch->capacity;
@@ -116,7 +126,7 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 
             /* Extract all columns */
             for (int c = 0; c < st->ncols; c++)
-                batch->int32_cols[c][nrows] = *(int32 *)(d + st->coldefs[c].offset);
+                out[c][nrows] = *(int32 *)(d + st->coldefs[c].offset);
 
             nrows++;
         }

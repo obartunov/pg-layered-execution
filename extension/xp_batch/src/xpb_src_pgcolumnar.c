@@ -334,14 +334,25 @@ xpcn_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 
     batch->nrows = chunk;
     batch->ncols = st->ncols;
-    batch->owns_data = false;       /* the group's memory outlives the batch */
     batch->selection = NULL;
     batch->nselected = 0;
 
+    /*
+     * Every column is borrowed: either straight from pgcolumnar's decoded
+     * stream (st->borrowed, the all-present zero-copy case) or from this
+     * source's own per-group buffer.  Both live until the next group is
+     * loaded, which is exactly the contract's borrow window.
+     *
+     * Validity is NULL because this source does not yet carry NULLs into the
+     * batch: xpcn_load_group() still raises an error when a surviving row has
+     * a NULL in a requested column.  Once that is lifted the present bitmap
+     * borrows straight into the column, since both use bit-set-means-valid.
+     */
     for (c = 0; c < st->ncols; c++)
-        batch->int32_cols[c] = st->borrowed
-            ? (int32 *) (st->bor[c] + st->cursor)
-            : st->own[c] + st->cursor;
+        xpcb_col_borrow(&batch->cols[c], XPB_COL_INT4,
+                        st->borrowed ? (int32 *) (st->bor[c] + st->cursor)
+                                     : st->own[c] + st->cursor,
+                        NULL);
 
     st->cursor += chunk;
     return true;

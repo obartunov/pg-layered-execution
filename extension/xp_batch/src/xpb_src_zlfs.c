@@ -26,12 +26,23 @@ zlfs_next_batch(XpBatchSource *src, XpColumnBatch *batch)
     int64 remaining = zz->nrows - st->cursor;
     int   chunk = (remaining > batch->capacity) ? batch->capacity : (int)remaining;
 
-    /* Borrow pointers directly into zone arrays — zero copy */
+    /*
+     * Borrow pointers directly into the zone arrays -- zero copy.
+     *
+     * Lifetime: the zone is owned by the ZLFS registry, not by this source,
+     * and it outlives the scan, so these borrowed pointers stay valid for the
+     * whole pipeline rather than only until the next next_batch().  That is
+     * stronger than the contract promises; consumers must not rely on it.
+     *
+     * A v1 zone is int32-only and has no NULLs by construction -- the builder
+     * refuses a nullable or variable-width column -- so every column is
+     * XPB_COL_INT4 with validity NULL.
+     */
     batch->nrows = chunk;
-    batch->owns_data = false;
     batch->ncols = st->cols_used;
     for (int c = 0; c < st->cols_used; c++)
-        batch->int32_cols[c] = zz->cols[st->col_map[c]] + st->cursor;
+        xpcb_col_borrow(&batch->cols[c], XPB_COL_INT4,
+                        zz->cols[st->col_map[c]] + st->cursor, NULL);
 
     batch->selection = NULL;
     batch->nselected = 0;

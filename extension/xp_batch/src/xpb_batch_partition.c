@@ -59,11 +59,25 @@ append_next_batch(XpBatchSource *src, XpColumnBatch *batch)
             st->child_batches[st->current]++;
             return true;
         }
-        /* Reset batch column pointers before switching to next child.
-         * Prevents heap source from writing into stale ZLFS borrowed pointers. */
+        /*
+         * Detach every column before switching to the next child.  Without
+         * this the heap source would see non-NULL data pointers left by the
+         * ZLFS child, decide the consumer had pre-allocated, and write into
+         * memory the ZLFS zone owns.
+         *
+         * Detach, not release: these columns are borrowed from the child
+         * source, which owns them and is about to be finished with.  The type
+         * is cleared too, so the next child cannot inherit a stale one and
+         * have the typed accessors wave it through.
+         */
         for (int c = 0; c < XPCB_MAX_COLS; c++)
-            batch->int32_cols[c] = NULL;
-        batch->owns_data = false;
+        {
+            batch->cols[c].type = XPB_COL_UNSET;
+            batch->cols[c].data = NULL;
+            batch->cols[c].validity = NULL;
+            batch->cols[c].owns_data = false;
+            batch->cols[c].owns_validity = false;
+        }
         st->current++;
     }
     return false;
@@ -368,10 +382,10 @@ xpb_partition_join2_groupby(PG_FUNCTION_ARGS)
         nbatches++;
 
         int nrows = batch.nrows;
-        int32 *col_pk = batch.int32_cols[0];  /* period_key */
-        int32 *col_ck = batch.int32_cols[1];  /* company_key */
-        int32 *col_ak = batch.int32_cols[2];  /* account_key */
-        int32 *col_dt = batch.int32_cols[3];  /* amount_dt */
+        int32 *col_pk = xpcb_i32(&batch, 0);  /* period_key  */
+        int32 *col_ck = xpcb_i32(&batch, 1);  /* company_key */
+        int32 *col_ak = xpcb_i32(&batch, 2);  /* account_key */
+        int32 *col_dt = xpcb_i32(&batch, 3);  /* amount_dt   */
 
         /* Join1: period_key → year (vectorized over batch) */
         INSTR_TIME_SET_CURRENT(tp);

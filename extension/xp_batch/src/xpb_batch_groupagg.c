@@ -91,18 +91,19 @@ batch_aggregate(XpBatchSource *source, BatchAggResult *res)
             break;
 
         /* First owned batch: save our allocated pointers */
-        if (!consumer_owns && batch.owns_data)
+        if (!consumer_owns && batch.cols[0].owns_data)
         {
             consumer_owns = true;
             for (int c = 0; c < batch.ncols; c++)
-                own_cols[c] = batch.int32_cols[c];
+                own_cols[c] = batch.cols[c].data;
         }
 
         nbatches++;
         int nrows = batch.nrows;
-        int32 *col_pk = batch.int32_cols[0];
-        int32 *col_ck = batch.int32_cols[1];
-        int32 *col_dt = batch.int32_cols[2];
+        /* dispatch once per batch, outside the row loop */
+        int32 *col_pk = xpcb_i32(&batch, 0);
+        int32 *col_ck = xpcb_i32(&batch, 1);
+        int32 *col_dt = xpcb_i32(&batch, 2);
 
         for (int i = 0; i < nrows; i++)
         {
