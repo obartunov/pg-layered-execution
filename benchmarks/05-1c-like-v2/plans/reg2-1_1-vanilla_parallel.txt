@@ -1,0 +1,39 @@
+Finalize HashAggregate (actual time=76.047..78.547 rows=200.00 loops=1)
+  Group Key: c.company_group, a.account_group, r.company_key
+  Batches: 1  Memory Usage: 129kB
+  Buffers: shared hit=12209
+  ->  Gather (actual time=53.237..68.149 rows=28270.00 loops=1)
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=12209
+        ->  Hash Join (actual time=49.696..60.432 rows=9423.33 loops=3)
+              Hash Cond: (r.account_key = a.account_key)
+              Buffers: shared hit=12209
+              ->  Hash Join (actual time=49.629..58.981 rows=9423.33 loops=3)
+                    Hash Cond: (r.company_key = c.company_key)
+                    Buffers: shared hit=12203
+                    ->  Partial HashAggregate (actual time=49.593..57.741 rows=9423.33 loops=3)
+                          Group Key: r.company_key, r.account_key
+                          Batches: 1  Memory Usage: 3345kB
+                          Buffers: shared hit=12200
+                          Worker 0:  Batches: 1  Memory Usage: 3345kB
+                          Worker 1:  Batches: 1  Memory Usage: 5393kB
+                          ->  Parallel Seq Scan on reg2 r (actual time=0.009..34.235 rows=27778.00 loops=3)
+                                Filter: ((period >= 1) AND (period <= 1))
+                                Rows Removed by Filter: 305558
+                                Buffers: shared hit=12200
+                    ->  Hash (actual time=0.018..0.018 rows=50.00 loops=3)
+                          Buckets: 1024  Batches: 1  Memory Usage: 10kB
+                          Buffers: shared hit=3
+                          ->  Seq Scan on dim_company c (actual time=0.008..0.010 rows=50.00 loops=3)
+                                Buffers: shared hit=3
+              ->  Hash (actual time=0.053..0.053 rows=200.00 loops=3)
+                    Buckets: 1024  Batches: 1  Memory Usage: 18kB
+                    Buffers: shared hit=6
+                    ->  Seq Scan on dim_account2 a (actual time=0.020..0.029 rows=200.00 loops=3)
+                          Buffers: shared hit=6
+Settings: work_mem = '64MB'
+Planning:
+  Buffers: shared hit=206
+Planning Time: 0.621 ms
+Execution Time: 79.015 ms

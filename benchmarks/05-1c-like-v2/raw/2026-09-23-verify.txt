@@ -1,0 +1,28 @@
+  ... expected 50 x 200 =            10000
+rows                               1000008
+rows per period (min/max)            83334 /    83334
+distinct (company, account)          10000
+distinct account_key                   200
+accounts per company (min/max)         200 /      200
+companies per account (min/max)         50 /       50
+distinct period                         12
+distinct company_key                    50
+
+--- report groups, on the full annual section ---
+report groups                          200
+
+--- NULL rates, recorded because the row shape is the point ---
+credit   NULL (numeric)                  0  (NOT NULL by schema)
+comment  NULL                       250008  (25.0%)
+debit    NULL (numeric)             166668  (16.7%)
+comment  empty string               250008  (25.0%)
+quantity NULL                       111120  (11.1%)
+
+--- measured columns: the report aggregates these, and they are NOT NULL ---
+sum(debit_cents)                500092383944   (past 2^31: true)
+credit_cents min/max            0 / 999998
+account_key min/max             4000000001 / 4000000200   (past 2^31: true)
+debit_cents  min/max            0 / 999998
+
+--- heap and columnar hold identical rows ---
+heap and pgColumnar agree: 11836397e8afc7ea1fd8a76587e13155

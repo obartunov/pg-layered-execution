@@ -1,0 +1,12 @@
+# heap deform, same rows and grouping, money columns differing only in type
+# int8 (attnos 8,9) vs numeric (attnos 6,7), 5 runs each, ms
+int8,73.780
+int8,72.100
+int8,72.762
+int8,73.998
+int8,73.881
+numeric,254.548
+numeric,195.463
+numeric,192.391
+numeric,212.440
+numeric,207.280

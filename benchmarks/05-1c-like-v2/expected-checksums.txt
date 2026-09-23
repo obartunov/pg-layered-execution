@@ -1,0 +1,9 @@
+# Benchmark 05-A canonical checksums, one per period range.
+# md5 over every grouping key and every aggregate, sorted before hashing.
+# Timing columns are excluded. Identical across all measured paths.
+range 1..1 06ee205763e88a4c69acc3500e485869
+range 1..3 9a53da4a03a9b707d0ffc164f32e40f2
+range 1..6 ece42c97cbb5c90a1357d2eb4df41cee
+range 1..12 135d70b3a7b8f075335c56de08a27a39
+range 90..91 d41d8cd98f00b204e9800998ecf8427e
+range 12..12 e48979f80b3dfbc2094b0ff9efe98cad

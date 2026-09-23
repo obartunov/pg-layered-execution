@@ -1,0 +1,251 @@
+############ Benchmark 05-A — selectivity crossover ############
+
+=== versions ===
+server: PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled 
+pgcolumnar: 1.0-alpha5
+
+=== physical layout: row groups and pruning opportunity ===
+--- row groups, with the period range each one covers ---
+rowgroup  1  rows=  150000  periods  1..2   span=2  nulls=0  chunks=15
+rowgroup  2  rows=  150000  periods  2..4   span=3  nulls=0  chunks=15
+rowgroup  3  rows=  150000  periods  4..6   span=3  nulls=0  chunks=15
+rowgroup  4  rows=  150000  periods  6..8   span=3  nulls=0  chunks=15
+rowgroup  5  rows=  150000  periods  8..9   span=2  nulls=0  chunks=15
+rowgroup  6  rows=  150000  periods  9..11  span=3  nulls=0  chunks=15
+rowgroup  7  rows=  100008  periods 11..12  span=2  nulls=0  chunks=11
+
+--- pruning opportunity: row groups a period predicate must read ---
+periods 1..1    rowgroups read  1 of 7   skipped  6
+periods 1..3    rowgroups read  2 of 7   skipped  5
+periods 1..6    rowgroups read  4 of 7   skipped  3
+periods 1..12   rowgroups read  7 of 7   skipped  0
+
+--- STOP CONDITION: every row group holding all 12 periods means no pruning ---
+OK: 3 of 7 row groups span 2 periods or fewer
+
+=== physical sizes ===
+reg2              95 MB    100.0 bytes/row
+reg2_col          15 MB     16.0 bytes/row
+
+=== ZLFS zone build (measured separately; NOT query latency) ===
+ZLFS zone [1..12] built: 1000008 rows, 129 ms, 19531 KB, ncols=5, schema_hash=36cbbdc1, file=/tmp/pgdata20/zlfs/zone_118761_1_12.zlfs
+
+############ correctness gate ############
+Runs before any timing. Timing is not taken if it fails.
+
+NOTICE:  v2_register_report [1..1] mode=heap: total=52.9 ms  build=0.2 ms  open=0.0 ms  source=51.9 ms  join1=0.2 ms  join2=0.3 ms  agg=0.3 ms  operators=0.8 ms  rows=83334  batches=2  groups=200  heap_path=deform
+NOTICE:  v2_register_report [1..1] mode=pgcolumnar: total=8.3 ms  build=0.1 ms  open=0.0 ms  source=7.5 ms  join1=0.2 ms  join2=0.2 ms  agg=0.3 ms  operators=0.6 ms  rows=83334  batches=2  groups=200  rowgroups_read=1 rows_in_read_groups=150000 rows_vec_skipped=60000 rows_emitted=83334
+NOTICE:  v2_register_report [1..1] mode=pgcolumnar: total=7.4 ms  build=0.1 ms  open=0.0 ms  source=6.7 ms  join1=0.2 ms  join2=0.2 ms  agg=0.2 ms  operators=0.6 ms  rows=83334  batches=2  groups=200  rowgroups_read=1 rows_in_read_groups=150000 rows_vec_skipped=60000 rows_emitted=83334
+NOTICE:  v2_register_report [1..3] mode=heap: total=50.8 ms  build=0.2 ms  open=0.0 ms  source=48.6 ms  join1=0.7 ms  join2=0.6 ms  agg=0.7 ms  operators=2.0 ms  rows=250002  batches=4  groups=200  heap_path=deform
+NOTICE:  v2_register_report [1..3] mode=pgcolumnar: total=14.1 ms  build=0.1 ms  open=0.0 ms  source=12.1 ms  join1=0.5 ms  join2=0.6 ms  agg=0.8 ms  operators=1.9 ms  rows=250002  batches=5  groups=200  rowgroups_read=2 rows_in_read_groups=300000 rows_vec_skipped=40000 rows_emitted=250002
+NOTICE:  v2_register_report [1..3] mode=pgcolumnar: total=14.1 ms  build=0.1 ms  open=0.0 ms  source=12.2 ms  join1=0.5 ms  join2=0.6 ms  agg=0.7 ms  operators=1.8 ms  rows=250002  batches=5  groups=200  rowgroups_read=2 rows_in_read_groups=300000 rows_vec_skipped=40000 rows_emitted=250002
+NOTICE:  v2_register_report [1..6] mode=heap: total=54.0 ms  build=0.2 ms  open=0.0 ms  source=50.2 ms  join1=1.1 ms  join2=1.1 ms  agg=1.3 ms  operators=3.6 ms  rows=500004  batches=8  groups=200  heap_path=deform
+NOTICE:  v2_register_report [1..6] mode=pgcolumnar: total=21.9 ms  build=0.1 ms  open=0.0 ms  source=18.2 ms  join1=1.1 ms  join2=1.2 ms  agg=1.3 ms  operators=3.6 ms  rows=500004  batches=10  groups=200  rowgroups_read=4 rows_in_read_groups=600000 rows_vec_skipped=90000 rows_emitted=500004
+NOTICE:  v2_register_report [1..6] mode=pgcolumnar: total=21.0 ms  build=0.1 ms  open=0.0 ms  source=17.4 ms  join1=1.1 ms  join2=1.1 ms  agg=1.4 ms  operators=3.5 ms  rows=500004  batches=10  groups=200  rowgroups_read=4 rows_in_read_groups=600000 rows_vec_skipped=90000 rows_emitted=500004
+NOTICE:  v2_register_report [1..12] mode=heap: total=66.3 ms  build=0.2 ms  open=0.0 ms  source=58.4 ms  join1=2.3 ms  join2=2.4 ms  agg=2.9 ms  operators=7.7 ms  rows=1000008  batches=16  groups=200  heap_path=deform
+NOTICE:  v2_register_report [1..12] mode=pgcolumnar: total=36.8 ms  build=0.1 ms  open=0.0 ms  source=29.6 ms  join1=2.1 ms  join2=2.2 ms  agg=2.7 ms  operators=7.1 ms  rows=1000008  batches=20  groups=200  rowgroups_read=7 rows_in_read_groups=1000008 rows_vec_skipped=0 rows_emitted=1000008
+NOTICE:  v2_register_report [1..12] mode=pgcolumnar: total=36.1 ms  build=0.1 ms  open=0.0 ms  source=28.8 ms  join1=2.2 ms  join2=2.2 ms  agg=2.9 ms  operators=7.3 ms  rows=1000008  batches=20  groups=200  rowgroups_read=7 rows_in_read_groups=1000008 rows_vec_skipped=0 rows_emitted=1000008
+NOTICE:  v2_register_report [90..91] mode=heap: total=47.8 ms  build=0.1 ms  open=0.0 ms  source=47.7 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=deform
+NOTICE:  v2_register_report [90..91] mode=pgcolumnar: total=0.1 ms  build=0.1 ms  open=0.0 ms  source=0.1 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  rowgroups_read=0 rows_in_read_groups=0 rows_vec_skipped=0 rows_emitted=0
+NOTICE:  v2_register_report [90..91] mode=pgcolumnar: total=0.1 ms  build=0.0 ms  open=0.0 ms  source=0.0 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  rowgroups_read=0 rows_in_read_groups=0 rows_vec_skipped=0 rows_emitted=0
+NOTICE:  v2_register_report [12..12] mode=heap: total=47.7 ms  build=0.2 ms  open=0.0 ms  source=46.9 ms  join1=0.2 ms  join2=0.2 ms  agg=0.3 ms  operators=0.6 ms  rows=83334  batches=2  groups=200  heap_path=deform
+NOTICE:  v2_register_report [12..12] mode=pgcolumnar: total=6.6 ms  build=0.1 ms  open=0.0 ms  source=5.9 ms  join1=0.2 ms  join2=0.2 ms  agg=0.2 ms  operators=0.6 ms  rows=83334  batches=2  groups=200  rowgroups_read=1 rows_in_read_groups=100008 rows_vec_skipped=10000 rows_emitted=83334
+NOTICE:  v2_register_report [12..12] mode=pgcolumnar: total=6.7 ms  build=0.1 ms  open=0.0 ms  source=6.0 ms  join1=0.2 ms  join2=0.2 ms  agg=0.2 ms  operators=0.6 ms  rows=83334  batches=2  groups=200  rowgroups_read=1 rows_in_read_groups=100008 rows_vec_skipped=10000 rows_emitted=83334
+1..1   vanilla_heap        06ee205763e88a4c69acc3500e485869  groups=200
+1..1   vanilla_col         06ee205763e88a4c69acc3500e485869  groups=200
+1..1   xpb_heap            06ee205763e88a4c69acc3500e485869  groups=200
+1..1   xpb_pgcolumnar      06ee205763e88a4c69acc3500e485869  groups=200
+1..1   xpb_pgcolumnar_again06ee205763e88a4c69acc3500e485869  groups=200
+1..3   vanilla_heap        9a53da4a03a9b707d0ffc164f32e40f2  groups=200
+1..3   vanilla_col         9a53da4a03a9b707d0ffc164f32e40f2  groups=200
+1..3   xpb_heap            9a53da4a03a9b707d0ffc164f32e40f2  groups=200
+1..3   xpb_pgcolumnar      9a53da4a03a9b707d0ffc164f32e40f2  groups=200
+1..3   xpb_pgcolumnar_again9a53da4a03a9b707d0ffc164f32e40f2  groups=200
+1..6   vanilla_heap        ece42c97cbb5c90a1357d2eb4df41cee  groups=200
+1..6   vanilla_col         ece42c97cbb5c90a1357d2eb4df41cee  groups=200
+1..6   xpb_heap            ece42c97cbb5c90a1357d2eb4df41cee  groups=200
+1..6   xpb_pgcolumnar      ece42c97cbb5c90a1357d2eb4df41cee  groups=200
+1..6   xpb_pgcolumnar_againece42c97cbb5c90a1357d2eb4df41cee  groups=200
+1..12  vanilla_heap        135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  vanilla_col         135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  xpb_heap            135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  xpb_pgcolumnar      135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  xpb_pgcolumnar_again135d70b3a7b8f075335c56de08a27a39  groups=200
+90..91 vanilla_heap        d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 vanilla_col         d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 xpb_heap            d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 xpb_pgcolumnar      d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 xpb_pgcolumnar_againd41d8cd98f00b204e9800998ecf8427e  groups=0
+12..12 vanilla_heap        e48979f80b3dfbc2094b0ff9efe98cad  groups=200
+12..12 vanilla_col         e48979f80b3dfbc2094b0ff9efe98cad  groups=200
+12..12 xpb_heap            e48979f80b3dfbc2094b0ff9efe98cad  groups=200
+12..12 xpb_pgcolumnar      e48979f80b3dfbc2094b0ff9efe98cad  groups=200
+12..12 xpb_pgcolumnar_againe48979f80b3dfbc2094b0ff9efe98cad  groups=200
+NOTICE:  gate PASS: one checksum per range, one group count, net identity holds
+
+=== per-group net identity, full range ===
+groups where net <> debit - credit: 0
+
+=== ZLFS arm, checked against the same result (its zone is one range) ===
+135d70b3a7b8f075335c56de08a27a39  groups=200
+135d70b3a7b8f075335c56de08a27a39  groups=200
+135d70b3a7b8f075335c56de08a27a39  groups=200
+
+############ plans ############
+  reg2-1_1-vanilla_single.txt: 7 plan nodes
+  reg2-1_1-vanilla_parallel.txt: 7 plan nodes
+  reg2-1_12-vanilla_single.txt: 7 plan nodes
+  reg2-1_12-vanilla_parallel.txt: 7 plan nodes
+  reg2_col-1_1-vanilla_single.txt: 7 plan nodes
+  reg2_col-1_1-vanilla_parallel.txt: 7 plan nodes
+  reg2_col-1_12-vanilla_single.txt: 7 plan nodes
+  reg2_col-1_12-vanilla_parallel.txt: 7 plan nodes
+
+############ timings: 1 warm-up + 5 measured runs ############
+# path,lo,hi,run,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,operators_ms,rows,rowgroups_read,rows_in_read_groups,rows_emitted
+# zlfs zone [1..1] build: 83334 rows 62 ms 1627 KB
+xpb_heap,1,1,1,53.7,0.0,52.5,0.3,0.3,0.3,0.9,83334,,,
+xpb_heap,1,1,2,55.0,0.0,53.4,0.3,0.5,0.4,1.1,83334,,,
+xpb_heap,1,1,3,57.7,0.0,56.4,0.3,0.3,0.2,0.9,83334,,,
+xpb_heap,1,1,4,69.1,0.0,66.6,0.4,0.3,0.5,1.2,83334,,,
+xpb_heap,1,1,5,75.7,0.1,73.8,0.4,0.4,0.4,1.2,83334,,,
+xpb_pgcolumnar,1,1,1,14.4,0.3,12.3,0.4,0.5,0.3,1.3,83334,1,150000,83334
+xpb_pgcolumnar,1,1,2,13.2,0.4,11.2,0.4,0.3,0.3,0.9,83334,1,150000,83334
+xpb_pgcolumnar,1,1,3,10.3,0.2,8.7,0.3,0.4,0.3,1.0,83334,1,150000,83334
+xpb_pgcolumnar,1,1,4,17.6,0.3,15.2,1.0,0.3,0.3,1.6,83334,1,150000,83334
+xpb_pgcolumnar,1,1,5,14.8,0.4,12.6,0.5,0.5,0.4,1.4,83334,1,150000,83334
+xpb_zlfs,1,1,1,20.1,18.8,0.0,0.3,0.3,0.3,0.9,83334,,,
+xpb_zlfs,1,1,2,20.5,19.0,0.0,0.3,0.5,0.3,1.1,83334,,,
+xpb_zlfs,1,1,3,23.1,21.2,0.0,0.5,0.5,0.4,1.4,83334,,,
+xpb_zlfs,1,1,4,19.4,17.7,0.0,0.5,0.4,0.3,1.2,83334,,,
+xpb_zlfs,1,1,5,20.1,18.7,0.0,0.4,0.3,0.2,0.9,83334,,,
+# zlfs zone [1..3] build: 250002 rows 70 ms 4882 KB
+xpb_heap,1,3,1,70.1,0.0,67.4,0.7,0.7,0.9,2.3,250002,,,
+xpb_heap,1,3,2,73.6,0.0,70.0,0.7,1.0,1.5,3.2,250002,,,
+xpb_heap,1,3,3,67.0,0.0,64.3,0.7,0.7,0.8,2.2,250002,,,
+xpb_heap,1,3,4,66.2,0.1,63.2,0.8,0.7,0.8,2.3,250002,,,
+xpb_heap,1,3,5,69.1,0.0,66.0,0.8,0.8,1.0,2.6,250002,,,
+xpb_pgcolumnar,1,3,1,28.2,0.3,23.8,1.1,1.3,1.2,3.6,250002,2,300000,250002
+xpb_pgcolumnar,1,3,2,17.9,0.2,15.2,0.6,0.8,0.7,2.1,250002,2,300000,250002
+xpb_pgcolumnar,1,3,3,18.3,0.2,15.3,0.7,0.7,0.8,2.2,250002,2,300000,250002
+xpb_pgcolumnar,1,3,4,33.8,0.5,28.1,1.3,1.3,2.0,4.6,250002,2,300000,250002
+xpb_pgcolumnar,1,3,5,20.0,0.2,17.0,0.8,0.8,0.8,2.3,250002,2,300000,250002
+xpb_zlfs,1,3,1,27.6,24.3,0.0,0.6,0.9,0.7,2.2,250002,,,
+xpb_zlfs,1,3,2,24.3,21.8,0.0,0.6,0.8,0.7,2.1,250002,,,
+xpb_zlfs,1,3,3,24.2,21.6,0.0,0.7,0.7,0.7,2.2,250002,,,
+xpb_zlfs,1,3,4,24.0,21.5,0.0,0.7,0.6,0.8,2.1,250002,,,
+xpb_zlfs,1,3,5,24.0,21.2,0.0,0.9,0.7,0.8,2.4,250002,,,
+# zlfs zone [1..6] build: 500004 rows 95 ms 9765 KB
+xpb_heap,1,6,1,78.7,0.0,74.2,1.3,1.3,1.5,4.1,500004,,,
+xpb_heap,1,6,2,75.9,0.0,71.1,1.4,1.3,1.6,4.4,500004,,,
+xpb_heap,1,6,3,77.1,0.0,71.6,1.4,1.5,1.5,4.4,500004,,,
+xpb_heap,1,6,4,83.1,0.0,77.5,1.7,1.5,1.8,5.0,500004,,,
+xpb_heap,1,6,5,73.0,0.0,68.0,1.4,1.5,1.5,4.5,500004,,,
+xpb_pgcolumnar,1,6,1,26.3,0.3,21.7,1.2,1.2,1.5,3.9,500004,4,600000,500004
+xpb_pgcolumnar,1,6,2,27.5,0.2,22.8,1.2,1.3,1.5,4.0,500004,4,600000,500004
+xpb_pgcolumnar,1,6,3,27.0,0.3,22.3,1.2,1.3,1.4,3.9,500004,4,600000,500004
+xpb_pgcolumnar,1,6,4,30.0,0.3,24.7,1.5,1.6,1.6,4.6,500004,4,600000,500004
+xpb_pgcolumnar,1,6,5,28.9,0.3,24.0,1.4,1.2,1.5,4.2,500004,4,600000,500004
+xpb_zlfs,1,6,1,34.4,29.8,0.0,1.2,1.2,1.7,4.1,500004,,,
+xpb_zlfs,1,6,2,35.8,31.1,0.0,1.3,1.4,1.5,4.2,500004,,,
+xpb_zlfs,1,6,3,35.7,30.7,0.0,1.5,1.4,1.5,4.4,500004,,,
+xpb_zlfs,1,6,4,38.6,32.4,0.0,1.6,1.7,2.2,5.6,500004,,,
+xpb_zlfs,1,6,5,35.4,30.8,0.0,1.4,1.2,1.5,4.0,500004,,,
+# zlfs zone [1..12] build: 1000008 rows 122 ms 19531 KB
+xpb_heap,1,12,1,82.4,0.0,73.8,2.6,2.6,2.9,8.1,1000008,,,
+xpb_heap,1,12,2,85.1,0.0,76.7,2.6,2.4,2.9,8.0,1000008,,,
+xpb_heap,1,12,3,88.3,0.0,79.5,2.6,2.6,2.9,8.2,1000008,,,
+xpb_heap,1,12,4,94.7,0.0,85.6,2.7,2.7,3.1,8.5,1000008,,,
+xpb_heap,1,12,5,101.6,0.0,91.1,3.2,3.2,3.5,9.9,1000008,,,
+xpb_pgcolumnar,1,12,1,46.9,0.2,38.4,2.5,2.5,2.8,7.9,1000008,7,1000008,1000008
+xpb_pgcolumnar,1,12,2,70.4,0.3,56.3,4.0,4.3,5.0,13.2,1000008,7,1000008,1000008
+xpb_pgcolumnar,1,12,3,41.5,0.2,33.4,2.2,2.4,3.0,7.5,1000008,7,1000008,1000008
+xpb_pgcolumnar,1,12,4,47.4,0.3,38.7,2.3,2.4,3.2,7.8,1000008,7,1000008,1000008
+xpb_pgcolumnar,1,12,5,41.2,0.3,33.0,2.4,2.3,2.9,7.5,1000008,7,1000008,1000008
+xpb_zlfs,1,12,1,47.0,37.2,0.0,2.8,3.0,3.5,9.2,1000008,,,
+xpb_zlfs,1,12,2,48.5,34.6,0.0,4.3,4.4,4.6,13.3,1000008,,,
+xpb_zlfs,1,12,3,39.5,31.1,0.0,2.8,2.3,2.8,7.9,1000008,,,
+xpb_zlfs,1,12,4,42.2,32.8,0.0,2.9,2.8,3.3,9.0,1000008,,,
+xpb_zlfs,1,12,5,44.9,36.3,0.0,2.3,2.4,3.2,7.9,1000008,,,
+vanilla_single_heap,1,1,1,79.466,,,,,,,,,,
+vanilla_single_heap,1,1,2,108.646,,,,,,,,,,
+vanilla_single_heap,1,1,3,86.859,,,,,,,,,,
+vanilla_single_heap,1,1,4,81.522,,,,,,,,,,
+vanilla_single_heap,1,1,5,84.866,,,,,,,,,,
+vanilla_parallel_heap,1,1,1,54.808,,,,,,,,,,
+vanilla_parallel_heap,1,1,2,52.884,,,,,,,,,,
+vanilla_parallel_heap,1,1,3,51.350,,,,,,,,,,
+vanilla_parallel_heap,1,1,4,51.891,,,,,,,,,,
+vanilla_parallel_heap,1,1,5,51.439,,,,,,,,,,
+vanilla_single_col,1,1,1,39.712,,,,,,,,,,
+vanilla_single_col,1,1,2,37.029,,,,,,,,,,
+vanilla_single_col,1,1,3,36.602,,,,,,,,,,
+vanilla_single_col,1,1,4,64.295,,,,,,,,,,
+vanilla_single_col,1,1,5,40.029,,,,,,,,,,
+vanilla_parallel_col,1,1,1,41.368,,,,,,,,,,
+vanilla_parallel_col,1,1,2,39.766,,,,,,,,,,
+vanilla_parallel_col,1,1,3,39.717,,,,,,,,,,
+vanilla_parallel_col,1,1,4,42.171,,,,,,,,,,
+vanilla_parallel_col,1,1,5,36.844,,,,,,,,,,
+vanilla_single_heap,1,3,1,131.698,,,,,,,,,,
+vanilla_single_heap,1,3,2,126.210,,,,,,,,,,
+vanilla_single_heap,1,3,3,150.138,,,,,,,,,,
+vanilla_single_heap,1,3,4,127.986,,,,,,,,,,
+vanilla_single_heap,1,3,5,137.580,,,,,,,,,,
+vanilla_parallel_heap,1,3,1,72.003,,,,,,,,,,
+vanilla_parallel_heap,1,3,2,77.859,,,,,,,,,,
+vanilla_parallel_heap,1,3,3,74.839,,,,,,,,,,
+vanilla_parallel_heap,1,3,4,75.010,,,,,,,,,,
+vanilla_parallel_heap,1,3,5,73.119,,,,,,,,,,
+vanilla_single_col,1,3,1,109.261,,,,,,,,,,
+vanilla_single_col,1,3,2,104.642,,,,,,,,,,
+vanilla_single_col,1,3,3,107.837,,,,,,,,,,
+vanilla_single_col,1,3,4,111.345,,,,,,,,,,
+vanilla_single_col,1,3,5,111.358,,,,,,,,,,
+vanilla_parallel_col,1,3,1,64.734,,,,,,,,,,
+vanilla_parallel_col,1,3,2,66.491,,,,,,,,,,
+vanilla_parallel_col,1,3,3,75.171,,,,,,,,,,
+vanilla_parallel_col,1,3,4,64.326,,,,,,,,,,
+vanilla_parallel_col,1,3,5,63.922,,,,,,,,,,
+vanilla_single_heap,1,6,1,196.164,,,,,,,,,,
+vanilla_single_heap,1,6,2,192.466,,,,,,,,,,
+vanilla_single_heap,1,6,3,188.620,,,,,,,,,,
+vanilla_single_heap,1,6,4,196.809,,,,,,,,,,
+vanilla_single_heap,1,6,5,212.525,,,,,,,,,,
+vanilla_parallel_heap,1,6,1,108.431,,,,,,,,,,
+vanilla_parallel_heap,1,6,2,108.485,,,,,,,,,,
+vanilla_parallel_heap,1,6,3,120.589,,,,,,,,,,
+vanilla_parallel_heap,1,6,4,129.634,,,,,,,,,,
+vanilla_parallel_heap,1,6,5,125.950,,,,,,,,,,
+vanilla_single_col,1,6,1,202.855,,,,,,,,,,
+vanilla_single_col,1,6,2,237.137,,,,,,,,,,
+vanilla_single_col,1,6,3,217.026,,,,,,,,,,
+vanilla_single_col,1,6,4,202.202,,,,,,,,,,
+vanilla_single_col,1,6,5,227.661,,,,,,,,,,
+vanilla_parallel_col,1,6,1,115.029,,,,,,,,,,
+vanilla_parallel_col,1,6,2,141.999,,,,,,,,,,
+vanilla_parallel_col,1,6,3,146.667,,,,,,,,,,
+vanilla_parallel_col,1,6,4,123.817,,,,,,,,,,
+vanilla_parallel_col,1,6,5,120.295,,,,,,,,,,
+vanilla_single_heap,1,12,1,410.478,,,,,,,,,,
+vanilla_single_heap,1,12,2,318.911,,,,,,,,,,
+vanilla_single_heap,1,12,3,324.666,,,,,,,,,,
+vanilla_single_heap,1,12,4,339.381,,,,,,,,,,
+vanilla_single_heap,1,12,5,353.184,,,,,,,,,,
+vanilla_parallel_heap,1,12,1,173.027,,,,,,,,,,
+vanilla_parallel_heap,1,12,2,181.161,,,,,,,,,,
+vanilla_parallel_heap,1,12,3,176.943,,,,,,,,,,
+vanilla_parallel_heap,1,12,4,186.593,,,,,,,,,,
+vanilla_parallel_heap,1,12,5,199.403,,,,,,,,,,
+vanilla_single_col,1,12,1,436.350,,,,,,,,,,
+vanilla_single_col,1,12,2,409.060,,,,,,,,,,
+vanilla_single_col,1,12,3,403.197,,,,,,,,,,
+vanilla_single_col,1,12,4,402.410,,,,,,,,,,
+vanilla_single_col,1,12,5,421.003,,,,,,,,,,
+vanilla_parallel_col,1,12,1,207.352,,,,,,,,,,
+vanilla_parallel_col,1,12,2,216.990,,,,,,,,,,
+vanilla_parallel_col,1,12,3,222.335,,,,,,,,,,
+vanilla_parallel_col,1,12,4,219.195,,,,,,,,,,
+vanilla_parallel_col,1,12,5,238.733,,,,,,,,,,
+
+############ done ############
