@@ -1,0 +1,7 @@
+dataset,path,execution_mode,rows_scanned,groups,total_ms,source_ms,join1_ms,join2_ms,agg_ms,runs,min_ms,median_ms,max_ms,checksum
+1c-like-v1,vanilla_single,heap + PostgreSQL row executor (mpw=0 jit=off),1000008,200,328.9,,,,,5,309.4,328.9,344.9,6854be25aa9bc0667f8163a679189dbe
+1c-like-v1,vanilla_default,heap + PostgreSQL row executor (server defaults),1000008,200,171.8,,,,,5,164.6,171.8,174.6,6854be25aa9bc0667f8163a679189dbe
+1c-like-v1,native_columnar,pgcolumnar + PgColumnarScan (mpw=0 jit=off),1000008,200,442.9,,,,,5,433.7,442.9,497.6,6854be25aa9bc0667f8163a679189dbe
+1c-like-v1,xpb_heap,heap + xp_batch pipeline,1000008,200,25.1,18.0,1.9,2.1,3.1,5,22.7,25.1,26.6,6854be25aa9bc0667f8163a679189dbe
+1c-like-v1,xpb_pgcolumnar,pgcolumnar + xp_batch Fold adapter,1000008,200,35.6,28.9,1.9,1.9,2.9,5,35.5,35.6,35.9,6854be25aa9bc0667f8163a679189dbe
+1c-like-v1,xpb_zlfs,ZLFS annual zone + xp_batch,1000008,200,7.0,0.0,1.9,2.1,3.0,5,6.7,7.0,7.2,6854be25aa9bc0667f8163a679189dbe

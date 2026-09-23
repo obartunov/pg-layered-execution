@@ -1,0 +1,14 @@
+-- port 5421
+server: PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled 
+Time: 346.963 ms
+Time: 328.460 ms
+Time: 340.003 ms
+Time: 372.188 ms
+Time: 357.576 ms
+-- port 5420
+server: PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled 
+Time: 317.449 ms
+Time: 345.152 ms
+Time: 346.924 ms
+Time: 329.002 ms
+Time: 364.154 ms
