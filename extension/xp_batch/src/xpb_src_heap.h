@@ -16,9 +16,13 @@ typedef enum XpbHeapPath
 {
     XPB_HEAP_FIXED = 0,     /* raw fixed-offset, fixed-width NOT NULL prefix */
     XPB_HEAP_DEFORM,        /* heap_deform_tuple, nullable and mixed types   */
-    XPB_HEAP_PROJECTED      /* walk like heap_deform_tuple, materialize only
+    XPB_HEAP_PROJECTED,     /* walk like heap_deform_tuple, materialize only
                              * the requested attributes.  EXPERIMENTAL:
                              * benchmark 05-C, never auto-selected.          */
+    XPB_HEAP_PROJECTED_EARLY /* as PROJECTED, but evaluate the range predicate
+                             * the moment its attribute has been walked and
+                             * abandon the tuple on rejection.  EXPERIMENTAL:
+                             * benchmark 05-D, never auto-selected.          */
 } XpbHeapPath;
 
 /*
@@ -73,6 +77,21 @@ extern void xpb_heap_source_projected_stats(XpBatchSource *src,
                                             int64 *tuples_scanned,
                                             int64 *attributes_walked,
                                             int64 *attributes_materialized);
+
+/*
+ * Early-rejection accounting, split by outcome.  The point of the split is to
+ * show that a rejected tuple genuinely stopped early: on an empty range with
+ * the predicate at attnum 1, attributes_walked_rejected should be one per
+ * tuple, not the whole row.  Incremented in the walker, never derived from
+ * selectivity afterwards.
+ */
+extern void xpb_heap_source_early_stats(XpBatchSource *src,
+                                        int64 *tuples_accepted,
+                                        int64 *tuples_rejected_early,
+                                        int64 *walked_accepted,
+                                        int64 *walked_rejected,
+                                        int64 *materialized_accepted,
+                                        int64 *materialized_rejected);
 
 extern void xpb_heap_source_stats(XpBatchSource *src, int64 *pages_rej,
                                   int64 *pages_scan, int64 *tuples_vis,

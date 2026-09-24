@@ -114,6 +114,20 @@ typedef struct HeapBatchState
     int64           tuples_scanned;
     int64           attributes_walked;
     int64           attributes_materialized;
+
+    /*
+     * Early-predicate mode.  pred_attno is explicit rather than assumed to be
+     * attnum 1: the walker checks the predicate when it reaches THAT
+     * attribute, wherever the layout puts it.
+     */
+    int16           pred_attno;             /* 1-based, 0 when unset        */
+    int             pred_col;               /* its batch column            */
+    int64           tuples_accepted;
+    int64           tuples_rejected_early;
+    int64           walked_accepted;
+    int64           walked_rejected;
+    int64           materialized_accepted;
+    int64           materialized_rejected;
 } HeapBatchState;
 
 /* ── Type mapping ── */
@@ -372,10 +386,37 @@ xpb_heap_deform_next_batch(XpBatchSource *src, XpColumnBatch *batch)
  * length header because that is what locating the next attribute requires;
  * it does not follow a TOAST pointer.
  */
+/*
+ * Evaluate the range predicate on a value just materialized into the batch.
+ * Returns true when the row survives.
+ *
+ * SQL semantics: a NULL operand makes BETWEEN unknown, and an unknown WHERE
+ * clause rejects the row.  There is no integer sentinel for NULL; the batch's
+ * validity bitmap is consulted.
+ *
+ * The raw int32 read is safe because xpb_heap_source_create_ex() refuses a
+ * predicate on anything but an XPB_COL_INT4 column; the assertion states that
+ * invariant at the point that depends on it, since this runs per tuple and
+ * cannot afford the checking accessor.
+ */
+static inline bool
+xpb_heap_pred_passes(const XpColumnBatch *batch, int col, int row,
+                     int32 lo, int32 hi)
+{
+    int32 key;
+
+    Assert(batch->cols[col].type == XPB_COL_INT4);
+    if (xpcb_isnull(batch, col, row))
+        return false;
+    key = ((const int32 *) batch->cols[col].data)[row];
+    return key >= lo && key <= hi;
+}
+
 static bool
 xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 {
     HeapBatchState *st = src->private_state;
+    bool            early = (st->path == XPB_HEAP_PROJECTED_EARLY);
     TupleDesc       td = RelationGetDescr(st->rel);
     MemoryContext   old;
     HeapTuple       tup;
@@ -416,6 +457,9 @@ xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
         uint32              off = 0;
         int                 attnum = 0;
         bool                keep = true;
+        bool                rejected = false;
+        int                 walked = 0;
+        int                 materialized = 0;
         Datum               d;
 
         st->tuples_visited++;
@@ -446,27 +490,34 @@ xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
             first_uncached = Min(first_uncached, first_null);
 
         /* phase 1: cached offsets, no alignment arithmetic */
-        for (; attnum < first_uncached; attnum++)
+        for (; !rejected && attnum < first_uncached; attnum++)
         {
             cattr = TupleDescCompactAttr(td, attnum);
-            st->attributes_walked++;
+            walked++;
 
             if (st->want[attnum] >= 0)
             {
                 d = fetch_att_noerr(tp + cattr->attcacheoff,
                                     cattr->attbyval, cattr->attlen);
                 xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
-                st->attributes_materialized++;
+                materialized++;
+                if (early && attnum + 1 == st->pred_attno &&
+                    !xpb_heap_pred_passes(batch, st->pred_col, nrows,
+                                          st->pred_lo, st->pred_hi))
+                {
+                    rejected = true;
+                    break;
+                }
             }
         }
-        if (first_uncached > 0)
+        if (!rejected && first_uncached > 0)
             off = cattr->attcacheoff + cattr->attlen;
 
         /* phase 2: no NULLs in this run */
-        for (; attnum < first_null; attnum++)
+        for (; !rejected && attnum < first_null; attnum++)
         {
             cattr = TupleDescCompactAttr(td, attnum);
-            st->attributes_walked++;
+            walked++;
 
             /*
              * Called for unused attributes too: stepping over a varlena
@@ -478,14 +529,21 @@ xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
             if (st->want[attnum] >= 0)
             {
                 xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
-                st->attributes_materialized++;
+                materialized++;
+                if (early && attnum + 1 == st->pred_attno &&
+                    !xpb_heap_pred_passes(batch, st->pred_col, nrows,
+                                          st->pred_lo, st->pred_hi))
+                {
+                    rejected = true;
+                    break;
+                }
             }
         }
 
         /* phase 3: NULLs possible; a NULL occupies no space */
-        for (; attnum < scan_natts; attnum++)
+        for (; !rejected && attnum < scan_natts; attnum++)
         {
-            st->attributes_walked++;
+            walked++;
 
             if (att_isnull(attnum, bp))
             {
@@ -493,7 +551,13 @@ xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
                 {
                     xpb_heap_store_value(st, batch, st->want[attnum], nrows,
                                          (Datum) 0, true);
-                    st->attributes_materialized++;
+                    materialized++;
+                    /* a NULL predicate operand makes BETWEEN unknown */
+                    if (early && attnum + 1 == st->pred_attno)
+                    {
+                        rejected = true;
+                        break;
+                    }
                 }
                 continue;
             }
@@ -504,18 +568,42 @@ xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
             if (st->want[attnum] >= 0)
             {
                 xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
-                st->attributes_materialized++;
+                materialized++;
+                if (early && attnum + 1 == st->pred_attno &&
+                    !xpb_heap_pred_passes(batch, st->pred_col, nrows,
+                                          st->pred_lo, st->pred_hi))
+                {
+                    rejected = true;
+                    break;
+                }
             }
         }
 
-        /* predicate on the first requested column, after it is in the batch */
-        if (st->has_pred)
-        {
-            int32 key = ((const int32 *) batch->cols[0].data)[nrows];
+        /*
+         * Late predicate: PROJECTED materializes every requested column and
+         * only then filters.  PROJECTED_EARLY has already decided, inside the
+         * walk, and skipped whatever followed.
+         */
+        if (rejected)
+            keep = false;
+        else if (st->has_pred && !early)
+            keep = xpb_heap_pred_passes(batch, st->pred_col, nrows,
+                                        st->pred_lo, st->pred_hi);
 
-            if (xpcb_isnull(batch, 0, nrows) ||
-                key < st->pred_lo || key > st->pred_hi)
-                keep = false;
+        st->attributes_walked += walked;
+        st->attributes_materialized += materialized;
+        if (keep)
+        {
+            st->tuples_accepted++;
+            st->walked_accepted += walked;
+            st->materialized_accepted += materialized;
+        }
+        else
+        {
+            if (rejected)
+                st->tuples_rejected_early++;
+            st->walked_rejected += walked;
+            st->materialized_rejected += materialized;
         }
 
         if (keep)
@@ -557,7 +645,7 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 
     if (st->path == XPB_HEAP_DEFORM)
         return xpb_heap_deform_next_batch(src, batch);
-    if (st->path == XPB_HEAP_PROJECTED)
+    if (st->path == XPB_HEAP_PROJECTED || st->path == XPB_HEAP_PROJECTED_EARLY)
         return xpb_heap_projected_next_batch(src, batch);
 
     if (st->done)
@@ -697,6 +785,12 @@ xpb_heap_rescan(XpBatchSource *src)
     st->tuples_scanned = 0;
     st->attributes_walked = 0;
     st->attributes_materialized = 0;
+    st->tuples_accepted = 0;
+    st->tuples_rejected_early = 0;
+    st->walked_accepted = 0;
+    st->walked_rejected = 0;
+    st->materialized_accepted = 0;
+    st->materialized_rejected = 0;
 }
 
 static void
@@ -820,11 +914,28 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
             st->max_attno = requested_attnos[i];
     }
 
-    if (has_pred && st->coltypes[0] != XPB_COL_INT4)
+    /*
+     * Predicate descriptor.  The range predicate is applied to the FIRST
+     * requested column; recording its attnum and batch column explicitly
+     * means the early-predicate walker checks it where the layout actually
+     * puts it rather than assuming attnum 1.
+     */
+    if (has_pred)
+    {
+        if (st->coltypes[0] != XPB_COL_INT4)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("HeapBatchSource: range predicate needs an int4 column, got %s",
+                            xpcb_type_name(st->coltypes[0])),
+                     errdetail("The experimental early-predicate path evaluates int4 BETWEEN only; it is not a general expression evaluator.")));
+        st->pred_attno = requested_attnos[0];
+        st->pred_col = 0;
+    }
+    else if (path == XPB_HEAP_PROJECTED_EARLY)
         ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("HeapBatchSource: range predicate needs an int4 first column, got %s",
-                        xpcb_type_name(st->coltypes[0]))));
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("HeapBatchSource: the early-predicate path needs a predicate"),
+                 errhint("Use XPB_HEAP_PROJECTED when there is nothing to reject on.")));
 
     if (path != XPB_HEAP_FIXED)
     {
@@ -954,4 +1065,21 @@ xpb_heap_source_projected_stats(XpBatchSource *src, int64 *tuples_scanned,
     *tuples_scanned = st->tuples_scanned;
     *attributes_walked = st->attributes_walked;
     *attributes_materialized = st->attributes_materialized;
+}
+
+void
+xpb_heap_source_early_stats(XpBatchSource *src, int64 *tuples_accepted,
+                            int64 *tuples_rejected_early,
+                            int64 *walked_accepted, int64 *walked_rejected,
+                            int64 *materialized_accepted,
+                            int64 *materialized_rejected)
+{
+    HeapBatchState *st = src->private_state;
+
+    *tuples_accepted = st->tuples_accepted;
+    *tuples_rejected_early = st->tuples_rejected_early;
+    *walked_accepted = st->walked_accepted;
+    *walked_rejected = st->walked_rejected;
+    *materialized_accepted = st->materialized_accepted;
+    *materialized_rejected = st->materialized_rejected;
 }

@@ -386,16 +386,20 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                 want = XPB_HEAP_FIXED;
             else if (strcmp(dash, "-projected") == 0)
                 want = XPB_HEAP_PROJECTED;
+            else if (strcmp(dash, "-early") == 0)
+                want = XPB_HEAP_PROJECTED_EARLY;
             else
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
                                 mode),
-                         errhint("<table>[-deform|-fixed|-projected], where table is heap, bad or fixedlayout; or pgcolumnar, or zlfs.")));
+                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad or fixedlayout; or pgcolumnar, or zlfs.")));
         }
 
         heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed"
-                       : (want == XPB_HEAP_PROJECTED) ? "projected" : "deform";
+                       : (want == XPB_HEAP_PROJECTED) ? "projected"
+                       : (want == XPB_HEAP_PROJECTED_EARLY) ? "projected-early"
+                       : "deform";
         src = xpb_heap_source_create_ex(fact_relid, attnos, V2_NCOLS, want,
                                         true, lo, hi);
         is_heap = true;
@@ -530,19 +534,25 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             int64   td_, ad_;
             int     ar_;
             bool    isdef;
-
             int64   ts_, aw_, am_;
+            int64   ta_, tr_, wa_, wr_, ma_, mr_;
 
             xpb_heap_source_deform_stats(src, &td_, &ad_, &ar_, &isdef);
             xpb_heap_source_projected_stats(src, &ts_, &aw_, &am_);
+            xpb_heap_source_early_stats(src, &ta_, &tr_, &wa_, &wr_, &ma_, &mr_);
             appendStringInfo(&extra,
                              "  heap_path=%s  tuples_deformed=" INT64_FORMAT
                              " attrs_deformed=" INT64_FORMAT
                              " tuples_scanned=" INT64_FORMAT
                              " attrs_walked=" INT64_FORMAT
                              " attrs_materialized=" INT64_FORMAT
+                             " tuples_accepted=" INT64_FORMAT
+                             " tuples_rejected_early=" INT64_FORMAT
+                             " walked_acc=" INT64_FORMAT " walked_rej=" INT64_FORMAT
+                             " mat_acc=" INT64_FORMAT " mat_rej=" INT64_FORMAT
                              " attrs_requested=%d",
-                             heap_path_used, td_, ad_, ts_, aw_, am_, ar_);
+                             heap_path_used, td_, ad_, ts_, aw_, am_,
+                             ta_, tr_, wa_, wr_, ma_, mr_, ar_);
         }
 
         elog(NOTICE,
