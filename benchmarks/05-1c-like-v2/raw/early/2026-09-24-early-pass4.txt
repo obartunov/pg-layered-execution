@@ -1,0 +1,218 @@
+############ Benchmark 05-D — early predicate pushdown ############
+
+=== layout equivalence and physical sizes ===
+--- row counts and logical equivalence ---
+reg2_fixed rows    1000008
+reg2_bad   rows    1000008
+logical checksum IDENTICAL: a5fdd715c60cab8cbe03a5525bbc4df1
+
+--- distributions must match ---
+period distribution   identical
+company distribution  identical
+account distribution  identical
+payload length distr  identical
+NULL counts           identical
+
+--- PHYSICAL size: reordering changes padding, so this is measured ---
+reg2_bad     relation     95 MB  total     95 MB  pages   12150  avg_width    65
+reg2_fixed   relation     92 MB  total     92 MB  pages   11795  avg_width    65
+size difference (fixed - bad): -2908160 bytes, -2.92%
+
+--- the same SQL report over both tables must agree, before xp_batch ---
+SQL report identical over both layouts (200 groups)
+
+############ source-mode proof ############
+The mode is proved from the OUTSIDE, by a counter the fixed path cannot
+increment, not by trusting the flag that was passed in.
+
+[1..12] mode=fixedlayout-deform: total=85.7 ms  build=0.5 ms  open=0.0 ms  source=76.5 ms  join1=2.9 ms  join2=3.2 ms  agg=2.6 ms  operators=8.7 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+[1..12] mode=fixedlayout-fixed: total=38.4 ms  build=0.2 ms  open=0.0 ms  source=30.3 ms  join1=2.5 ms  join2=2.5 ms  agg=2.1 ms  operators=7.1 ms  rows=1000008  batches=16  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+[1..12] mode=fixedlayout-projected: total=60.4 ms  build=0.2 ms  open=0.0 ms  source=53.1 ms  join1=2.5 ms  join2=2.4 ms  agg=2.3 ms  operators=7.1 ms  rows=1000008  batches=16  groups=200  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=5000040 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+[1..12] mode=fixedlayout-early: total=59.8 ms  build=0.2 ms  open=0.0 ms  source=52.0 ms  join1=2.4 ms  join2=2.2 ms  agg=3.0 ms  operators=7.6 ms  rows=1000008  batches=16  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=5000040 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+[1..1] mode=bad-early: total=38.2 ms  build=0.2 ms  open=0.1 ms  source=37.2 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.7 ms  rows=83334  batches=2  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1666680 attrs_materialized=1333344 tuples_accepted=83334 tuples_rejected_early=916674 walked_acc=750006 walked_rej=916674 mat_acc=416670 mat_rej=916674 attrs_requested=5
+[90..91] mode=bad-early: total=30.7 ms  build=0.2 ms  open=0.0 ms  source=30.5 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1000008 attrs_materialized=1000008 tuples_accepted=0 tuples_rejected_early=1000008 walked_acc=0 walked_rej=1000008 mat_acc=0 mat_rej=1000008 attrs_requested=5
+
+-- fixed mode on a layout that cannot support it must ERROR, not downgrade:
+ERROR:  HeapBatchSource: "reg2_bad" cannot use the fixed-offset path: column "comment" is variable-width
+HINT:  Use XPB_HEAP_DEFORM for this layout.
+
+############ correctness gate ############
+All three arms, every predicate. Timing is not taken if this fails.
+
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-fixed: total=20.9 ms  build=0.3 ms  open=0.0 ms  source=20.6 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-deform: total=42.1 ms  build=0.3 ms  open=0.0 ms  source=41.8 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-projected: total=44.8 ms  build=0.2 ms  open=0.0 ms  source=44.6 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=5000040 mat_acc=0 mat_rej=5000040 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=fixedlayout-early: total=30.0 ms  build=0.2 ms  open=0.0 ms  source=29.8 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1000008 attrs_materialized=1000008 tuples_accepted=0 tuples_rejected_early=1000008 walked_acc=0 walked_rej=1000008 mat_acc=0 mat_rej=1000008 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=bad-deform: total=51.6 ms  build=0.2 ms  open=0.0 ms  source=51.4 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=bad-projected: total=67.2 ms  build=0.2 ms  open=0.0 ms  source=67.0 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=9000072 attrs_materialized=5000040 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=9000072 mat_acc=0 mat_rej=5000040 attrs_requested=5
+NOTICE:  v2_register_report [90..91] mode=bad-early: total=32.1 ms  build=0.2 ms  open=0.0 ms  source=32.0 ms  join1=0.0 ms  join2=0.0 ms  agg=0.0 ms  operators=0.0 ms  rows=0  batches=0  groups=0  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1000008 attrs_materialized=1000008 tuples_accepted=0 tuples_rejected_early=1000008 walked_acc=0 walked_rej=1000008 mat_acc=0 mat_rej=1000008 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-fixed: total=20.6 ms  build=0.3 ms  open=0.0 ms  source=19.4 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-deform: total=43.7 ms  build=0.2 ms  open=0.0 ms  source=42.7 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-projected: total=48.3 ms  build=0.2 ms  open=0.0 ms  source=47.4 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.8 ms  rows=83334  batches=2  groups=200  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=83334 tuples_rejected_early=0 walked_acc=416670 walked_rej=4583370 mat_acc=416670 mat_rej=4583370 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=fixedlayout-early: total=31.4 ms  build=0.2 ms  open=0.0 ms  source=30.4 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.7 ms  rows=83334  batches=2  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1333344 attrs_materialized=1333344 tuples_accepted=83334 tuples_rejected_early=916674 walked_acc=416670 walked_rej=916674 mat_acc=416670 mat_rej=916674 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=bad-deform: total=47.9 ms  build=0.2 ms  open=0.0 ms  source=47.0 ms  join1=0.3 ms  join2=0.3 ms  agg=0.2 ms  operators=0.8 ms  rows=83334  batches=2  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=bad-projected: total=63.2 ms  build=0.2 ms  open=0.0 ms  source=62.2 ms  join1=0.4 ms  join2=0.3 ms  agg=0.2 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=9000072 attrs_materialized=5000040 tuples_accepted=83334 tuples_rejected_early=0 walked_acc=750006 walked_rej=8250066 mat_acc=416670 mat_rej=4583370 attrs_requested=5
+NOTICE:  v2_register_report [1..1] mode=bad-early: total=34.2 ms  build=0.2 ms  open=0.0 ms  source=33.1 ms  join1=0.3 ms  join2=0.4 ms  agg=0.2 ms  operators=0.9 ms  rows=83334  batches=2  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=1666680 attrs_materialized=1333344 tuples_accepted=83334 tuples_rejected_early=916674 walked_acc=750006 walked_rej=916674 mat_acc=416670 mat_rej=916674 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-fixed: total=30.3 ms  build=0.1 ms  open=0.0 ms  source=23.1 ms  join1=2.4 ms  join2=2.5 ms  agg=2.2 ms  operators=7.1 ms  rows=1000008  batches=16  groups=200  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-deform: total=57.6 ms  build=0.0 ms  open=0.0 ms  source=50.9 ms  join1=2.3 ms  join2=2.2 ms  agg=2.1 ms  operators=6.6 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-projected: total=90.4 ms  build=0.0 ms  open=0.0 ms  source=69.1 ms  join1=7.1 ms  join2=8.9 ms  agg=5.3 ms  operators=21.3 ms  rows=1000008  batches=16  groups=200  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=5000040 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=fixedlayout-early: total=65.7 ms  build=0.1 ms  open=0.0 ms  source=58.9 ms  join1=2.4 ms  join2=2.2 ms  agg=2.1 ms  operators=6.7 ms  rows=1000008  batches=16  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=5000040 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=5000040 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=bad-deform: total=89.1 ms  build=0.0 ms  open=0.0 ms  source=81.6 ms  join1=2.6 ms  join2=2.4 ms  agg=2.3 ms  operators=7.4 ms  rows=1000008  batches=16  groups=200  heap_path=deform  tuples_deformed=1000008 attrs_deformed=9000072 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=bad-projected: total=63.8 ms  build=0.0 ms  open=0.0 ms  source=56.6 ms  join1=2.6 ms  join2=2.3 ms  agg=2.2 ms  operators=7.2 ms  rows=1000008  batches=16  groups=200  heap_path=projected  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=9000072 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=9000072 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+NOTICE:  v2_register_report [1..12] mode=bad-early: total=63.2 ms  build=0.0 ms  open=0.0 ms  source=56.2 ms  join1=2.3 ms  join2=2.3 ms  agg=2.2 ms  operators=6.9 ms  rows=1000008  batches=16  groups=200  heap_path=projected-early  tuples_deformed=0 attrs_deformed=0 tuples_scanned=1000008 attrs_walked=9000072 attrs_materialized=5000040 tuples_accepted=1000008 tuples_rejected_early=0 walked_acc=9000072 walked_rej=0 mat_acc=5000040 mat_rej=0 attrs_requested=5
+90..91 fixedlayout-fixed     d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 fixedlayout-deform    d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 fixedlayout-projected d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 fixedlayout-early     d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 bad-deform            d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 bad-projected         d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 bad-early             d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 sql_reg2_bad          d41d8cd98f00b204e9800998ecf8427e  groups=0
+90..91 sql_reg2_fixed        d41d8cd98f00b204e9800998ecf8427e  groups=0
+1..1   fixedlayout-fixed     06ee205763e88a4c69acc3500e485869  groups=200
+1..1   fixedlayout-deform    06ee205763e88a4c69acc3500e485869  groups=200
+1..1   fixedlayout-projected 06ee205763e88a4c69acc3500e485869  groups=200
+1..1   fixedlayout-early     06ee205763e88a4c69acc3500e485869  groups=200
+1..1   bad-deform            06ee205763e88a4c69acc3500e485869  groups=200
+1..1   bad-projected         06ee205763e88a4c69acc3500e485869  groups=200
+1..1   bad-early             06ee205763e88a4c69acc3500e485869  groups=200
+1..1   sql_reg2_bad          06ee205763e88a4c69acc3500e485869  groups=200
+1..1   sql_reg2_fixed        06ee205763e88a4c69acc3500e485869  groups=200
+1..12  fixedlayout-fixed     135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  fixedlayout-deform    135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  fixedlayout-projected 135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  fixedlayout-early     135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  bad-deform            135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  bad-projected         135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  bad-early             135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  sql_reg2_bad          135d70b3a7b8f075335c56de08a27a39  groups=200
+1..12  sql_reg2_fixed        135d70b3a7b8f075335c56de08a27a39  groups=200
+NOTICE:  05-D gate PASS: all seven arms and both SQL layouts agree on every range
+
+############ buffer residency ############
+Both tables must be operating under comparable cache conditions, or a
+difference in reads would be read as deform cost.
+  reg2_bad: shared hit=12150
+  reg2_fixed: shared hit=11795
+
+############ timings: 1 warm-up + 5 measured runs ############
+# arm,lo,hi,run,total_ms,open_ms,source_ms,operators_ms,rows,heap_path,tuples_scanned,tuples_deformed,attrs_deformed,attrs_walked,attrs_materialized,tuples_accepted,tuples_rejected_early,walked_acc,walked_rej,mat_acc,mat_rej
+fixedlayout-fixed,90,91,1,23.8,0.0,23.2,0.0,0,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,90,91,2,22.6,0.0,21.9,0.0,0,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,90,91,3,22.0,0.0,21.2,0.0,0,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,90,91,4,21.3,0.0,20.9,0.0,0,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,90,91,5,21.1,0.0,20.7,0.0,0,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-deform,90,91,1,43.9,0.1,42.7,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,90,91,2,41.6,0.0,41.1,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,90,91,3,40.4,0.0,40.0,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,90,91,4,44.6,0.0,43.9,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,90,91,5,46.2,0.0,45.7,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-projected,90,91,1,49.9,0.0,49.4,0.0,0,projected,1000008,0,0,5000040,5000040,0,0,0,5000040,0,5000040
+fixedlayout-projected,90,91,2,50.3,0.0,49.9,0.0,0,projected,1000008,0,0,5000040,5000040,0,0,0,5000040,0,5000040
+fixedlayout-projected,90,91,3,51.1,0.0,50.7,0.0,0,projected,1000008,0,0,5000040,5000040,0,0,0,5000040,0,5000040
+fixedlayout-projected,90,91,4,64.6,0.0,64.2,0.0,0,projected,1000008,0,0,5000040,5000040,0,0,0,5000040,0,5000040
+fixedlayout-projected,90,91,5,59.5,0.0,59.0,0.0,0,projected,1000008,0,0,5000040,5000040,0,0,0,5000040,0,5000040
+fixedlayout-early,90,91,1,34.5,0.0,34.1,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+fixedlayout-early,90,91,2,48.7,0.0,48.3,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+fixedlayout-early,90,91,3,38.1,0.0,37.3,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+fixedlayout-early,90,91,4,36.3,0.0,35.9,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+fixedlayout-early,90,91,5,40.0,0.0,39.6,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+bad-deform,90,91,1,47.9,0.0,47.4,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,90,91,2,49.8,0.0,49.3,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,90,91,3,46.9,0.1,46.4,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,90,91,4,50.8,0.0,50.4,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,90,91,5,49.9,0.0,49.2,0.0,0,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-projected,90,91,1,67.2,0.0,66.6,0.0,0,projected,1000008,0,0,9000072,5000040,0,0,0,9000072,0,5000040
+bad-projected,90,91,2,64.5,0.0,64.1,0.0,0,projected,1000008,0,0,9000072,5000040,0,0,0,9000072,0,5000040
+bad-projected,90,91,3,68.3,0.0,67.8,0.0,0,projected,1000008,0,0,9000072,5000040,0,0,0,9000072,0,5000040
+bad-projected,90,91,4,73.2,0.0,72.8,0.0,0,projected,1000008,0,0,9000072,5000040,0,0,0,9000072,0,5000040
+bad-projected,90,91,5,70.2,0.0,69.7,0.0,0,projected,1000008,0,0,9000072,5000040,0,0,0,9000072,0,5000040
+bad-early,90,91,1,48.0,0.0,47.5,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+bad-early,90,91,2,48.5,0.0,47.9,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+bad-early,90,91,3,37.7,0.0,37.2,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+bad-early,90,91,4,38.7,0.0,38.2,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+bad-early,90,91,5,38.9,0.0,38.4,0.0,0,projected-early,1000008,0,0,1000008,1000008,0,1000008,0,1000008,0,1000008
+fixedlayout-fixed,1,1,1,24.4,0.0,23.0,0.9,83334,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,1,2,22.4,0.0,20.5,1.3,83334,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,1,3,23.0,0.0,21.0,1.5,83334,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,1,4,22.0,0.0,20.5,1.0,83334,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,1,5,22.1,0.0,20.6,0.9,83334,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,1,1,43.9,0.0,42.3,1.1,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,1,2,46.5,0.0,44.6,1.5,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,1,3,48.0,0.0,46.1,1.3,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,1,4,44.6,0.0,43.3,0.9,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,1,5,44.5,0.0,42.6,1.4,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-projected,1,1,1,53.5,0.0,50.6,2.5,83334,projected,1000008,0,0,5000040,5000040,83334,0,416670,4583370,416670,4583370
+fixedlayout-projected,1,1,2,52.1,0.0,50.8,0.9,83334,projected,1000008,0,0,5000040,5000040,83334,0,416670,4583370,416670,4583370
+fixedlayout-projected,1,1,3,54.5,0.0,53.2,1.0,83334,projected,1000008,0,0,5000040,5000040,83334,0,416670,4583370,416670,4583370
+fixedlayout-projected,1,1,4,51.4,0.0,50.2,0.8,83334,projected,1000008,0,0,5000040,5000040,83334,0,416670,4583370,416670,4583370
+fixedlayout-projected,1,1,5,55.6,0.0,54.2,0.9,83334,projected,1000008,0,0,5000040,5000040,83334,0,416670,4583370,416670,4583370
+fixedlayout-early,1,1,1,43.9,0.0,42.5,1.0,83334,projected-early,1000008,0,0,1333344,1333344,83334,916674,416670,916674,416670,916674
+fixedlayout-early,1,1,2,48.9,0.0,47.7,0.8,83334,projected-early,1000008,0,0,1333344,1333344,83334,916674,416670,916674,416670,916674
+fixedlayout-early,1,1,3,39.4,0.0,38.0,0.9,83334,projected-early,1000008,0,0,1333344,1333344,83334,916674,416670,916674,416670,916674
+fixedlayout-early,1,1,4,40.9,0.0,39.3,1.0,83334,projected-early,1000008,0,0,1333344,1333344,83334,916674,416670,916674,416670,916674
+fixedlayout-early,1,1,5,38.8,0.0,37.5,0.9,83334,projected-early,1000008,0,0,1333344,1333344,83334,916674,416670,916674,416670,916674
+bad-deform,1,1,1,57.7,0.0,55.7,1.5,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,1,2,55.8,0.0,53.7,1.5,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,1,3,49.5,0.0,48.0,1.0,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,1,4,50.3,0.0,48.9,0.9,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,1,5,49.8,0.0,48.5,0.9,83334,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-projected,1,1,1,69.6,0.0,68.1,1.0,83334,projected,1000008,0,0,9000072,5000040,83334,0,750006,8250066,416670,4583370
+bad-projected,1,1,2,69.5,0.0,68.0,0.9,83334,projected,1000008,0,0,9000072,5000040,83334,0,750006,8250066,416670,4583370
+bad-projected,1,1,3,69.0,0.0,67.5,0.9,83334,projected,1000008,0,0,9000072,5000040,83334,0,750006,8250066,416670,4583370
+bad-projected,1,1,4,70.6,0.0,69.2,0.9,83334,projected,1000008,0,0,9000072,5000040,83334,0,750006,8250066,416670,4583370
+bad-projected,1,1,5,67.8,0.0,66.5,0.8,83334,projected,1000008,0,0,9000072,5000040,83334,0,750006,8250066,416670,4583370
+bad-early,1,1,1,40.0,0.0,38.6,0.9,83334,projected-early,1000008,0,0,1666680,1333344,83334,916674,750006,916674,416670,916674
+bad-early,1,1,2,42.9,0.0,41.0,1.5,83334,projected-early,1000008,0,0,1666680,1333344,83334,916674,750006,916674,416670,916674
+bad-early,1,1,3,42.2,0.0,40.6,1.0,83334,projected-early,1000008,0,0,1666680,1333344,83334,916674,750006,916674,416670,916674
+bad-early,1,1,4,40.3,0.0,38.6,1.2,83334,projected-early,1000008,0,0,1666680,1333344,83334,916674,750006,916674,416670,916674
+bad-early,1,1,5,42.5,0.0,40.9,1.2,83334,projected-early,1000008,0,0,1666680,1333344,83334,916674,750006,916674,416670,916674
+fixedlayout-fixed,1,12,1,52.0,0.0,41.4,8.9,1000008,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,12,2,46.1,0.0,36.2,8.5,1000008,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,12,3,44.4,0.0,35.6,7.2,1000008,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,12,4,61.1,0.0,45.7,13.1,1000008,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-fixed,1,12,5,45.8,0.0,35.4,9.0,1000008,fixed,0,0,0,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,12,1,77.7,0.0,69.7,7.6,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,12,2,75.4,0.0,67.6,7.4,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,12,3,77.1,0.0,69.4,7.1,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,12,4,89.9,0.0,80.6,8.8,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-deform,1,12,5,92.2,0.0,82.7,8.9,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+fixedlayout-projected,1,12,1,68.0,0.0,61.0,6.6,1000008,projected,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-projected,1,12,2,69.7,0.0,61.8,7.4,1000008,projected,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-projected,1,12,3,71.5,0.0,62.8,8.2,1000008,projected,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-projected,1,12,4,71.4,0.0,63.5,7.4,1000008,projected,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-projected,1,12,5,93.6,0.1,84.7,7.1,1000008,projected,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-early,1,12,1,72.7,0.1,62.7,9.4,1000008,projected-early,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-early,1,12,2,73.6,0.0,65.9,7.2,1000008,projected-early,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-early,1,12,3,65.3,0.0,56.5,8.2,1000008,projected-early,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-early,1,12,4,67.5,0.0,58.9,8.1,1000008,projected-early,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+fixedlayout-early,1,12,5,64.9,0.0,56.9,7.3,1000008,projected-early,1000008,0,0,5000040,5000040,1000008,0,5000040,0,5000040,0
+bad-deform,1,12,1,81.6,0.0,73.7,7.4,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,12,2,108.1,0.0,97.4,10.0,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,12,3,80.6,0.1,73.1,7.0,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,12,4,78.6,0.0,71.4,6.8,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-deform,1,12,5,120.1,0.1,109.0,10.5,1000008,deform,0,1000008,9000072,0,0,0,0,0,0,0,0
+bad-projected,1,12,1,77.3,0.0,69.9,6.9,1000008,projected,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-projected,1,12,2,75.4,0.0,68.3,6.8,1000008,projected,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-projected,1,12,3,75.5,0.0,68.3,6.8,1000008,projected,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-projected,1,12,4,82.2,0.0,74.0,7.8,1000008,projected,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-projected,1,12,5,99.0,0.1,90.2,7.7,1000008,projected,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-early,1,12,1,79.3,0.1,71.2,7.6,1000008,projected-early,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-early,1,12,2,88.9,0.0,80.0,8.5,1000008,projected-early,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-early,1,12,3,89.1,0.0,80.4,8.2,1000008,projected-early,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-early,1,12,4,84.7,0.0,76.3,8.0,1000008,projected-early,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+bad-early,1,12,5,83.3,0.0,75.4,7.4,1000008,projected-early,1000008,0,0,9000072,5000040,1000008,0,9000072,0,5000040,0
+
+# pgColumnar context, same two predicates, unchanged code
+pgcolumnar,1,1,1,8.7,0.2,7.4,0.8,83334,n/a,,,,,,,,,,,
+pgcolumnar,1,1,2,10.3,0.2,9.0,0.7,83334,n/a,,,,,,,,,,,
+pgcolumnar,1,1,3,9.0,0.2,7.6,0.8,83334,n/a,,,,,,,,,,,
+pgcolumnar,1,1,4,8.9,0.2,7.5,0.8,83334,n/a,,,,,,,,,,,
+pgcolumnar,1,1,5,8.2,0.2,6.9,0.8,83334,n/a,,,,,,,,,,,
+pgcolumnar,1,12,1,38.6,0.2,30.7,7.4,1000008,n/a,,,,,,,,,,,
+pgcolumnar,1,12,2,42.1,0.2,34.1,7.4,1000008,n/a,,,,,,,,,,,
+pgcolumnar,1,12,3,36.6,0.1,29.3,6.8,1000008,n/a,,,,,,,,,,,
+pgcolumnar,1,12,4,38.9,0.2,31.1,7.3,1000008,n/a,,,,,,,,,,,
+pgcolumnar,1,12,5,38.2,0.2,30.4,7.3,1000008,n/a,,,,,,,,,,,
+
+############ done ############
