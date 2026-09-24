@@ -84,9 +84,10 @@ AS '$libdir/xp_batch', 'xpb_1c_register_report';
 -- back what the batch actually held, per column, including type and
 -- NULLability. Not part of any pipeline; used by test/contract_tests.sh to
 -- compare the batch layer against PostgreSQL's own view of the same table.
-CREATE OR REPLACE FUNCTION xpb_contract_probe(relname text, attnos int[], path text)
+CREATE OR REPLACE FUNCTION xpb_contract_probe(relname text, attnos int[], path text,
+                                              pred_lo int DEFAULT NULL, pred_hi int DEFAULT NULL)
 RETURNS TABLE(rownum bigint, col int, coltype text, is_null bool, val text)
-LANGUAGE C STRICT
+LANGUAGE C
 AS '$libdir/xp_batch', 'xpb_contract_probe';
 
 -- Typed pipeline: join + GROUP BY + SUM over the typed batch contract, with

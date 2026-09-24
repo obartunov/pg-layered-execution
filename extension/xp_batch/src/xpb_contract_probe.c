@@ -58,18 +58,25 @@ probe_render(const XpColumnBatch *b, int c, int r)
 }
 
 /*
- * xpb_contract_probe(relname text, attnos int[], path text)
+ * xpb_contract_probe(relname text, attnos int[], path text,
+ *                    pred_lo int DEFAULT NULL, pred_hi int DEFAULT NULL)
  *   -> (rownum bigint, col int, coltype text, isnull bool, val text)
  *
- * path is 'fixed' or 'deform'.  Asking for 'fixed' on a layout that cannot
- * support it raises the guard's error -- which is the point of several tests.
+ * path is 'fixed', 'deform', 'projected' or 'projected-early'.  Asking for
+ * 'fixed' on a layout that cannot support it raises the guard's error -- which
+ * is the point of several tests.
+ *
+ * The optional pred_lo/pred_hi pair applies a range predicate to the FIRST
+ * requested column.  Because those two arguments must be allowed to be NULL,
+ * the function cannot be STRICT, so the first three arguments are checked
+ * here rather than by the executor.
  */
 Datum
 xpb_contract_probe(PG_FUNCTION_ARGS)
 {
-    text           *relname = PG_GETARG_TEXT_PP(0);
-    ArrayType      *attarr = PG_GETARG_ARRAYTYPE_P(1);
-    text           *pathname = PG_GETARG_TEXT_PP(2);
+    text           *relname;
+    ArrayType      *attarr;
+    text           *pathname;
     ReturnSetInfo  *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
     TupleDesc       tupdesc;
     Tuplestorestate *store;
@@ -90,6 +97,24 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("xpb_contract_probe: set-valued context required")));
 
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+        ereport(ERROR,
+                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                 errmsg("xpb_contract_probe: relname, attnos and path must not be NULL")));
+    relname = PG_GETARG_TEXT_PP(0);
+    attarr = PG_GETARG_ARRAYTYPE_P(1);
+    pathname = PG_GETARG_TEXT_PP(2);
+
+    /*
+     * Half a range is not a predicate.  Accepting it silently would mean a
+     * test that meant to exercise the early-predicate path quietly measured
+     * the unfiltered one instead.
+     */
+    if (PG_ARGISNULL(3) != PG_ARGISNULL(4))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xpb_contract_probe: pred_lo and pred_hi must both be given or both omitted")));
+
     pstr = text_to_cstring(pathname);
     if (strcmp(pstr, "fixed") == 0)
         path = XPB_HEAP_FIXED;
@@ -97,10 +122,12 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
         path = XPB_HEAP_DEFORM;
     else if (strcmp(pstr, "projected") == 0)
         path = XPB_HEAP_PROJECTED;
+    else if (strcmp(pstr, "projected-early") == 0)
+        path = XPB_HEAP_PROJECTED_EARLY;
     else
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("xpb_contract_probe: path must be 'fixed', 'deform' or 'projected', got \"%s\"",
+                 errmsg("xpb_contract_probe: path must be 'fixed', 'deform', 'projected' or 'projected-early', got \"%s\"",
                         pstr)));
 
     relid = RelnameGetRelid(text_to_cstring(relname));
@@ -145,8 +172,19 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
     rsi->setResult = store;
     rsi->setDesc = BlessTupleDesc(tupdesc);
     MemoryContextSwitchTo(oldcxt);
-    src = xpb_heap_source_create_ex(relid, attnos, ncols, path,
-                                    false, 0, 0);
+    /*
+     * Optional range predicate on the first requested column, so the
+     * early-predicate path can be tested on any table rather than only
+     * through the benchmark's fixed schema.
+     */
+    {
+        bool    has_pred = !PG_ARGISNULL(3) && !PG_ARGISNULL(4);
+        int32   lo = has_pred ? PG_GETARG_INT32(3) : 0;
+        int32   hi = has_pred ? PG_GETARG_INT32(4) : 0;
+
+        src = xpb_heap_source_create_ex(relid, attnos, ncols, path,
+                                        has_pred, lo, hi);
+    }
     memset(&batch, 0, sizeof(batch));
     batch.capacity = 1024;      /* small on purpose: exercise batch boundaries */
     batch.ncols = ncols;

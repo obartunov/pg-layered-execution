@@ -566,6 +566,133 @@ else
 fi
 
 echo
+echo "=== early-predicate projected path (experimental, benchmark 05-D) ==="
+echo "    rejects a row the moment the predicate attribute is known"
+
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+-- predicate at attnum 1, ahead of a varlena and of the other requested
+-- columns, so an early reject can skip the rest of the tuple
+CREATE TABLE ep (
+    p int4 NOT NULL,      -- 1  predicate
+    note text,            -- 2  varlena after the predicate
+    q int8 NOT NULL,      -- 3  requested
+    r int4,               -- 4  requested, nullable
+    big text              -- 5  varlena
+);
+INSERT INTO ep SELECT g % 12 + 1,
+       CASE WHEN g % 4 = 0 THEN NULL ELSE repeat('n', g % 23) END,
+       g::int8 * 4000000000,
+       CASE WHEN g % 5 = 0 THEN NULL ELSE g END,
+       CASE WHEN g % 3 = 0 THEN NULL ELSE repeat('b', g % 11) END
+FROM generate_series(1, 4000) g;
+
+-- nullable predicate column: BETWEEN on NULL is unknown, so WHERE rejects
+CREATE TABLE ep_null (p int4, q int8 NOT NULL, note text);
+INSERT INTO ep_null SELECT CASE WHEN g % 7 = 0 THEN NULL ELSE g % 12 + 1 END,
+       g::int8 * 3000000000, repeat('x', g % 13)
+FROM generate_series(1, 2000) g;
+
+-- an external toasted value AFTER the predicate: an early reject must not
+-- even reach it
+CREATE TABLE ep_toast (p int4 NOT NULL, big text, q int8 NOT NULL);
+INSERT INTO ep_toast SELECT g % 12 + 1, repeat('abcdefgh', 40000), g::int8 * 7
+FROM generate_series(1, 200) g;
+SQL
+
+# $1 name  $2 table  $3 attnos  $4 lo  $5 hi  $6 SQL column list  $7 WHERE
+ep_case() {
+    local name="$1" tbl="$2" att="$3" lo="$4" hi="$5" cols="$6" where="$7"
+    local e l p
+    e=$("${PSQL[@]}" -c "SELECT md5(coalesce(string_agg(col||':'||coalesce(val,E'\\\\N'), ',' ORDER BY col, coalesce(val,E'\\\\N')),'')) FROM xpb_contract_probe('$tbl', $att, 'projected-early', $lo, $hi)" 2>&1)
+    l=$("${PSQL[@]}" -c "SELECT md5(coalesce(string_agg(col||':'||coalesce(val,E'\\\\N'), ',' ORDER BY col, coalesce(val,E'\\\\N')),'')) FROM xpb_contract_probe('$tbl', $att, 'projected', $lo, $hi)" 2>&1)
+    p=$("${PSQL[@]}" -c "SELECT md5(coalesce(string_agg(col||':'||coalesce(val,E'\\\\N'), ',' ORDER BY col, coalesce(val,E'\\\\N')),'')) FROM (SELECT * FROM $tbl WHERE $where) t, LATERAL (VALUES $cols) AS v(col,val)" 2>&1)
+    if [ "$e" = "$l" ] && [ "$e" = "$p" ] && [ -n "$e" ] && [[ ! "$e" =~ ERROR ]]; then
+        echo "  PASS  $name"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  $name"
+        echo "        early=$(head -c 34 <<<"$e") late=$(head -c 34 <<<"$l") sql=$(head -c 34 <<<"$p")"
+        fail=1
+    fi
+}
+
+EPC="(0,p::text),(1,q::text),(2,r::text)"
+ep_case "accepts all (1..12)"        ep "ARRAY[1,3,4]" 1 12 "$EPC" "p BETWEEN 1 AND 12"
+ep_case "rejects all (90..91)"       ep "ARRAY[1,3,4]" 90 91 "$EPC" "p BETWEEN 90 AND 91"
+ep_case "accepts a subset (1..1)"    ep "ARRAY[1,3,4]" 1 1  "$EPC" "p BETWEEN 1 AND 1"
+ep_case "accepts a subset (4..7)"    ep "ARRAY[1,3,4]" 4 7  "$EPC" "p BETWEEN 4 AND 7"
+ep_case "NULL predicate column rejects" ep_null "ARRAY[1,2]" 1 12 \
+        "(0,p::text),(1,q::text)" "p BETWEEN 1 AND 12"
+ep_case "predicate before a toasted varlena" ep_toast "ARRAY[1,3]" 1 1 \
+        "(0,p::text),(1,q::text)" "p BETWEEN 1 AND 1"
+ep_case "accepted rows keep int8 and NULL validity" ep "ARRAY[1,3,4]" 2 3 \
+        "$EPC" "p BETWEEN 2 AND 3"
+
+# An early reject before a toasted column must not touch the toast relation.
+skipped=$("${PSQL[@]}" <<'SQL' 2>/dev/null | tail -1
+SELECT pg_stat_reset(); SELECT pg_sleep(0.3);
+SELECT count(*) FROM xpb_contract_probe('ep_toast', ARRAY[1,3], 'projected-early', 90, 91);
+SELECT pg_stat_force_next_flush(); SELECT pg_sleep(0.3);
+SELECT coalesce(toast_blks_hit + toast_blks_read, 0) FROM pg_statio_all_tables WHERE relname='ep_toast';
+SQL
+)
+if [ "$skipped" = "0" ]; then
+    echo "  PASS  early reject reads no toast blocks ($skipped)"
+    pass_count=$((pass_count + 1))
+else
+    echo "  FAIL  early reject touched $skipped toast blocks"
+    fail=1
+fi
+
+# The early path needs a predicate; asking without one must error, not
+# silently behave like the late path.
+out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_contract_probe('ep', ARRAY[1,3], 'projected-early')" 2>&1)
+if grep -q "early-predicate path needs a predicate" <<<"$out"; then
+    echo "  PASS  early path without a predicate errors rather than falling back"
+    pass_count=$((pass_count + 1))
+else
+    echo "  FAIL  no-predicate early path not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-80)"
+    fail=1
+fi
+
+# The optional pred_lo/pred_hi pair means the probe cannot be STRICT, so the
+# other arguments are no longer NULL-checked by the executor.  Unguarded they
+# segfault the backend, which is how this was found.  Half a range is refused
+# too: accepting it would silently measure the unfiltered path.
+probe_refuses() {
+    local what="$1"; shift
+    local want="$1"; shift
+    local out
+    out=$("${PSQL[@]}" -c "$1" 2>&1)
+    if grep -q "$want" <<<"$out"; then
+        echo "  PASS  $what"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  $what: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        fail=1
+    fi
+}
+probe_refuses "NULL relname is refused, not dereferenced" "must not be NULL" \
+    "SELECT count(*) FROM xpb_contract_probe(NULL, ARRAY[1], 'deform')"
+probe_refuses "NULL attnos is refused, not dereferenced" "must not be NULL" \
+    "SELECT count(*) FROM xpb_contract_probe('ep', NULL::int[], 'deform')"
+probe_refuses "NULL path is refused, not dereferenced" "must not be NULL" \
+    "SELECT count(*) FROM xpb_contract_probe('ep', ARRAY[1], NULL)"
+probe_refuses "half a predicate range is refused" "must both be given" \
+    "SELECT count(*) FROM xpb_contract_probe('ep', ARRAY[1,3], 'projected-early', 1, NULL)"
+probe_refuses "half a predicate range is refused (other side)" "must both be given" \
+    "SELECT count(*) FROM xpb_contract_probe('ep', ARRAY[1,3], 'projected-early', NULL, 12)"
+
+# The backend must still be alive after all of that.
+if [ "$("${PSQL[@]}" -c 'SELECT 42')" = "42" ]; then
+    echo "  PASS  backend survived the NULL-argument probes"
+    pass_count=$((pass_count + 1))
+else
+    echo "  FAIL  backend did not survive the NULL-argument probes"
+    fail=1
+fi
+
+echo
 echo "=== benchmark-only source-mode forcing ==="
 echo "    (proved by a counter the fixed path cannot increment, not by the flag)"
 
