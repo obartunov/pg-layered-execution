@@ -243,6 +243,18 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     bool            is_pgcn = (strcmp(mode, "pgcolumnar") == 0);
     bool            is_heap = false;
     const char     *heap_path_used = "n/a";
+    /*
+     * Benchmark 05-E: observation of the aggregation hash table.  Counted in
+     * the probe loop itself, never derived afterwards from the group count.
+     * The table is a static open-addressed array with linear probing and no
+     * growth, so there is no rehash or capacity event to count -- that
+     * absence is itself part of the 05-E result and is reported explicitly
+     * rather than left to be inferred.
+     */
+    int64           agg_probes = 0;     /* slots examined, insert + hit      */
+    int64           agg_inserts = 0;    /* new groups created                */
+    int64           agg_hits = 0;       /* existing group found              */
+    int             agg_max_probe = 0;  /* longest single chain walked       */
     instr_time      t0, t1, tp, tn;
     double          build_ms = 0, open_ms = 0, source_ms = 0,
                     j1_ms = 0, j2_ms = 0, agg_ms = 0;
@@ -496,11 +508,22 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                     g->company_key = ck;
                     g->debit = dt; g->credit = kt;
                     ngroups++;
+                    agg_inserts++;
+                    agg_probes += probe + 1;
+                    if (probe + 1 > agg_max_probe)
+                        agg_max_probe = probe + 1;
                     break;
                 }
                 if (g->company_group == g1 && g->account_group == g2 &&
                     g->company_key == ck)
-                { g->debit += dt; g->credit += kt; break; }
+                {
+                    g->debit += dt; g->credit += kt;
+                    agg_hits++;
+                    agg_probes += probe + 1;
+                    if (probe + 1 > agg_max_probe)
+                        agg_max_probe = probe + 1;
+                    break;
+                }
             }
         }
         INSTR_TIME_SET_CURRENT(tn);
@@ -554,6 +577,35 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                              heap_path_used, td_, ad_, ts_, aw_, am_,
                              ta_, tr_, wa_, wr_, ma_, mr_, ar_);
         }
+
+        /*
+         * Aggregation hash table (benchmark 05-E).  agg_bytes is the actual
+         * allocation, which is sizeof(V2Group) * V2_GRP_CAP whatever the
+         * group count turns out to be: the table is sized once, before a
+         * single row is read.  It is reported as the allocation it is rather
+         * than divided by the group count to manufacture a per-group figure.
+         *
+         * grp_growths and grp_rehashes are constants here.  They are printed
+         * anyway so that "this implementation never grows" is a recorded
+         * measurement rather than something a reader has to take on trust.
+         */
+        appendStringInfo(&extra,
+                         "  grp_cap=%d grp_load_limit=%d grp_occupied=%d"
+                         " grp_load_factor=%.4f grp_bytes=%zu grp_entry_bytes=%zu"
+                         " grp_inserts=" INT64_FORMAT " grp_hits=" INT64_FORMAT
+                         " grp_probes=" INT64_FORMAT " grp_probes_per_lookup=%.4f"
+                         " grp_max_probe=%d grp_growths=0 grp_rehashes=0"
+                         " dim1_bytes=%zu dim2_bytes=%zu",
+                         V2_GRP_CAP, V2_GRP_LOAD, ngroups,
+                         (double) ngroups / V2_GRP_CAP,
+                         (size_t) V2_GRP_CAP * sizeof(V2Group), sizeof(V2Group),
+                         agg_inserts, agg_hits, agg_probes,
+                         (agg_inserts + agg_hits) > 0
+                             ? (double) agg_probes / (double) (agg_inserts + agg_hits)
+                             : 0.0,
+                         agg_max_probe,
+                         (size_t) V2_DIM1_CAP * sizeof(V2Dim1),
+                         (size_t) V2_DIM2_CAP * sizeof(V2Dim2));
 
         elog(NOTICE,
              "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
