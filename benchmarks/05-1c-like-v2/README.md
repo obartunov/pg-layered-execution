@@ -719,3 +719,310 @@ available on layouts that permit it.
   is unchanged, and 05-A/05-B numbers are unaffected.
 * A tuple shorter than the projection is refused rather than handled with
   missing-value semantics.
+
+---
+
+# Benchmark 05-D — Early Predicate Pushdown into Projected Heap Decode
+
+05-C ended on an open hypothesis: the projected walker, unlike
+`heap_deform_tuple`, can abandon a tuple mid-way, so it should be able to
+evaluate the predicate the moment the predicate attribute is available and
+stop. 05-D implements exactly that and measures it.
+
+> How much can the projected heap decoder save if it evaluates the predicate
+> as soon as the predicate attribute is available and stops walking the tuple
+> immediately when the row is rejected?
+
+`XPB_HEAP_PROJECTED_EARLY`. Experimental, never auto-selected. `XPB_HEAP_FIXED`,
+`XPB_HEAP_DEFORM` and `XPB_HEAP_PROJECTED` are unchanged and all four live in
+the same binary, so late-versus-early is a controlled comparison.
+
+## Answer
+
+**Case A, and the 05-C hypothesis is confirmed.** At selective predicates
+early rejection is **1.4–1.8× faster than projected-late**, and at full scan
+the two are indistinguishable. The mechanism counters show why directly: on
+the empty range a rejected tuple walks **1 attribute instead of 9**.
+
+Early rejection also overtakes full deform at selective predicates — 05-C's
+loss at low selectivity was predicate placement, exactly as diagnosed, and it
+is gone. It does **not** reach fixed-offset extraction, and it does not come
+near pgColumnar's rowgroup pruning.
+
+## Implementation
+
+One new mode, sharing the 05-C walker rather than a second one. In each of
+the walker's three phases, immediately after an attribute is stored:
+
+```c
+if (early && attnum + 1 == st->pred_attno &&
+    !xpb_heap_pred_passes(batch, st->pred_col, nrows,
+                          st->pred_lo, st->pred_hi))
+{ rejected = true; break; }
+```
+
+and the tuple is abandoned: `nrows` is never incremented, so the partially
+written batch slot is overwritten by the next tuple.
+
+Deliberately *not* built (§3, §23): no expression executor, no fmgr dispatch
+per row, no operator lookup, no SIMD or branchless filtering. The predicate is
+`int4 BETWEEN lo AND hi` and nothing else.
+
+Four properties worth stating explicitly:
+
+* **The predicate attnum is explicit, not assumed.** `pred_attno` is recorded
+  in the source descriptor and the walker tests `attnum + 1 == st->pred_attno`.
+  It happens to be 1 in this benchmark's tables; the code does not rely on that.
+* **NULL rejects the row.** `xpb_heap_pred_passes()` returns false when the
+  predicate attribute is NULL, before reading the value — `BETWEEN` on NULL is
+  UNKNOWN, and a WHERE filter drops the row. No integer sentinel is used.
+  Tested on a table whose predicate column is nullable.
+* **An unsupported predicate column is an ERROR, not a downgrade.** A non-int4
+  predicate column, or the early mode with no predicate at all, raises rather
+  than silently falling back to late evaluation — a silent fallback would make
+  every subsequent measurement meaningless.
+* **Accepted rows take the identical path.** The rejection test is the only
+  addition; layout handling, alignment, varlena headers and NULL bitmap
+  interpretation are the 05-C code, unmodified.
+
+## Counters — the mechanism, not an inference
+
+Increments live in the walk loop. Across all 25 measured runs every counter is
+**bit-identical**, which is itself the check that they are not being derived
+from selectivity after the fact.
+
+| predicate | layout | rejected early | walk/tuple | mat/tuple | walk per *rejected* tuple | walk per *accepted* tuple |
+|---|---|---|---|---|---|---|
+| empty (90..91) | `reg2_bad` | 1 000 008 | **1.00** | 1.00 | **1.00** | — |
+| empty (90..91) | `reg2_fixed` | 1 000 008 | **1.00** | 1.00 | **1.00** | — |
+| 1/12 | `reg2_bad` | 916 674 | 1.67 | 1.33 | **1.00** | 9.00 |
+| 1/12 | `reg2_fixed` | 916 674 | 1.33 | 1.33 | **1.00** | 5.00 |
+| 12/12 | `reg2_bad` | 0 | 9.00 | 5.00 | — | 9.00 |
+| 12/12 | `reg2_fixed` | 0 | 5.00 | 5.00 | — | 5.00 |
+
+For comparison, projected-*late* walks 9.00 (`reg2_bad`) or 5.00
+(`reg2_fixed`) and materializes 5.00 per tuple at **every** predicate.
+
+This is §13's strongest case, and it comes out exactly as specified: on the
+empty range the early path walks one attribute, tests it, rejects, and moves
+to the next tuple. No join probe, no aggregate, no output row.
+
+`mat/tuple` is 1.00 rather than 0.00 on a rejected tuple because the predicate
+attribute *is* stored into its batch slot before being tested. That store is
+then abandoned — the row is never committed — but it is real work and the
+counter reports it rather than hiding it.
+
+## Results
+
+Warm cache, 1 warm-up + 5 measured runs per pass, **5 passes** = 25
+measurements per cell. Median `source_ms` (min–max). Same GUCs, tables and
+pipeline as 05-B/05-C. Raw logs in `raw/early/`, aggregate in
+`results-early-predicate.csv`.
+
+| predicate | `reg2_fixed` fixed | `reg2_fixed` deform | `reg2_fixed` proj-late | `reg2_fixed` **proj-early** | `reg2_bad` deform | `reg2_bad` proj-late | `reg2_bad` **proj-early** |
+|---|---|---|---|---|---|---|---|
+| empty (90..91) | 21.4 | 43.2 | 53.4 | **37.8** | 49.3 | 66.6 | **37.6** |
+| 1/12 | 22.1 | 43.6 | 51.7 | **37.5** | 50.8 | 69.2 | **39.5** |
+| 12/12 | 35.6 | 70.7 | 61.0 | **60.6** | 75.9 | 74.1 | **74.6** |
+
+pgColumnar context, code unchanged since 05-A: 8.3 ms at 1/12, 32.4 ms at 12/12.
+
+`total_ms`, rows selected and all counters per cell are in
+`results-early-predicate.csv`; nothing is buried in the logs.
+
+### Late − early (§20)
+
+| predicate | layout | late | early | late − early | ratio | deform / early |
+|---|---|---|---|---|---|---|
+| empty | `reg2_bad` | 66.6 | 37.6 | **+29.0 ms** | **1.77×** | 1.31× |
+| empty | `reg2_fixed` | 53.4 | 37.8 | **+15.6 ms** | **1.41×** | 1.14× |
+| 1/12 | `reg2_bad` | 69.2 | 39.5 | **+29.7 ms** | **1.75×** | 1.29× |
+| 1/12 | `reg2_fixed` | 51.7 | 37.5 | **+14.2 ms** | **1.38×** | 1.16× |
+| 12/12 | `reg2_bad` | 74.1 | 74.6 | −0.5 ms | 0.99× | 1.02× |
+| 12/12 | `reg2_fixed` | 61.0 | 60.6 | +0.4 ms | 1.01× | 1.17× |
+
+Connecting mechanism to timing, and no further: on `reg2_bad` at the empty
+range the walk drops 9.00 → 1.00 attributes/tuple and materialization 5.00 →
+1.00, and the time drops 1.77×. The counters establish that the work was
+avoided; they do not by themselves establish that the walk is the *only* thing
+that changed, because abandoning a tuple also skips the batch-commit
+bookkeeping. No stronger causal claim is made here.
+
+### The 12/12 control (§10, §15)
+
+`tuples_rejected_early = 0` at 12/12, and walk and materialization counters are
+**identical** to projected-late. There is therefore no mechanism by which the
+two arms can differ except the per-tuple range comparison itself.
+
+During this benchmark one pass nevertheless reported `fixedlayout-early` 20%
+slower than `fixedlayout-late` at 12/12. §10 requires investigating that before
+interpreting anything, so it was, and it was **host measurement noise**, not
+overhead:
+
+* Per-pass medians across the five published passes — `fixedlayout-late`
+  60.6 / 69.2 / 56.2 / 62.8 / 59.4 against `fixedlayout-early`
+  60.6 / 65.7 / 57.4 / 58.9 / 61.4 — overlap; the 20% gap did not reproduce.
+* 6.1% of all `source_ms` measurements in this benchmark exceed 1.25× their
+  own cell median, spread across **all eight** arms including
+  `fixedlayout-fixed` and `pgcolumnar`. This host produces occasional spikes;
+  block-ordered runs
+  let one land entirely inside one arm's five runs and move its median.
+* A dedicated interleaved paired A/B — late and early alternating within one
+  session, 15 pairs per layout, so every pair sees the same conditions — was
+  run twice (`raw/early/*-1212-paired-{a,b}.txt`):
+
+| run | layout | paired (early − late) | 95% CI | early faster in |
+|---|---|---|---|---|
+| a | `reg2_bad` | −2.13 ms | [−7.35, +3.10] | 8/15 pairs |
+| a | `reg2_fixed` | +2.18 ms | [−0.19, +4.55] | 4/15 pairs |
+| b | `reg2_bad` | +2.65 ms | [−1.81, +7.11] | 5/15 pairs |
+| b | `reg2_fixed` | +1.67 ms | [−2.45, +5.80] | 8/15 pairs |
+
+All four confidence intervals include zero, and the sign of the point estimate
+is not stable between runs.
+
+**§15 answer: the cost of carrying early-predicate capability when it cannot
+prune is below this harness's resolution.** The paired point estimates span
+−2.1 to +2.7 ms on a 59–74 ms source phase and none is distinguishable from
+zero. That is the expected shape:
+the added work is one `int32` range comparison per tuple against a value
+already in a batch column.
+
+## Correctness gate
+
+68 cases in `contract_tests.sh`, all passing, plus the 05-D benchmark gate
+(seven arms and both SQL layouts must produce one checksum and one group count
+per predicate range). Timing is not taken if the gate fails.
+
+New for the early path, each compared against **both** projected-late **and**
+PostgreSQL's own SQL over the same table:
+
+* predicate accepts all rows; rejects all rows; accepts a subset (two ranges)
+* predicate column NULL → row rejected
+* predicate before a varlena, and before an **external toasted** varlena
+* accepted rows still decode int8 correctly and preserve NULL validity
+* the early mode without a predicate is refused rather than downgraded
+
+### A defect this found in the test harness itself
+
+`xpb_contract_probe` gained the optional `pred_lo`/`pred_hi` pair, which means
+it can no longer be `STRICT` — and without `STRICT` the executor stops
+NULL-checking its other arguments. The first version dereferenced a NULL
+`relname` and **segfaulted the backend**. Fixed by checking arguments 0–2
+explicitly, and a half-specified range (one bound NULL) is now refused too,
+since accepting it would silently have measured the unfiltered path. Six
+cases cover this, the last of which asserts the backend is still alive
+afterwards. The probe is test-only and on no measured path.
+
+### An early reject reads no toast blocks (§17)
+
+Same method as 05-C — the TOAST relation's own block counters, with
+`pg_stat_force_next_flush()` so the reading is not stale — rather than
+instrumenting the hot path:
+
+```
+early reject before a toasted column     0 toast blocks touched
+```
+
+A rejected row stops before the toast pointer is ever followed.
+
+## pgColumnar context (§21)
+
+The comparison that is now meaningful is *tuple-level early rejection* against
+*rowgroup-level pruning*, not columnar against full deform:
+
+| | 1/12 | 12/12 |
+|---|---|---|
+| heap, full deform (`reg2_bad`) | 50.8 | 75.9 |
+| heap, projected-late (`reg2_bad`) | 69.2 | 74.1 |
+| heap, **projected-early** (`reg2_bad`) | **39.5** | **74.6** |
+| heap, **projected-early** (`reg2_fixed`) | **37.5** | **60.6** |
+| heap, fixed offsets (`reg2_fixed`) | 22.1 | 35.6 |
+| pgColumnar | **8.3** | **32.4** |
+
+pgColumnar was not re-run for 05-D beyond this context measurement and its
+code is unchanged; its numbers agree with 05-A/05-C within noise.
+
+Early rejection is **4.5–4.8× behind pgColumnar at 1/12** (37.5 on `reg2_fixed`,
+39.5 on `reg2_bad`, against 8.3). The two mechanisms are
+not close: pgColumnar skips whole rowgroups without touching them, while the
+early heap path still visits every tuple and pays a page-at-a-time scan to do
+it. Tuple-level rejection removes decode work; it cannot remove the scan.
+
+At 12/12, where neither mechanism can prune, pgColumnar (32.4) and fixed-offset
+heap extraction (35.6) are comparable, and both are well ahead of any generic
+heap decode.
+
+## What this does and does not support
+
+* Early predicate evaluation in a projected heap decoder is a **real and large
+  win at selective predicates** — 1.4–1.8× over late evaluation — and is free
+  when it cannot prune.
+* It turns the generic heap path from *slower* than full deform at low
+  selectivity (05-C) into *faster* than full deform (1.14–1.31×).
+* It does **not** close the gap to fixed-offset extraction: 37.5 against 22.1
+  at 1/12 on the same table, still 1.7×.
+* It does **not** approach columnar rowgroup pruning.
+
+## Limitations
+
+* **The predicate sits at physical attnum 1 in both tables, which is the best
+  case.** A rejected tuple walks exactly 1 attribute here. The walker steps
+  over intervening attributes to reach its target — `walk/accepted = 9.00` on
+  `reg2_bad` shows it doing so — so a predicate at physical attnum *k* would
+  cost *k* walked attributes per rejected tuple, and the benefit would shrink
+  accordingly. §12's predicate-position experiment (attnum 1 / 5 / 9) was
+  **not performed**: it needs a third table and a report mode of its own, which
+  is more than the "only if easy" the brief allows. The scaling statement above
+  is a mechanism-supported expectation, not a measurement.
+* One predicate, one type: `int4 BETWEEN`. Nothing here supports a claim about
+  general predicate pushdown.
+* Single-column predicate only. No conjunctions, no disjunctions.
+* `reg2_fixed` is 2.92% smaller than `reg2_bad` (carried from 05-B), so
+  cross-layout comparisons carry that; same-table comparisons do not.
+* Warm cache only. A cold-cache run would be dominated by I/O and would not
+  measure decode.
+* The 05-A/05-B/05-C numbers reproduce within this host's noise but are not
+  bit-comparable across passes; this README does not restate them as if they
+  were.
+* `XPB_HEAP_PROJECTED_EARLY` is **not** auto-selected anywhere.
+  `xpb_heap_source_create()` and automatic source selection are unchanged.
+
+## The decision after 05-D (§29)
+
+The heap→batch spectrum is now measured end to end, on one dataset, one
+pipeline, and two controlled layouts:
+
+```
+heap arms measured on reg2_fixed; pgColumnar on reg2_col (1/12 / 12/12, source_ms)
+
+fixed offsets      22.1 / 35.6     lower bound; only on eligible layouts
+projected + early  37.5 / 60.6     general heap path, any layout
+projected late     51.7 / 61.0     superseded by the above
+full deform        43.6 / 70.7     what PostgreSQL gives you
+pgColumnar          8.3 / 32.4     rowgroup pruning
+```
+
+On `reg2_bad`, where the fixed-offset path is not available at all, the same
+spectrum reads 39.5 / 74.6 for projected-early against 50.8 / 75.9 for full
+deform — the general heap path's realistic case.
+
+**The evidence points to A: the heap→batch decoder is good enough to stop
+working on.** Three observations support that:
+
+1. The two remaining heap wins are structural, not incremental. Fixed-offset
+   extraction is already implemented and already the floor; it is unavailable
+   on `reg2_bad`-shaped layouts for a reason that no decoder change can fix.
+2. Between projected-early (37.5) and fixed (22.1) the residue is the
+   per-attribute loop machinery itself. Removing it means compiling the
+   projection or vectorizing the walk — both explicitly out of scope (§23),
+   and both large enough to be their own project.
+3. The gap that actually matters for the architecture is the 4.5× to
+   pgColumnar at 1/12, and that is a *scan-granularity* gap, not a decode gap.
+   No amount of tuple-level decoding work closes it.
+
+The case for B would be a predicate-position experiment showing the benefit
+collapsing for realistic schemas where the predicate is not the first
+attribute. That is the one open measurement, and it is cheap enough to settle
+before committing to A — but it would refine this result, not change the
+spectrum above.
