@@ -1026,3 +1026,326 @@ collapsing for realistic schemas where the predicate is not the first
 attribute. That is the one open measurement, and it is cheap enough to settle
 before committing to A — but it would refine this result, not change the
 spectrum above.
+
+---
+
+# Benchmark 05-E — Group Cardinality and Memory Boundary
+
+05-A..05-D characterised the source. 05-E moves the bottleneck downstream on
+purpose:
+
+> How does the batch pipeline behave as the number of live groups grows from
+> hundreds to tens of thousands, and where is its current memory/capacity
+> boundary?
+
+Nothing about heap decode, pgColumnar, the projected paths, predicate
+pushdown or the ZLFS format changes here. The aggregate was measured, not
+optimised.
+
+## Answer
+
+**Three regimes, and the boundary is a compile-time constant rather than a
+memory limit.**
+
+* Up to ~6 000 groups the aggregate is nearly flat and the pipeline is
+  source-dominated.
+* From half-full onwards the aggregate climbs steeply and dominates the
+  operators, entirely because of hash-table **load factor** — the measured
+  probe counts track textbook linear probing.
+* At **12 288 groups** the run stops with a clean ERROR. That is
+  `V2_GRP_LOAD`, a `#define` in `xpb_v2_report.c`, and it is reached while the
+  table holds 393 kB of live entries. PostgreSQL, on the same query, keeps
+  49 152 groups in 17 MB without spilling. **The limit is a chosen constant,
+  not a resource.**
+
+## Holding everything but cardinality still
+
+The group key is `(company_group, account_group, company_key)`, and
+`company_group` is a function of `company_key`, so cardinality is exactly
+
+```
+distinct(company_key) x distinct(account_group)
+```
+
+and `account_group` is a **dimension payload**. So the ladder is walked by
+rewriting 384 dimension rows — `xpe_set_cardinality(k)` — and nothing else.
+Across the whole benchmark:
+
+| held fixed | how |
+|---|---|
+| fact table | byte-identical; never rewritten, `pg_relation_size` checked each pass |
+| row count | 983 040 at every point |
+| predicate, selectivity | `period BETWEEN 1 AND 12`, all rows, every point |
+| join shape | same two joins, same dimension row counts (128 and 384) |
+| dimension hash occupancy | 128/192 and 384/768 of their load limits, constant |
+| ZLFS zone | built once over the fact table, reused by every point |
+
+Rebuilding a differently-keyed fact table per point — the obvious way to do
+this — would have moved source cost and join occupancy alongside cardinality
+and confounded all three. The measured flatness of `source_ms` and both join
+phases below is therefore a check on the construction, not a discovery.
+
+Sizing: 128 companies x 384 accounts = 49 152 pairs, each occurring exactly
+20 times. When `k` divides 384 every group holds exactly `20 * 384 / k` rows,
+so the distribution is uniform by construction rather than by sampling (§8 —
+no skew here). `k = 80, 88, 92` do not divide 384; they exist only to resolve
+the knee, and `verify-cardinality.sql` reports their group-size spread
+(max/min 1.25) rather than letting them pass as uniform.
+
+## The hash table being measured
+
+`xpb_v2_report.c`, unchanged by this benchmark:
+
+```c
+#define V2_GRP_CAP   16384
+#define V2_GRP_LOAD  (V2_GRP_CAP * 3 / 4)     /* = 12288 */
+```
+
+Open addressing, linear probing, `sizeof(V2Group) = 32` bytes, allocated once
+with `palloc0` before a single row is read. **It never grows and never
+rehashes.** Those two counters are reported as constant zeros rather than
+omitted, so that "this implementation does not grow" is a recorded
+measurement and not something the reader has to infer.
+
+## Results
+
+Primary arm is ZLFS (§2): the zone is already materialised, so `source_ms` is
+0.0 and what remains is operator behaviour. 5 passes x (1 warm-up + 5 measured
+runs) = 25 runs per cell, median `ms`. Raw in `raw/group-cardinality/`,
+aggregate in `results-group-cardinality.csv`.
+
+| groups | rows/group | load | source | join1 | join2 | **aggregate** | operators | total | status |
+|---|---|---|---|---|---|---|---|---|---|
+| 256 | 3840 | 0.016 | 0.0 | 2.5 | 2.8 | **3.8** | 9.1 | 86.8 | OK |
+| 1 024 | 960 | 0.063 | 0.0 | 2.4 | 2.8 | **4.4** | 9.6 | 81.8 | OK |
+| 2 048 | 480 | 0.125 | 0.0 | 2.5 | 2.9 | **4.5** | 10.0 | 86.6 | OK |
+| 4 096 | 240 | 0.250 | 0.0 | 2.4 | 2.8 | **4.4** | 9.6 | 82.2 | OK |
+| 6 144 | 160 | 0.375 | 0.0 | 2.5 | 2.9 | **4.9** | 10.3 | 81.7 | OK |
+| 8 192 | 120 | 0.500 | 0.0 | 2.6 | 2.9 | **9.1** | 14.6 | 89.9 | OK |
+| 10 240 | 96 | 0.625 | 0.0 | 2.4 | 2.9 | **14.0** | 19.3 | 91.4 | OK |
+| 11 264 | 87 | 0.688 | 0.0 | 2.5 | 2.9 | **16.6** | 22.0 | 96.2 | OK |
+| 11 776 | 83 | 0.719 | 0.0 | 2.4 | 2.8 | **17.4** | 22.8 | 96.4 | OK |
+| 12 288 | 80 | 0.750 | 0.0 | 2.4 | 2.9 | **19.3** | 24.7 | 96.7 | OK |
+| 12 416 | — | — | — | — | — | — | — | — | **ERROR** |
+| 16 384 | — | — | — | — | — | — | — | — | **ERROR** |
+| 24 576 | — | — | — | — | — | — | — | — | **ERROR** |
+| 49 152 | — | — | — | — | — | — | — | — | **ERROR** |
+
+`total` includes `open` (71-76 ms), which for the ZLFS arm is the registry
+scan -- it reads and validates every zone file in the data directory,
+including the 19 MB zone this benchmark rebuilds at the start of each pass. It
+is timed as its own phase, is constant across the ladder, and is excluded from
+`source` and `operators`, so it offsets every row equally and cannot affect
+the cardinality result (section 17). Building the zone (~180 ms) happens once
+per pass, before any measured run, and the runner reports it separately.
+
+The heap fixed-offset arm carries the same aggregate under a real source
+(`source_ms` 39.1-41.0 throughout) and its aggregate column agrees with the
+ZLFS arm at every point -- 3.4, 4.2, 4.6, 4.5, 5.1, 9.4, 14.0, 16.5, 17.6,
+19.6 -- which is the check that the aggregate behaviour is a property of the
+operator and not of the source.
+
+### Source and join really are flat
+
+Across a 48x change in group count: `source_ms` 0.0 everywhere (ZLFS) and
+39.1-41.0 (heap); `join1` 2.4-2.6; `join2` 2.8-2.9. §13 asked for this to be
+measured rather than assumed, and it holds.
+
+### The aggregate follows load factor, not group count
+
+| groups | load | probes/lookup measured | linear-probe theory | max probe | aggregate ms |
+|---|---|---|---|---|---|
+| 256 | 0.016 | 1.016 | 1.008 | 2 | 3.8 |
+| 1 024 | 0.063 | 1.034 | 1.033 | 4 | 4.4 |
+| 2 048 | 0.125 | 1.076 | 1.071 | 4 | 4.5 |
+| 4 096 | 0.250 | 1.149 | 1.167 | 5 | 4.4 |
+| 6 144 | 0.375 | 1.286 | 1.300 | 12 | 4.9 |
+| 8 192 | 0.500 | 1.540 | 1.500 | 37 | 9.1 |
+| 10 240 | 0.625 | 1.909 | 1.833 | 63 | 14.0 |
+| 11 264 | 0.688 | 2.201 | 2.100 | 84 | 16.6 |
+| 11 776 | 0.719 | 2.397 | 2.278 | 84 | 17.4 |
+| 12 288 | 0.750 | 2.707 | 2.500 | 91 | 19.3 |
+
+Theory is the textbook successful-search cost for linear probing,
+`0.5 * (1 + 1/(1-load))`; the lookups here are overwhelmingly successful
+(970 752 hits against 12 288 inserts at the last point). Measurement tracks it
+within a few percent at every load factor.
+
+**This is the §22 distinction, and it comes out on the side of saturation.**
+The aggregate does not slow down because there are more groups — between 256
+and 6 144 groups, a 24x increase, it moves 3.8 to 4.9 ms. It slows down
+because the table fills: every point above half-full costs roughly what
+linear probing says it should. The hash function is ordinary
+multiply-and-xor with no final mixing and takes the table index from the low
+bits, which is a fair thing to be suspicious of — but the average probe counts
+do not convict it. The `max_probe` tail (91 slots at 0.75) is worse than the
+average suggests and is the one place a weakness could still be hiding.
+Recorded as a hypothesis for a later experiment, not acted on here (§23).
+
+### Where the curve stops being smooth
+
+The knee is at **load factor 0.5**, 8 192 groups: 4.9 to 9.1 ms, an 86% jump
+for a 33% increase in groups, after five points that were nearly flat. §21
+suggested this point might matter more than the hard ERROR, and it does — it
+is where the implementation stops being cardinality-insensitive, and it
+arrives at half the nominal capacity, well before anything fails.
+
+### Memory does not grow
+
+| | |
+|---|---|
+| aggregate table | **524 288 bytes at every cardinality point** |
+| entry size | 32 bytes |
+| initial capacity | 16 384 slots |
+| final capacity | 16 384 slots |
+| growth events | 0 |
+| rehash events | 0 |
+| dimension hashes | 3 072 + 24 576 bytes, also constant |
+
+There is no allocation curve to plot. The table is sized once, before the
+first row, and `bytes_per_group` is therefore an artefact of division rather
+than a property of the implementation: it *falls* from 2 048 B/group at 256
+groups to 42.7 B/group at 12 288. §14 permits that metric only where the
+accounting supports it directly; here it does not, and it is reported as the
+fixed allocation it actually is. No process RSS was used.
+
+## The boundary (§26)
+
+| | |
+|---|---|
+| last successful group count | **12 288** |
+| first failing group count | **12 289** (the run requesting 12 416) |
+| hash capacity at failure | 16 384 slots, 524 288 bytes |
+| live bytes at last success | 12 288 x 32 = **393 216 bytes** |
+| failure trigger | **compile-time constant**, `V2_GRP_LOAD = V2_GRP_CAP * 3 / 4` in `xpb_v2_report.c` |
+| not | allocation failure, `work_mem`, OOM, or spill |
+
+```
+ERROR:  v2_register_report: group hash overflow (12288 groups, cap 16384)
+```
+
+The error names the count and the capacity, fires before any write, and is
+raised identically at 12 416, 16 384, 24 576 and 49 152 requested groups —
+deterministic, clean, non-corrupting, and the backend survives. Every failing
+point was run the full 5 passes to establish that, rather than being observed
+once.
+
+## Correctness gate
+
+`05-E gate PASS` in all five passes. **Per-group** equality, not grand totals:
+at each of the ten successful cardinality points, the ZLFS arm, the heap arm
+and PostgreSQL's own SQL must produce one identical md5 over every
+(company_group, account_group, company_key, debit, credit, net) tuple, sorted
+canonically, with NULLs rendered as explicit markers rather than swallowed by
+concatenation. The gate additionally asserts the group count is `128 * k` and
+that `sum(debit) - sum(credit) = sum(debit - credit)` in every row. Timing is
+not taken if it fails.
+
+## PostgreSQL baseline (§19, §20)
+
+Single core, `max_parallel_workers_per_gather = 0`, same query, medians of 25
+runs:
+
+| groups | xp_batch total (heap arm) | PostgreSQL |
+|---|---|---|
+| 256 | 50.4 | 286.8 |
+| 8 192 | 57.0 | 288.2 |
+| 12 288 | 66.5 | 302.4 |
+
+**The plan shapes are not the same, and the difference must not be read as
+executor overhead.** PostgreSQL applies eager aggregation:
+
+```
+Finalize HashAggregate          rows=12288   Batches: 1  Memory Usage: 6161kB
+  -> Hash Join (account)        rows=49152
+     -> Hash Join (company)     rows=49152
+        -> Partial HashAggregate rows=49152  Batches: 1  Memory Usage: 17425kB
+           -> Seq Scan          rows=983040
+```
+
+It aggregates 983 040 rows down to 49 152 **before** the joins, then joins two
+tiny dimensions and finalises. xp_batch joins all 983 040 rows and then
+aggregates. Two consequences:
+
+1. PostgreSQL's cost is nearly flat across the ladder (286 to 298 ms) because
+   its dominant hash table is the partial aggregate, which holds 49 152 groups
+   *at every point of the ladder*. Its flatness is a property of the plan, not
+   evidence that its aggregation scales better.
+2. **PostgreSQL holds 49 152 groups — 4x the count at which xp_batch errors —
+   in 17 MB with `Batches: 1`, no spill.** The plan shape is constant across
+   all three measured points; no switch to `GroupAggregate`, no partitioning,
+   no batching.
+
+xp_batch is 4.5-5.7x faster here, on a pipeline that does strictly more work
+per row than the plan it is being compared against, and stops at a quarter of
+the cardinality.
+
+## Limitations
+
+* **`k` is bounded above by the aggregate's own capacity**, so §5's ~100 000
+  group point is unreachable by construction and was not faked. The ladder
+  ends where the implementation ends.
+* The instrumentation is not free and is included in the numbers above. The
+  probe counters cost **~1.1 ms per million aggregated rows** (`fixedlayout-fixed`
+  at 1..12: `operators_ms` median 7.70 across 05-D's 25 runs, 8.80 across 15
+  runs after this change). It is O(rows) and independent of group count, so it
+  offsets the cardinality curve by a constant and does not distort its shape —
+  uninstrumented, the 256-to-12 288 aggregate growth would read steeper, not
+  shallower. 05-A..05-D's published timings predate it.
+* Uniform distribution only. No skew, no hot keys (§8, §28).
+* One row count. §27's optional row-count control was **not performed**: it
+  needs a second fact table and a second report mode, and every
+  (company, account) pair in this dataset lives entirely within one `period`,
+  so the row count cannot be halved with a predicate without also halving the
+  cardinality. Per-row and per-group costs are therefore not separated
+  experimentally here; the flat region below load 0.375 is the closest thing
+  to a per-row reading.
+* `ns/group` is reported in the CSV but is not a complexity model: it falls
+  from 14 453 to 830 and then rises again to 1 611, because group *sizes*
+  change by a factor of 48 across the ladder (§14).
+* The ZLFS arm's `open_ms` is dominated by a registry scan over all zone files
+  in the data directory. 55 orphaned zone files left by earlier sessions
+  (their source relations dropped) were moved aside to `/tmp/zlfs-orphans`
+  before measuring, which cut `open_ms` from ~79 ms to ~51 ms. No zone
+  belonging to 05-A..05-D was touched and their arms still run.
+* `zlfs_drop_zone(lo, hi)` keys on the period range alone, not on the
+  relation, so any benchmark that drops zones for [1..12] -- 05-A and 04 both
+  do -- also drops this one's. The runner therefore rebuilds its own zone at
+  the top of every pass rather than inheriting one, which makes 05-E
+  independent of gate ordering. The cross-relation reach of `zlfs_drop_zone`
+  is recorded here as an observation; changing it is out of scope (section 32).
+* Warm cache only.
+* No spill was implemented, no capacity was enlarged, and the hash function,
+  sizing policy, key encoding and collision strategy are untouched (§23, §24,
+  §32).
+
+## The decision after 05-E (§34)
+
+The measurements put this at **C, with a correction to how the question is
+usually posed.**
+
+The capacity boundary is real and close: 12 288 groups is not a large number
+for a register workload — a year of postings across a few thousand accounts
+and a few hundred cost centres passes it easily. So the boundary is the
+blocker, and growth or spill has to be designed (option C).
+
+But the numbers say the ceiling is not where the design discussion usually
+puts it:
+
+* It is **not a memory problem**. 393 kB of live entries, against 17 MB
+  PostgreSQL spends on 4x the groups without spilling. Nothing was exhausted;
+  a constant was reached.
+* The cost curve breaks at **half** the nominal capacity, not at the limit.
+  Any growth policy that waits for the load limit inherits a table that has
+  already been slowing down for a factor of two. Whatever replaces this should
+  grow at or before 0.5, which also means a growth design has to answer what
+  the rehash costs, since 05-E establishes that today there is none.
+* Aggregation is **not** expensive in itself. At realistic occupancy the
+  aggregate is 4–5 ms against a 38 ms source — option B is not supported.
+
+So: not A (the boundary is too close to move on to skew), not B (aggregation
+is cheap where it fits), not D (12 288 groups is not sufficient for realistic
+register workloads, which is precisely why it must be fixed before 10M scale
+is worth measuring). C — and the design target that follows from the data is a
+table that grows at load 0.5, not one that merely raises 16 384 to a bigger
+constant.

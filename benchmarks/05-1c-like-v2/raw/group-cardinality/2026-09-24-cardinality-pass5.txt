@@ -1,0 +1,349 @@
+############ Benchmark 05-E — group cardinality and memory boundary ############
+
+=== the fact table, which must not change across the ladder ===
+reg2_card rows=983040 bytes=94281728 distinct company_key=128 distinct account_key=384
+
+=== ZLFS zone (built once, outside every measured run — section 17) ===
+  NOTICE:  ZLFS zone [1..12] built: 983040 rows, 184 ms, 19200 KB, ncols=5, schema_hash=8e30a051, file=/tmp/pgdata20/zlfs/zone_168897_1_12.zlfs
+  VALID
+zone (re)built outside measured runs: 266 ms wall
+zone rows=983040 size_kb=19200 freshness=VALID
+
+############ correctness gate ############
+Per-group equality against PostgreSQL at every cardinality point, both
+source arms. Grand totals alone are not accepted. Timing is not taken if
+this fails.
+
+256
+WARNING:  ZLFS: cannot validate schema for /tmp/pgdata20/zlfs/zone_24614_25_36.zlfs (source relation gone?), skipping
+WARNING:  ZLFS: cannot validate schema for /tmp/pgdata20/zlfs/zone_170293_1_12.zlfs (source relation gone?), skipping
+WARNING:  ZLFS: cannot validate schema for /tmp/pgdata20/zlfs/zone_169319_991_992.zlfs (source relation gone?), skipping
+WARNING:  ZLFS: cannot validate schema for /tmp/pgdata20/zlfs/zone_82957_1_12.zlfs (source relation gone?), skipping
+WARNING:  ZLFS: cannot validate schema for /tmp/pgdata20/zlfs/zone_169593_1_3000.zlfs (source relation gone?), skipping
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=82.4 ms  build=0.5 ms  open=73.1 ms  source=0.0 ms  join1=1.9 ms  join2=2.8 ms  agg=4.0 ms  operators=8.7 ms  rows=983040  batches=15  groups=256  grp_cap=16384 grp_load_limit=12288 grp_occupied=256 grp_load_factor=0.0156 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=256 grp_hits=982784 grp_probes=998400 grp_probes_per_lookup=1.0156 grp_max_probe=2 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=44.4 ms  build=0.3 ms  open=0.0 ms  source=34.8 ms  join1=2.5 ms  join2=2.5 ms  agg=3.2 ms  operators=8.2 ms  rows=983040  batches=15  groups=256  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=256 grp_load_factor=0.0156 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=256 grp_hits=982784 grp_probes=998400 grp_probes_per_lookup=1.0156 grp_max_probe=2 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+1024
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=9.9 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.4 ms  join2=2.8 ms  agg=4.5 ms  operators=9.7 ms  rows=983040  batches=15  groups=1024  grp_cap=16384 grp_load_limit=12288 grp_occupied=1024 grp_load_factor=0.0625 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=1024 grp_hits=982016 grp_probes=1016640 grp_probes_per_lookup=1.0342 grp_max_probe=4 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=34.2 ms  build=0.1 ms  open=0.0 ms  source=24.7 ms  join1=2.6 ms  join2=2.5 ms  agg=4.3 ms  operators=9.5 ms  rows=983040  batches=15  groups=1024  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=1024 grp_load_factor=0.0625 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=1024 grp_hits=982016 grp_probes=1016640 grp_probes_per_lookup=1.0342 grp_max_probe=4 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+2048
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=9.4 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.1 ms  join2=2.9 ms  agg=4.2 ms  operators=9.2 ms  rows=983040  batches=15  groups=2048  grp_cap=16384 grp_load_limit=12288 grp_occupied=2048 grp_load_factor=0.1250 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=2048 grp_hits=980992 grp_probes=1057920 grp_probes_per_lookup=1.0762 grp_max_probe=4 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=36.0 ms  build=0.1 ms  open=0.0 ms  source=26.4 ms  join1=2.5 ms  join2=2.7 ms  agg=4.3 ms  operators=9.5 ms  rows=983040  batches=15  groups=2048  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=2048 grp_load_factor=0.1250 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=2048 grp_hits=980992 grp_probes=1057920 grp_probes_per_lookup=1.0762 grp_max_probe=4 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+4096
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=9.8 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.5 ms  join2=2.6 ms  agg=4.5 ms  operators=9.6 ms  rows=983040  batches=15  groups=4096  grp_cap=16384 grp_load_limit=12288 grp_occupied=4096 grp_load_factor=0.2500 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=4096 grp_hits=978944 grp_probes=1129680 grp_probes_per_lookup=1.1492 grp_max_probe=5 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=34.1 ms  build=0.1 ms  open=0.0 ms  source=24.9 ms  join1=2.5 ms  join2=2.5 ms  agg=4.1 ms  operators=9.1 ms  rows=983040  batches=15  groups=4096  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=4096 grp_load_factor=0.2500 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=4096 grp_hits=978944 grp_probes=1129680 grp_probes_per_lookup=1.1492 grp_max_probe=5 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+6144
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=10.0 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.5 ms  join2=2.6 ms  agg=4.7 ms  operators=9.8 ms  rows=983040  batches=15  groups=6144  grp_cap=16384 grp_load_limit=12288 grp_occupied=6144 grp_load_factor=0.3750 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=6144 grp_hits=976896 grp_probes=1263680 grp_probes_per_lookup=1.2855 grp_max_probe=12 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=35.4 ms  build=0.1 ms  open=0.0 ms  source=25.7 ms  join1=2.3 ms  join2=2.7 ms  agg=4.6 ms  operators=9.5 ms  rows=983040  batches=15  groups=6144  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=6144 grp_load_factor=0.3750 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=6144 grp_hits=976896 grp_probes=1263680 grp_probes_per_lookup=1.2855 grp_max_probe=12 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+8192
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=13.8 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.4 ms  join2=2.7 ms  agg=8.5 ms  operators=13.6 ms  rows=983040  batches=15  groups=8192  grp_cap=16384 grp_load_limit=12288 grp_occupied=8192 grp_load_factor=0.5000 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=8192 grp_hits=974848 grp_probes=1514280 grp_probes_per_lookup=1.5404 grp_max_probe=37 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=37.8 ms  build=0.1 ms  open=0.0 ms  source=24.9 ms  join1=2.3 ms  join2=2.6 ms  agg=7.8 ms  operators=12.8 ms  rows=983040  batches=15  groups=8192  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=8192 grp_load_factor=0.5000 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=8192 grp_hits=974848 grp_probes=1514280 grp_probes_per_lookup=1.5404 grp_max_probe=37 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+10240
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=18.9 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.1 ms  join2=2.7 ms  agg=13.9 ms  operators=18.7 ms  rows=983040  batches=15  groups=10240  grp_cap=16384 grp_load_limit=12288 grp_occupied=10240 grp_load_factor=0.6250 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=10240 grp_hits=972800 grp_probes=1876140 grp_probes_per_lookup=1.9085 grp_max_probe=63 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=44.0 ms  build=0.1 ms  open=0.0 ms  source=25.6 ms  join1=2.1 ms  join2=2.4 ms  agg=13.7 ms  operators=18.2 ms  rows=983040  batches=15  groups=10240  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=10240 grp_load_factor=0.6250 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=10240 grp_hits=972800 grp_probes=1876140 grp_probes_per_lookup=1.9085 grp_max_probe=63 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+11264
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=21.1 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.1 ms  join2=2.6 ms  agg=16.2 ms  operators=20.9 ms  rows=983040  batches=15  groups=11264  grp_cap=16384 grp_load_limit=12288 grp_occupied=11264 grp_load_factor=0.6875 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=11264 grp_hits=971776 grp_probes=2163580 grp_probes_per_lookup=2.2009 grp_max_probe=84 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=45.8 ms  build=0.1 ms  open=0.0 ms  source=25.2 ms  join1=2.3 ms  join2=2.5 ms  agg=15.6 ms  operators=20.5 ms  rows=983040  batches=15  groups=11264  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=11264 grp_load_factor=0.6875 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=11264 grp_hits=971776 grp_probes=2163580 grp_probes_per_lookup=2.2009 grp_max_probe=84 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+11776
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=22.8 ms  build=0.3 ms  open=0.0 ms  source=0.0 ms  join1=2.3 ms  join2=2.7 ms  agg=17.5 ms  operators=22.6 ms  rows=983040  batches=15  groups=11776  grp_cap=16384 grp_load_limit=12288 grp_occupied=11776 grp_load_factor=0.7188 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=11776 grp_hits=971264 grp_probes=2356000 grp_probes_per_lookup=2.3966 grp_max_probe=84 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=54.6 ms  build=0.1 ms  open=0.0 ms  source=30.4 ms  join1=2.5 ms  join2=2.8 ms  agg=18.8 ms  operators=24.1 ms  rows=983040  batches=15  groups=11776  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=11776 grp_load_factor=0.7188 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=11776 grp_hits=971264 grp_probes=2356000 grp_probes_per_lookup=2.3966 grp_max_probe=84 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+12288
+NOTICE:  v2_register_report [1..12] mode=card-zlfs: total=24.7 ms  build=0.2 ms  open=0.0 ms  source=0.0 ms  join1=2.8 ms  join2=2.7 ms  agg=18.9 ms  operators=24.4 ms  rows=983040  batches=15  groups=12288  grp_cap=16384 grp_load_limit=12288 grp_occupied=12288 grp_load_factor=0.7500 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=12288 grp_hits=970752 grp_probes=2660960 grp_probes_per_lookup=2.7069 grp_max_probe=91 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+NOTICE:  v2_register_report [1..12] mode=card: total=48.6 ms  build=0.1 ms  open=0.0 ms  source=24.8 ms  join1=2.6 ms  join2=2.6 ms  agg=18.5 ms  operators=23.7 ms  rows=983040  batches=15  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_cap=16384 grp_load_limit=12288 grp_occupied=12288 grp_load_factor=0.7500 grp_bytes=524288 grp_entry_bytes=32 grp_inserts=12288 grp_hits=970752 grp_probes=2660960 grp_probes_per_lookup=2.7069 grp_max_probe=91 grp_growths=0 grp_rehashes=0 dim1_bytes=3072 dim2_bytes=24576
+k=  2  groups=   256  card-zlfs 6f7e32746e8166962b47e359f9a97ef3
+k=  2  groups=   256  card      6f7e32746e8166962b47e359f9a97ef3
+k=  2  groups=   256  sql       6f7e32746e8166962b47e359f9a97ef3
+k=  8  groups=  1024  card-zlfs a18caed6b30d942181fbb911719b472d
+k=  8  groups=  1024  card      a18caed6b30d942181fbb911719b472d
+k=  8  groups=  1024  sql       a18caed6b30d942181fbb911719b472d
+k= 16  groups=  2048  card-zlfs 4d0352aa101d41e1eea4f601e747f84b
+k= 16  groups=  2048  card      4d0352aa101d41e1eea4f601e747f84b
+k= 16  groups=  2048  sql       4d0352aa101d41e1eea4f601e747f84b
+k= 32  groups=  4096  card-zlfs 8a17bf76420664c841702005576393de
+k= 32  groups=  4096  card      8a17bf76420664c841702005576393de
+k= 32  groups=  4096  sql       8a17bf76420664c841702005576393de
+k= 48  groups=  6144  card-zlfs d9fcd40a9c94821179fd9541cbdae183
+k= 48  groups=  6144  card      d9fcd40a9c94821179fd9541cbdae183
+k= 48  groups=  6144  sql       d9fcd40a9c94821179fd9541cbdae183
+k= 64  groups=  8192  card-zlfs 3757d1a3204b10b0cb742496d91ed52f
+k= 64  groups=  8192  card      3757d1a3204b10b0cb742496d91ed52f
+k= 64  groups=  8192  sql       3757d1a3204b10b0cb742496d91ed52f
+k= 80  groups= 10240  card-zlfs e0bd87d51e57f90b39d7bc8c7ae99512
+k= 80  groups= 10240  card      e0bd87d51e57f90b39d7bc8c7ae99512
+k= 80  groups= 10240  sql       e0bd87d51e57f90b39d7bc8c7ae99512
+k= 88  groups= 11264  card-zlfs acacf1bac92e2e1756a24c6d1ea23199
+k= 88  groups= 11264  card      acacf1bac92e2e1756a24c6d1ea23199
+k= 88  groups= 11264  sql       acacf1bac92e2e1756a24c6d1ea23199
+k= 92  groups= 11776  card-zlfs 7164204c364e210da56a7b79e2c2538e
+k= 92  groups= 11776  card      7164204c364e210da56a7b79e2c2538e
+k= 92  groups= 11776  sql       7164204c364e210da56a7b79e2c2538e
+k= 96  groups= 12288  card-zlfs ef8df5069efc76691aadb074ac9c85e4
+k= 96  groups= 12288  card      ef8df5069efc76691aadb074ac9c85e4
+k= 96  groups= 12288  sql       ef8df5069efc76691aadb074ac9c85e4
+NOTICE:  05-E gate PASS: both arms and PostgreSQL agree per group at every cardinality point
+
+############ cardinality verification, per point ############
+-- k=2 (groups=256) --
+   input rows        983040
+   total rows        983040
+   groups            256
+   rows per group    avg=3840.00 min=3840 max=3840 median=3840
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=2
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=8 (groups=1024) --
+   input rows        983040
+   total rows        983040
+   groups            1024
+   rows per group    avg=960.00 min=960 max=960 median=960
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=8
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=16 (groups=2048) --
+   input rows        983040
+   total rows        983040
+   groups            2048
+   rows per group    avg=480.00 min=480 max=480 median=480
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=16
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=32 (groups=4096) --
+   input rows        983040
+   total rows        983040
+   groups            4096
+   rows per group    avg=240.00 min=240 max=240 median=240
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=32
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=48 (groups=6144) --
+   input rows        983040
+   total rows        983040
+   groups            6144
+   rows per group    avg=160.00 min=160 max=160 median=160
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=48
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=64 (groups=8192) --
+   input rows        983040
+   total rows        983040
+   groups            8192
+   rows per group    avg=120.00 min=120 max=120 median=120
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=64
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=80 (groups=10240) --
+   input rows        983040
+   total rows        983040
+   groups            10240
+   rows per group    avg=96.00 min=80 max=100 median=100
+   uniform           no (max/min = 1.250)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=80
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=88 (groups=11264) --
+   input rows        983040
+   total rows        983040
+   groups            11264
+   rows per group    avg=87.27 min=80 max=100 median=80
+   uniform           no (max/min = 1.250)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=88
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=92 (groups=11776) --
+   input rows        983040
+   total rows        983040
+   groups            11776
+   rows per group    avg=83.48 min=80 max=100 median=80
+   uniform           no (max/min = 1.250)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=92
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+-- k=96 (groups=12288) --
+   input rows        983040
+   total rows        983040
+   groups            12288
+   rows per group    avg=80.00 min=80 max=80 median=80
+   uniform           yes (every group identical)
+   dim_company_c     rows=128 distinct company_group=8
+   dim_account_c     rows=384 distinct account_group=96
+   fact keys         distinct company_key=128 distinct account_key=384 distinct period=12
+
+############ timings: 1 warm-up + 5 measured runs ############
+# arm,k,run,groups,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,operators_ms,rows,cap,load_limit,occupied,load_factor,grp_bytes,entry_bytes,inserts,hits,probes,probes_per_lookup,max_probe,growths,rehashes,status
+card-zlfs,2,1,256,97.0,86.3,0.0,2.4,3.1,4.2,9.7,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card-zlfs,2,2,256,105.5,91.4,0.0,2.8,3.6,6.8,13.3,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card-zlfs,2,3,256,140.8,123.5,0.0,7.6,3.2,5.9,16.7,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card-zlfs,2,4,256,86.8,77.0,0.0,2.1,2.8,4.2,9.1,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card-zlfs,2,5,256,89.2,76.3,0.0,2.9,4.1,5.2,12.2,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card-zlfs,8,1,1024,97.1,80.2,0.0,3.6,4.6,8.1,16.3,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card-zlfs,8,2,1024,103.0,88.0,0.0,3.3,4.3,6.5,14.1,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card-zlfs,8,3,1024,91.7,80.3,0.0,2.8,3.4,4.6,10.8,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card-zlfs,8,4,1024,82.0,72.4,0.0,2.2,2.7,4.1,9.0,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card-zlfs,8,5,1024,81.2,71.5,0.0,2.0,2.8,4.4,9.1,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card-zlfs,16,1,2048,79.0,69.1,0.0,2.4,2.8,4.1,9.3,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card-zlfs,16,2,2048,86.6,76.1,0.0,2.5,2.9,4.5,9.8,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card-zlfs,16,3,2048,86.6,76.2,0.0,2.3,2.9,4.5,9.7,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card-zlfs,16,4,2048,86.4,75.6,0.0,2.9,2.9,4.4,10.2,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card-zlfs,16,5,2048,101.2,85.7,0.0,3.3,4.4,7.0,14.8,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card-zlfs,32,1,4096,99.1,86.1,0.0,2.9,3.7,5.8,12.4,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card-zlfs,32,2,4096,83.6,73.6,0.0,2.3,2.6,4.4,9.4,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card-zlfs,32,3,4096,80.9,70.6,0.0,2.4,2.9,4.3,9.7,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card-zlfs,32,4,4096,108.5,92.0,0.0,2.8,5.4,7.4,15.5,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card-zlfs,32,5,4096,81.2,71.0,0.0,2.4,2.8,4.4,9.5,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card-zlfs,48,1,6144,85.5,72.6,0.0,2.7,3.4,6.3,12.4,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card-zlfs,48,2,6144,83.4,72.8,0.0,2.1,2.9,5.0,10.1,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card-zlfs,48,3,6144,81.6,70.6,0.0,2.4,2.8,5.1,10.3,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card-zlfs,48,4,6144,82.6,72.1,0.0,2.5,2.7,4.7,9.9,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card-zlfs,48,5,6144,81.0,70.1,0.0,2.7,2.8,4.8,10.3,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card-zlfs,64,1,8192,92.0,77.1,0.0,2.7,2.9,8.7,14.3,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card-zlfs,64,2,8192,86.4,71.7,0.0,2.3,2.9,8.9,14.1,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card-zlfs,64,3,8192,94.4,79.9,0.0,2.2,2.9,8.7,13.9,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card-zlfs,64,4,8192,107.7,91.6,0.0,2.7,3.0,9.7,15.5,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card-zlfs,64,5,8192,85.7,71.2,0.0,2.7,2.8,8.4,13.9,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card-zlfs,80,1,10240,87.9,68.3,0.0,2.6,2.8,13.7,19.0,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card-zlfs,80,2,10240,91.6,71.5,0.0,2.4,2.8,14.2,19.4,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card-zlfs,80,3,10240,91.4,71.3,0.0,2.4,2.9,14.2,19.5,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card-zlfs,80,4,10240,98.0,76.8,0.0,2.7,3.0,14.6,20.3,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card-zlfs,80,5,10240,92.9,71.6,0.0,2.8,2.9,14.9,20.7,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card-zlfs,88,1,11264,96.6,73.2,0.0,2.5,2.9,17.4,22.8,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card-zlfs,88,2,11264,93.6,71.8,0.0,2.3,2.9,15.9,21.2,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card-zlfs,88,3,11264,93.3,71.0,0.0,2.4,2.8,16.4,21.6,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card-zlfs,88,4,11264,110.0,87.8,0.0,2.6,2.7,16.2,21.5,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card-zlfs,88,5,11264,92.5,70.6,0.0,2.3,2.8,16.1,21.3,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card-zlfs,92,1,11776,96.9,72.8,0.0,2.5,2.8,18.3,23.6,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card-zlfs,92,2,11776,119.8,82.7,0.0,4.8,3.4,28.0,36.2,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card-zlfs,92,3,11776,93.2,70.2,0.0,2.2,2.7,17.3,22.3,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card-zlfs,92,4,11776,92.8,69.9,0.0,2.1,2.7,17.4,22.2,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card-zlfs,92,5,11776,94.5,70.7,0.0,2.4,3.0,17.9,23.3,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card-zlfs,96,1,12288,97.0,72.1,0.0,2.5,2.9,19.0,24.3,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card-zlfs,96,2,12288,92.3,68.0,0.0,2.1,2.9,18.8,23.7,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card-zlfs,96,3,12288,98.3,73.6,0.0,2.3,2.8,19.0,24.1,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card-zlfs,96,4,12288,96.9,71.5,0.0,2.3,2.7,19.6,24.7,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card-zlfs,96,5,12288,96.7,70.5,0.0,2.7,2.9,20.1,25.6,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card-zlfs,97,1,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,97,2,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,97,3,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,97,4,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,97,5,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,128,1,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,128,2,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,128,3,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,128,4,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,128,5,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,192,1,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,192,2,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,192,3,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,192,4,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,192,5,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,384,1,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,384,2,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,384,3,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,384,4,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card-zlfs,384,5,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,2,1,256,48.5,0.0,38.1,2.6,2.9,3.3,8.8,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card,2,2,256,51.1,0.0,40.1,2.8,2.8,3.6,9.2,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card,2,3,256,51.7,0.0,40.5,2.8,2.6,4.0,9.5,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card,2,4,256,49.7,0.0,39.4,2.7,2.6,3.3,8.6,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card,2,5,256,48.3,0.0,37.9,2.9,2.7,3.2,8.8,983040,16384,12288,256,0.0156,524288,32,256,982784,998400,1.0156,2,0,0,OK
+card,8,1,1024,65.9,0.0,49.0,3.3,5.1,6.3,14.6,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card,8,2,1024,62.7,0.0,47.4,3.4,3.6,5.8,12.8,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card,8,3,1024,51.6,0.0,38.8,2.6,4.0,4.3,11.0,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card,8,4,1024,50.2,0.0,39.2,2.6,2.6,4.0,9.1,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card,8,5,1024,52.3,0.0,40.8,2.8,2.6,4.2,9.6,983040,16384,12288,1024,0.0625,524288,32,1024,982016,1016640,1.0342,4,0,0,OK
+card,16,1,2048,58.7,0.0,44.0,3.3,3.3,5.6,12.2,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card,16,2,2048,63.1,0.0,47.5,3.4,3.9,5.8,13.0,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card,16,3,2048,49.5,0.0,38.3,2.7,2.8,4.1,9.5,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card,16,4,2048,50.9,0.0,39.1,2.7,2.9,4.5,10.0,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card,16,5,2048,55.4,0.1,42.6,2.9,3.2,4.7,10.7,983040,16384,12288,2048,0.1250,524288,32,2048,980992,1057920,1.0762,4,0,0,OK
+card,32,1,4096,50.5,0.0,38.9,2.5,2.5,4.9,9.9,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card,32,2,4096,49.2,0.0,38.1,2.8,2.5,4.2,9.5,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card,32,3,4096,49.3,0.0,38.0,2.8,2.5,4.3,9.6,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card,32,4,4096,49.2,0.0,37.7,2.8,2.6,4.4,9.9,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card,32,5,4096,53.4,0.0,39.2,5.6,2.6,4.2,12.4,983040,16384,12288,4096,0.2500,524288,32,4096,978944,1129680,1.1492,5,0,0,OK
+card,48,1,6144,67.6,0.0,49.7,3.6,4.4,7.2,15.2,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card,48,2,6144,51.3,0.0,39.0,2.6,2.8,5.2,10.6,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card,48,3,6144,54.8,0.0,42.5,2.9,2.6,5.1,10.6,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card,48,4,6144,53.0,0.0,40.4,2.8,2.7,5.4,10.8,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card,48,5,6144,50.3,0.0,38.4,2.8,2.5,4.9,10.2,983040,16384,12288,6144,0.3750,524288,32,6144,976896,1263680,1.2855,12,0,0,OK
+card,64,1,8192,55.2,0.0,39.2,2.7,2.6,8.9,14.3,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card,64,2,8192,57.6,0.0,41.5,2.7,3.0,8.8,14.5,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card,64,3,8192,53.8,0.0,37.9,2.8,2.7,8.7,14.2,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card,64,4,8192,54.4,0.0,38.4,2.7,2.7,9.0,14.3,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card,64,5,8192,74.7,0.0,52.6,3.0,3.4,13.5,19.9,983040,16384,12288,8192,0.5000,524288,32,8192,974848,1514280,1.5404,37,0,0,OK
+card,80,1,10240,60.1,0.0,39.1,2.9,2.7,13.6,19.2,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card,80,2,10240,60.6,0.0,38.7,2.8,3.2,14.0,20.1,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card,80,3,10240,61.1,0.0,39.6,2.8,2.4,14.0,19.2,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card,80,4,10240,59.8,0.0,38.2,2.8,2.8,14.1,19.8,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card,80,5,10240,59.0,0.0,37.8,2.8,2.8,13.8,19.4,983040,16384,12288,10240,0.6250,524288,32,10240,972800,1876140,1.9085,63,0,0,OK
+card,88,1,11264,61.7,0.0,38.6,2.5,2.8,16.1,21.4,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card,88,2,11264,63.0,0.0,39.6,2.6,2.5,16.2,21.3,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card,88,3,11264,62.5,0.0,38.9,2.7,2.6,16.6,21.9,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card,88,4,11264,62.7,0.0,38.8,2.7,2.8,16.5,22.0,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card,88,5,11264,82.6,0.0,50.1,3.5,4.5,21.5,29.5,983040,16384,12288,11264,0.6875,524288,32,11264,971776,2163580,2.2009,84,0,0,OK
+card,92,1,11776,63.0,0.0,38.5,2.6,2.8,17.4,22.8,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card,92,2,11776,68.0,0.0,40.9,3.1,2.8,18.6,24.5,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card,92,3,11776,63.4,0.0,38.8,2.8,2.8,17.2,22.7,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card,92,4,11776,68.7,0.0,43.3,2.6,2.9,17.6,23.1,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card,92,5,11776,63.7,0.0,39.3,2.7,2.5,17.4,22.7,983040,16384,12288,11776,0.7188,524288,32,11776,971264,2356000,2.3966,84,0,0,OK
+card,96,1,12288,66.2,0.0,39.3,2.9,3.1,19.0,25.0,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card,96,2,12288,65.2,0.0,38.8,2.7,2.7,19.3,24.6,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card,96,3,12288,67.3,0.0,40.0,2.7,2.6,20.1,25.4,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card,96,4,12288,66.8,0.0,39.4,2.5,2.6,20.5,25.6,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card,96,5,12288,64.8,0.0,38.5,2.5,2.7,19.2,24.5,983040,16384,12288,12288,0.7500,524288,32,12288,970752,2660960,2.7069,91,0,0,OK
+card,97,1,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,97,2,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,97,3,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,97,4,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,97,5,12416,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,128,1,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,128,2,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,128,3,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,128,4,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,128,5,16384,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,192,1,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,192,2,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,192,3,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,192,4,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,192,5,24576,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,384,1,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,384,2,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,384,3,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,384,4,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+card,384,5,49152,,,,,,,,,,,,,,,,,,,,,,ERROR
+
+############ exact failure boundary ############
+Last success and first failure, with the error text as raised.
+-- k=96, 12288 groups:
+   OK  [1..12] mode=card-zlfs: total=100.5 ms  build=0.7 ms  open=74.5 ms  source=0.0 ms  join1=2.7 ms  join2=2.8 ms  ag
+-- k=97, 12416 groups:
+   ERROR:  v2_register_report: group hash overflow (12288 groups, cap 16384)
+
+############ PostgreSQL baseline, single core (section 19) ############
+# engine,k,run,groups,ms
+postgres,2,1,256,268.343
+postgres,2,2,256,283.628
+postgres,2,3,256,306.666
+postgres,2,4,256,308.833
+postgres,2,5,256,313.724
+postgres,64,1,8192,287.703
+postgres,64,2,8192,288.185
+postgres,64,3,8192,283.865
+postgres,64,4,8192,287.382
+postgres,64,5,8192,283.488
+postgres,96,1,12288,311.919
+postgres,96,2,12288,354.479
+postgres,96,3,12288,312.609
+postgres,96,4,12288,305.839
+postgres,96,5,12288,290.375
+
+############ PostgreSQL plan shapes (section 20) ############
+  k=2 groups=256: HashAggregate Batches: 1 HashAggregate Batches: 1 Batches: 1 Batches: 1 
+  k=64 groups=8192: HashAggregate Batches: 1 HashAggregate Batches: 1 Batches: 1 Batches: 1 
+  k=96 groups=12288: HashAggregate Batches: 1 HashAggregate Batches: 1 Batches: 1 Batches: 1 
+
+############ done ############
