@@ -14,8 +14,11 @@
 
 typedef enum XpbHeapPath
 {
-    XPB_HEAP_FIXED = 0,     /* raw fixed-offset, int4 NOT NULL prefix only */
-    XPB_HEAP_DEFORM         /* heap_deform_tuple, nullable and mixed types  */
+    XPB_HEAP_FIXED = 0,     /* raw fixed-offset, fixed-width NOT NULL prefix */
+    XPB_HEAP_DEFORM,        /* heap_deform_tuple, nullable and mixed types   */
+    XPB_HEAP_PROJECTED      /* walk like heap_deform_tuple, materialize only
+                             * the requested attributes.  EXPERIMENTAL:
+                             * benchmark 05-C, never auto-selected.          */
 } XpbHeapPath;
 
 /*
@@ -59,6 +62,17 @@ extern void xpb_heap_source_deform_stats(XpBatchSource *src,
                                          int64 *attrs_deformed,
                                          int *attrs_requested,
                                          bool *is_deform_path);
+
+/*
+ * Projected-path accounting.  attributes_walked counts what the tuple layout
+ * forced us to visit in order to locate later attributes; attributes_
+ * materialized counts what was actually stored into the batch.  The two
+ * differ exactly by the unused attributes a layout makes us step over.
+ */
+extern void xpb_heap_source_projected_stats(XpBatchSource *src,
+                                            int64 *tuples_scanned,
+                                            int64 *attributes_walked,
+                                            int64 *attributes_materialized);
 
 extern void xpb_heap_source_stats(XpBatchSource *src, int64 *pages_rej,
                                   int64 *pages_scan, int64 *tuples_vis,

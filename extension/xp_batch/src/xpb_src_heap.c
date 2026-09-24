@@ -43,6 +43,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "access/tupmacs.h"
 #include "catalog/pg_type.h"
 #include "storage/bufmgr.h"
 #include "utils/memutils.h"
@@ -106,6 +107,13 @@ typedef struct HeapBatchState
     int64           tuples_deformed;
     int64           attrs_deformed;
     int             attrs_requested;
+
+    /* projected path */
+    int16           max_attno;              /* highest requested, 1-based   */
+    signed char     want[MaxTupleAttributeNumber]; /* attnum-1 -> batch col, or -1 */
+    int64           tuples_scanned;
+    int64           attributes_walked;
+    int64           attributes_materialized;
 } HeapBatchState;
 
 /* ── Type mapping ── */
@@ -332,6 +340,214 @@ xpb_heap_deform_next_batch(XpBatchSource *src, XpColumnBatch *batch)
     return true;
 }
 
+
+/* ── Projected path ── */
+
+/*
+ * Walk a heap tuple by PostgreSQL's own rules, but materialize only the
+ * attributes the batch asked for.
+ *
+ * This is a structural mirror of heap_deform_tuple() in
+ * access/common/heaptuple.c, using the SAME inline helpers from
+ * access/tupmacs.h -- fetch_att_noerr(), align_fetch_then_add(),
+ * first_null_attr() -- and the same three-phase shape:
+ *
+ *   1. a prefix whose offsets are cached in the tuple descriptor
+ *      (firstNonCachedOffsetAttr), where no alignment arithmetic is needed;
+ *   2. a run with no NULLs, where each attribute is aligned and stepped over;
+ *   3. a tail that may contain NULLs, where a NULL occupies no space.
+ *
+ * Nothing about alignment, short or external varlena headers, or NULL bitmap
+ * interpretation is reinvented here; it is delegated to those helpers.  The
+ * only thing this does differently from heap_deform_tuple is:
+ *
+ *   - it stops at the HIGHEST REQUESTED attnum instead of natts, and
+ *   - it stores into the batch's typed columns instead of a Datum/isnull
+ *     array of width natts, so unused attributes cost a step and nothing
+ *     more.
+ *
+ * An unused attribute is still WALKED -- that is unavoidable, since a later
+ * attribute's position depends on it -- but it is never materialized and, for
+ * a varlena, never detoasted.  align_fetch_then_add() reads a varlena's
+ * length header because that is what locating the next attribute requires;
+ * it does not follow a TOAST pointer.
+ */
+static bool
+xpb_heap_projected_next_batch(XpBatchSource *src, XpColumnBatch *batch)
+{
+    HeapBatchState *st = src->private_state;
+    TupleDesc       td = RelationGetDescr(st->rel);
+    MemoryContext   old;
+    HeapTuple       tup;
+    int             nrows = 0;
+
+    if (st->done)
+        return false;
+
+    xpcb_reset(batch);
+    batch->ncols = st->ncols;
+
+    MemoryContextReset(st->batch_cxt);
+    old = MemoryContextSwitchTo(st->batch_cxt);
+
+    for (int c = 0; c < st->ncols; c++)
+    {
+        XpBatchColumn *col = &batch->cols[c];
+
+        col->type = st->coltypes[c];
+        col->data = palloc(batch->capacity * xpcb_type_width(col->type));
+        col->validity = NULL;
+        col->owns_data = false;
+        col->owns_validity = false;
+    }
+
+    while (nrows < batch->capacity &&
+           (tup = heap_getnext(st->scan, ForwardScanDirection)) != NULL)
+    {
+        HeapTupleHeader     tuphdr = tup->t_data;
+        bool                hasnulls = HeapTupleHasNulls(tup);
+        uint8              *bp = tuphdr->t_bits;
+        const char         *tp = (const char *) tuphdr + tuphdr->t_hoff;
+        CompactAttribute   *cattr = NULL;
+        int                 tup_natts = HeapTupleHeaderGetNatts(tuphdr);
+        int                 scan_natts;
+        int                 first_null;
+        int                 first_uncached;
+        uint32              off = 0;
+        int                 attnum = 0;
+        bool                keep = true;
+        Datum               d;
+
+        st->tuples_visited++;
+        st->tuples_scanned++;
+
+        /*
+         * Only attributes up to the highest one requested need visiting.
+         * Everything past it cannot move anything we read.
+         */
+        scan_natts = Min(tup_natts, (int) st->max_attno);
+
+        /*
+         * A tuple shorter than the projection would need getmissingattr()
+         * semantics for the remainder.  Refused rather than guessed: this is
+         * an experimental decoder and a wrong answer here is silent
+         * corruption.
+         */
+        if (tup_natts < (int) st->max_attno)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("xp_batch: projected path met a tuple with %d attributes, %d required",
+                            tup_natts, st->max_attno),
+                     errdetail("A tuple written before a column was added needs missing-value semantics, which this experimental path does not implement.")));
+
+        first_null = hasnulls ? first_null_attr(bp, scan_natts) : scan_natts;
+        first_uncached = Min(td->firstNonCachedOffsetAttr, scan_natts);
+        if (hasnulls)
+            first_uncached = Min(first_uncached, first_null);
+
+        /* phase 1: cached offsets, no alignment arithmetic */
+        for (; attnum < first_uncached; attnum++)
+        {
+            cattr = TupleDescCompactAttr(td, attnum);
+            st->attributes_walked++;
+
+            if (st->want[attnum] >= 0)
+            {
+                d = fetch_att_noerr(tp + cattr->attcacheoff,
+                                    cattr->attbyval, cattr->attlen);
+                xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
+                st->attributes_materialized++;
+            }
+        }
+        if (first_uncached > 0)
+            off = cattr->attcacheoff + cattr->attlen;
+
+        /* phase 2: no NULLs in this run */
+        for (; attnum < first_null; attnum++)
+        {
+            cattr = TupleDescCompactAttr(td, attnum);
+            st->attributes_walked++;
+
+            /*
+             * Called for unused attributes too: stepping over a varlena
+             * requires reading its length header, which is exactly what this
+             * does and no more.  The Datum it returns is discarded.
+             */
+            d = align_fetch_then_add(tp, &off, cattr->attbyval, cattr->attlen,
+                                     cattr->attalignby);
+            if (st->want[attnum] >= 0)
+            {
+                xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
+                st->attributes_materialized++;
+            }
+        }
+
+        /* phase 3: NULLs possible; a NULL occupies no space */
+        for (; attnum < scan_natts; attnum++)
+        {
+            st->attributes_walked++;
+
+            if (att_isnull(attnum, bp))
+            {
+                if (st->want[attnum] >= 0)
+                {
+                    xpb_heap_store_value(st, batch, st->want[attnum], nrows,
+                                         (Datum) 0, true);
+                    st->attributes_materialized++;
+                }
+                continue;
+            }
+
+            cattr = TupleDescCompactAttr(td, attnum);
+            d = align_fetch_then_add(tp, &off, cattr->attbyval, cattr->attlen,
+                                     cattr->attalignby);
+            if (st->want[attnum] >= 0)
+            {
+                xpb_heap_store_value(st, batch, st->want[attnum], nrows, d, false);
+                st->attributes_materialized++;
+            }
+        }
+
+        /* predicate on the first requested column, after it is in the batch */
+        if (st->has_pred)
+        {
+            int32 key = ((const int32 *) batch->cols[0].data)[nrows];
+
+            if (xpcb_isnull(batch, 0, nrows) ||
+                key < st->pred_lo || key > st->pred_hi)
+                keep = false;
+        }
+
+        if (keep)
+        {
+            st->tuples_passed++;
+            nrows++;
+        }
+        else
+        {
+            /*
+             * The row is dropped, so any validity bit written for it must be
+             * reset -- the next row reuses this slot and a stale clear bit
+             * would make a present value look NULL.
+             */
+            for (int c = 0; c < st->ncols; c++)
+                if (batch->cols[c].validity)
+                    xpcb_set_valid(&batch->cols[c], nrows);
+        }
+    }
+
+    MemoryContextSwitchTo(old);
+
+    if (nrows == 0)
+    {
+        st->done = true;
+        return false;
+    }
+
+    batch->nrows = nrows;
+    return true;
+}
+
 /* ── Fixed path ── */
 
 static bool
@@ -341,6 +557,8 @@ xpb_heap_next_batch(XpBatchSource *src, XpColumnBatch *batch)
 
     if (st->path == XPB_HEAP_DEFORM)
         return xpb_heap_deform_next_batch(src, batch);
+    if (st->path == XPB_HEAP_PROJECTED)
+        return xpb_heap_projected_next_batch(src, batch);
 
     if (st->done)
         return false;
@@ -470,12 +688,15 @@ xpb_heap_rescan(XpBatchSource *src)
     st->tuples_deformed = 0;
     st->attrs_deformed = 0;
 
-    if (st->path == XPB_HEAP_DEFORM)
+    if (st->path != XPB_HEAP_FIXED)
     {
         /* Ends the borrow window for anything the last batch handed out. */
         table_rescan(st->scan, NULL);
         MemoryContextReset(st->batch_cxt);
     }
+    st->tuples_scanned = 0;
+    st->attributes_walked = 0;
+    st->attributes_materialized = 0;
 }
 
 static void
@@ -483,7 +704,7 @@ xpb_heap_end(XpBatchSource *src)
 {
     HeapBatchState *st = src->private_state;
 
-    if (st->path == XPB_HEAP_DEFORM)
+    if (st->path != XPB_HEAP_FIXED)
     {
         if (st->scan)
             table_endscan(st->scan);
@@ -575,13 +796,37 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
                      errdetail("Supported: int4, int8, numeric, and text/varchar/bpchar/bytea as varlena.")));
     }
 
+    /*
+     * Projection map for the projected path: attnum-1 -> batch column, or -1
+     * for an attribute that must be walked but not materialized.  Built once
+     * here, never per tuple.
+     */
+    memset(st->want, -1, sizeof(st->want));
+    st->max_attno = 0;
+    for (int i = 0; i < ncols; i++)
+    {
+        if (requested_attnos[i] > MaxTupleAttributeNumber)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("xp_batch: attno %d exceeds MaxTupleAttributeNumber",
+                            requested_attnos[i])));
+        if (st->want[requested_attnos[i] - 1] >= 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("xp_batch: attno %d requested twice; the projected path maps each attribute to one batch column",
+                            requested_attnos[i])));
+        st->want[requested_attnos[i] - 1] = (signed char) i;
+        if (requested_attnos[i] > st->max_attno)
+            st->max_attno = requested_attnos[i];
+    }
+
     if (has_pred && st->coltypes[0] != XPB_COL_INT4)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("HeapBatchSource: range predicate needs an int4 first column, got %s",
                         xpcb_type_name(st->coltypes[0]))));
 
-    if (path == XPB_HEAP_DEFORM)
+    if (path != XPB_HEAP_FIXED)
     {
         st->batch_cxt = AllocSetContextCreate(CurrentMemoryContext,
                                               "xpb heap deform batch",
@@ -697,4 +942,16 @@ xpb_heap_source_deform_stats(XpBatchSource *src, int64 *tuples_deformed,
     *attrs_deformed = st->attrs_deformed;
     *attrs_requested = st->attrs_requested;
     *is_deform_path = (st->path == XPB_HEAP_DEFORM);
+}
+
+void
+xpb_heap_source_projected_stats(XpBatchSource *src, int64 *tuples_scanned,
+                                int64 *attributes_walked,
+                                int64 *attributes_materialized)
+{
+    HeapBatchState *st = src->private_state;
+
+    *tuples_scanned = st->tuples_scanned;
+    *attributes_walked = st->attributes_walked;
+    *attributes_materialized = st->attributes_materialized;
 }

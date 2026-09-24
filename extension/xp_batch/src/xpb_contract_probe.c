@@ -95,10 +95,12 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
         path = XPB_HEAP_FIXED;
     else if (strcmp(pstr, "deform") == 0)
         path = XPB_HEAP_DEFORM;
+    else if (strcmp(pstr, "projected") == 0)
+        path = XPB_HEAP_PROJECTED;
     else
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("xpb_contract_probe: path must be 'fixed' or 'deform', got \"%s\"",
+                 errmsg("xpb_contract_probe: path must be 'fixed', 'deform' or 'projected', got \"%s\"",
                         pstr)));
 
     relid = RelnameGetRelid(text_to_cstring(relname));

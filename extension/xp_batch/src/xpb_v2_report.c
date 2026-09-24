@@ -384,15 +384,18 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                 want = XPB_HEAP_DEFORM;
             else if (strcmp(dash, "-fixed") == 0)
                 want = XPB_HEAP_FIXED;
+            else if (strcmp(dash, "-projected") == 0)
+                want = XPB_HEAP_PROJECTED;
             else
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
                                 mode),
-                         errhint("<table>[-deform|-fixed], where table is heap, bad or fixedlayout; or pgcolumnar, or zlfs.")));
+                         errhint("<table>[-deform|-fixed|-projected], where table is heap, bad or fixedlayout; or pgcolumnar, or zlfs.")));
         }
 
-        heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed" : "deform";
+        heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed"
+                       : (want == XPB_HEAP_PROJECTED) ? "projected" : "deform";
         src = xpb_heap_source_create_ex(fact_relid, attnos, V2_NCOLS, want,
                                         true, lo, hi);
         is_heap = true;
@@ -528,11 +531,18 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             int     ar_;
             bool    isdef;
 
+            int64   ts_, aw_, am_;
+
             xpb_heap_source_deform_stats(src, &td_, &ad_, &ar_, &isdef);
+            xpb_heap_source_projected_stats(src, &ts_, &aw_, &am_);
             appendStringInfo(&extra,
                              "  heap_path=%s  tuples_deformed=" INT64_FORMAT
-                             " attrs_deformed=" INT64_FORMAT " attrs_requested=%d",
-                             heap_path_used, td_, ad_, ar_);
+                             " attrs_deformed=" INT64_FORMAT
+                             " tuples_scanned=" INT64_FORMAT
+                             " attrs_walked=" INT64_FORMAT
+                             " attrs_materialized=" INT64_FORMAT
+                             " attrs_requested=%d",
+                             heap_path_used, td_, ad_, ts_, aw_, am_, ar_);
         }
 
         elog(NOTICE,
