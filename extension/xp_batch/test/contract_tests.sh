@@ -464,6 +464,108 @@ compare "fixed prefix, varlena after it" f_i8 "ARRAY[1,2]" fixed \
         "(0,a::text),(1,b::text)"
 
 echo
+echo "=== projected heap path (experimental, benchmark 05-C) ==="
+echo "    walks the tuple by PostgreSQL's rules, materializes only what was asked"
+
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+-- varlena BEFORE and BETWEEN requested attributes, NULLs in both positions,
+-- mixed widths, and int8 at both extremes
+CREATE TABLE pj (
+    a int4 NOT NULL,      -- 1  requested
+    v1 text,              -- 2  varlena before a requested attr, 25% NULL
+    b int8 NOT NULL,      -- 3  requested
+    v2 text,              -- 4  varlena BETWEEN requested attrs
+    n1 int4,              -- 5  nullable, not requested
+    c int8,               -- 6  requested, nullable
+    d numeric(18,2),      -- 7  numeric, not requested
+    e int4 NOT NULL       -- 8  requested
+);
+INSERT INTO pj
+SELECT g,
+       CASE WHEN g % 4 = 0 THEN NULL WHEN g % 4 = 1 THEN '' ELSE repeat('v', g % 31) END,
+       CASE WHEN g % 5 = 0 THEN 9223372036854775807
+            WHEN g % 5 = 1 THEN -9223372036854775808
+            ELSE g::int8 * 4000000000 END,
+       CASE WHEN g % 3 = 0 THEN NULL ELSE repeat('w', g % 17) END,
+       CASE WHEN g % 6 = 0 THEN NULL ELSE g END,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE g::int8 * 1000000 END,
+       CASE WHEN g % 8 = 0 THEN NULL ELSE (g / 100.0)::numeric(18,2) END,
+       g * 3
+FROM generate_series(1, 3000) g;
+
+-- every nullable attribute NULL in every row
+CREATE TABLE pj_allnull (a int4 NOT NULL, v text, n int4, b int8 NOT NULL);
+INSERT INTO pj_allnull SELECT g, NULL, NULL, g::int8 * 5000000000
+FROM generate_series(1, 500) g;
+
+-- an external toasted value ahead of a requested fixed-width column
+CREATE TABLE pj_toast (a int4 NOT NULL, big text, b int8 NOT NULL);
+INSERT INTO pj_toast SELECT g, repeat('abcdefgh', 3000 * g), g::int8 * 6000000000
+FROM generate_series(1, 6) g;
+SQL
+
+# NULL is rendered by the harness, not here -- an extra coalesce would
+# escape differently on the two sides and compare a literal against a NULL.
+PJ="(0,a::text),(1,b::text),(2,c::text),(3,e::text)"
+compare "projected: varlena before and between requested attrs" \
+        pj "ARRAY[1,3,6,8]" projected "$PJ"
+compare "deform: same rows, same projection" \
+        pj "ARRAY[1,3,6,8]" deform "$PJ"
+
+compare "projected: all-NULL attributes in every row" \
+        pj_allnull "ARRAY[1,4]" projected "(0,a::text),(1,b::text)"
+compare "projected: external toasted varlena before a requested attr" \
+        pj_toast "ARRAY[1,3]" projected "(0,a::text),(1,b::text)"
+compare "projected: the toasted column itself, when requested" \
+        pj_toast "ARRAY[1,2,3]" projected "(0,a::text),(1,big),(2,b::text)"
+compare "projected: int4/int8 mixed, INT64 extremes" \
+        t_i8 "ARRAY[1,2]" projected "(0,a::text),(1,b::text)"
+compare "projected: nullable int4 in the middle" \
+        v_i4null "ARRAY[1,2,3]" projected "(0,a::text),(1,b::text),(2,c::text)"
+compare "projected: NULL across a batch boundary" \
+        v_span "ARRAY[1,2]" projected "(0,a::text),(1,b::text)"
+compare "projected: numeric, exact decimal scale" \
+        n_exact "ARRAY[1,2,3]" projected "(0,a::text),(1,d::text),(2,e::text)"
+
+# The unused toasted value must be stepped over, not detoasted. A detoast of
+# 144 kB per row would be visible; this asserts the result is right while the
+# column is skipped, and the timing arm in 05-C reports the counters.
+compare "projected: skipping a toasted column gives the same answer" \
+        pj_toast "ARRAY[1,3]" deform "(0,a::text),(1,b::text)"
+
+# An unused EXTERNAL varlena must be stepped over, not detoasted. Observed
+# through the TOAST relation's block counters rather than by instrumenting the
+# hot path: locating the next attribute needs only the 18-byte pointer's
+# length header, so touching the toast relation at all would mean the value
+# was followed.
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE pj_ext (a int4 NOT NULL, big text, b int8 NOT NULL);
+INSERT INTO pj_ext SELECT g, repeat('abcdefgh', 40000), g::int8 * 7
+FROM generate_series(1, 200) g;
+SQL
+skipped=$("${PSQL[@]}" <<'SQL' 2>/dev/null | tail -1
+SELECT pg_stat_reset(); SELECT pg_sleep(0.3);
+SELECT count(*) FROM xpb_contract_probe('pj_ext', ARRAY[1,3], 'projected');
+SELECT pg_stat_force_next_flush(); SELECT pg_sleep(0.3);
+SELECT coalesce(toast_blks_hit + toast_blks_read, 0) FROM pg_statio_all_tables WHERE relname='pj_ext';
+SQL
+)
+wanted=$("${PSQL[@]}" <<'SQL' 2>/dev/null | tail -1
+SELECT pg_stat_reset(); SELECT pg_sleep(0.3);
+SELECT count(*) FROM xpb_contract_probe('pj_ext', ARRAY[1,2,3], 'projected');
+SELECT pg_stat_force_next_flush(); SELECT pg_sleep(0.3);
+SELECT coalesce(toast_blks_hit + toast_blks_read, 0) FROM pg_statio_all_tables WHERE relname='pj_ext';
+SQL
+)
+if [ "$skipped" = "0" ] && [ "${wanted:-0}" -gt 0 ]; then
+    echo "  PASS  unused external varlena is NOT detoasted (toast blocks: $skipped skipped, $wanted requested)"
+    pass_count=$((pass_count + 1))
+else
+    echo "  FAIL  detoast check: skipped touched $skipped toast blocks, requested touched $wanted"
+    fail=1
+fi
+
+echo
 echo "=== benchmark-only source-mode forcing ==="
 echo "    (proved by a counter the fixed path cannot increment, not by the flag)"
 
