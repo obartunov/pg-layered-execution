@@ -1,0 +1,10 @@
+Aggregate (actual time=121.528..121.530 rows=1.00 loops=1)
+  Buffers: shared hit=12150
+  ->  Seq Scan on reg2_bad (actual time=0.011..67.174 rows=1000008.00 loops=1)
+        Filter: ((period >= 1) AND (period <= 12))
+        Buffers: shared hit=12150
+Settings: work_mem = '64MB', max_parallel_workers_per_gather = '0'
+Planning:
+  Buffers: shared hit=39
+Planning Time: 0.333 ms
+Execution Time: 121.602 ms
