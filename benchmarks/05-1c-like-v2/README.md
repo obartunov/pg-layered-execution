@@ -543,3 +543,179 @@ range 1..12   135d70b3a7b8f075335c56de08a27a39   200 groups
   columns. That is a capability addition to the *fixed* path, not an
   optimization of the deform path being measured.
 * No optimization was applied during measurement.
+
+---
+
+# Benchmark 05-C — Projected Heap Deform
+
+05-B established that generic tuple deformation is the dominant heap→batch
+cost, and that the generic path deforms 9 attributes per tuple where the batch
+asks for 5. 05-C tests one narrowly defined alternative:
+
+> Walk a PostgreSQL heap tuple correctly — NULL bitmap, alignment, varlena
+> headers — but materialize only the attributes the batch requested.
+
+`XPB_HEAP_PROJECTED`. Experimental, never auto-selected; `XPB_HEAP_FIXED` and
+`XPB_HEAP_DEFORM` are unchanged.
+
+## Answer
+
+**Case B, partially.** `fixed < projected < deform` at full scan, where
+projected closes ~40% of the deform→fixed gap. At low selectivity projected is
+*worse* than deform — for an identifiable implementation reason, not an
+architectural one. The walk itself turns out to be cheap; what deform pays for
+is materializing attributes nobody asked for.
+
+## Implementation
+
+A structural mirror of `heap_deform_tuple()`, reusing its own inline helpers
+from `access/tupmacs.h` — `fetch_att_noerr()`, `align_fetch_then_add()`,
+`first_null_attr()` — and its three-phase shape: a cached-offset prefix
+(`firstNonCachedOffsetAttr`), a no-NULL run, and a tail that may contain
+NULLs. Nothing about alignment, short/external varlena headers or NULL bitmap
+interpretation is reinvented; it is delegated to those helpers, so the
+implementation is explainable line-by-line against PostgreSQL's.
+
+Two differences from `heap_deform_tuple`, and only two:
+
+* it stops at the **highest requested attnum** instead of `natts`;
+* it stores into the batch's typed columns instead of a `Datum`/`isnull` array
+  of width `natts`, so an unused attribute costs a step and nothing more.
+
+A tuple with fewer attributes than the projection needs `getmissingattr()`
+semantics; that is **refused with an error** rather than guessed, since a
+wrong answer there is silent corruption.
+
+## Counters — walked versus materialized
+
+Exactly the distinction §3 asks for, and it shows the two layouts behaving
+differently:
+
+| layout | attributes walked | attributes materialized |
+|---|---|---|
+| `reg2_fixed` (projection is attnums 1–5) | 5 000 040 = **5**/tuple | 5 000 040 = 5/tuple |
+| `reg2_bad` (varlena at attnum 2) | 9 000 072 = **9**/tuple | 5 000 040 = 5/tuple |
+
+On `reg2_bad` every attribute must still be walked — a later attribute's
+position depends on the varlena ahead of it — so only materialization can be
+skipped. That is the architecturally interesting case, and it is the one
+`heap_deform_tuple` cannot improve on.
+
+## Results
+
+Warm cache, 1 warm-up + 5 measured runs, median (min–max), `source_ms`. Same
+GUCs and protocol as 05-B. The whole matrix was run twice; the second run is
+published and the first agrees within noise (both in `raw/projected/`).
+
+| predicate | `reg2_fixed` fixed | `reg2_fixed` deform | `reg2_fixed` **projected** | `reg2_bad` deform | `reg2_bad` **projected** |
+|---|---|---|---|---|---|
+| empty (90..91) | 22.8 | 40.6 | **45.5** | 45.9 | **57.4** |
+| 1/12 | 26.7 | 43.5 | **48.1** | 47.9 | **58.6** |
+| 12/12 | 35.7 | 66.2 | **56.0** | 70.9 | **65.0** |
+
+pgColumnar context, unchanged code: 8.8 ms at 1/12, 29.5 ms at 12/12.
+
+### At full scan, where the comparison is clean
+
+Nothing is rejected at 12/12, so predicate placement is irrelevant and the
+arms differ only in decoding:
+
+```
+fixed      35.7          deform -> projected saves 10.2 ms
+projected  56.0          projected -> fixed still costs 20.3 ms
+deform     66.2          projected closes ~33% of the gap
+```
+
+Run 1 gave 40.3 / 58.3 / 70.6 — 40% of the gap. So **projected closes roughly
+a third to 40% of the distance from full deform to fixed offsets.**
+
+On `reg2_bad`, where all 9 attributes must be walked regardless, projected
+still beats deform (65.0 against 70.9). Skipping *materialization alone* —
+with no reduction in walking — is worth ~8%.
+
+Comparing the two projected arms isolates the walk: 56.0 walking 5 attributes
+against 65.0 walking 9, for the same 5 materialized. **Walking four extra
+attributes costs ~9 ms; materializing four extra costs ~10 ms.** They are the
+same order, and neither alone explains the 30 ms gap to fixed offsets — the
+rest is the per-attribute loop machinery that fixed offsets skip entirely.
+
+### At low selectivity, projected loses — and why
+
+This is an implementation asymmetry I introduced, not a property of projected
+decoding, and it makes the empty-range case **not a clean answer to §11**:
+
+* the **deform** arm evaluates the predicate straight out of its `Datum`
+  array, *before* storing anything into the batch;
+* the **projected** arm materializes all five columns into the batch and only
+  then reads the predicate column back out of it.
+
+So on a rejected row, projected pays five stores that deform does not. With
+every row rejected (the empty range) that is the entire difference: 45.5
+against 40.6.
+
+*Follow-up hypothesis, not implemented (§19).* Evaluate the predicate as soon
+as the predicate column has been walked, then `break` out of the attribute
+loop. Unlike `heap_deform_tuple`, which is all-or-nothing, the projected
+walker can abandon a tuple mid-way — it would skip both the remaining
+materialization *and* the remaining walk. That should turn the empty-range
+result around, and it is the obvious next measurement rather than something to
+slip into this one.
+
+## Correctness
+
+53 cases in `contract_tests.sh`, all passing. New for the projected path, each
+compared against both `heap_deform_tuple` and PostgreSQL itself: varlena
+before a requested attribute; varlena *between* requested attributes; NULL
+before a requested attribute; NULL *in* a requested attribute; every nullable
+attribute NULL in every row; external toasted varlena before a requested
+attribute; the toasted column itself when requested; mixed int4/int8;
+`INT64_MIN`/`INT64_MAX`; NULL across a batch boundary; numeric at exact
+decimal scale.
+
+The existing corruption regressions and layout guards are untouched.
+
+### The unused toasted value is not detoasted
+
+§12, proved through the TOAST relation's block counters rather than by
+instrumenting the hot path:
+
+```
+skipping the toasted column     0 toast blocks touched
+requesting it                 299 toast blocks touched
+```
+
+Locating the next attribute needs only the 18-byte pointer's length header.
+Touching the toast relation at all would mean the value had been followed.
+
+## Where this leaves the architecture
+
+| | 1/12 | 12/12 |
+|---|---|---|
+| heap, full deform | 47.9 | 70.9 |
+| heap, projected | 58.6 | 65.0 |
+| heap, fixed offsets | 26.7 | 35.7 |
+| pgColumnar | **8.8** | **29.5** |
+
+Projected deform is a real but partial improvement, and only at full scan in
+its current form. It does not bring the generic heap path near either fixed
+offsets or pgColumnar.
+
+The 05-B conclusion stands and is sharpened: the heap→batch penalty is mostly
+**materializing attributes nobody asked for**, and partly the per-attribute
+loop machinery itself. Removing the first recovers about a third of it;
+removing the second is what the fixed-offset path does, and it is only
+available on layouts that permit it.
+
+## Limitations
+
+* The empty-range and 1/12 comparisons are confounded by predicate placement
+  (above). Only the 12/12 column is a clean decode-versus-decode measurement.
+* `reg2_fixed` is 2.92% smaller than `reg2_bad` (carried over from 05-B), so
+  cross-layout comparisons carry that; same-table comparisons do not.
+* Warm cache only; no cold-cache experiment.
+* No optimization was applied during measurement. No SIMD, prefetch, vector
+  predicates, planner integration, expression compilation or JIT.
+* `XPB_HEAP_PROJECTED` is not auto-selected anywhere. `xpb_heap_source_create()`
+  is unchanged, and 05-A/05-B numbers are unaffected.
+* A tuple shorter than the projection is refused rather than handled with
+  missing-value semantics.
