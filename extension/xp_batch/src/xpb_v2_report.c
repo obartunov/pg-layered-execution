@@ -38,6 +38,7 @@
 #include "miscadmin.h"
 #include "portability/instr_time.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "access/table.h"
 #include "utils/tuplestore.h"
@@ -58,8 +59,31 @@ PG_FUNCTION_INFO_V1(xpb_v2_register_report);
 
 #define V2_DIM1_CAP  256        /* 50 companies   */
 #define V2_DIM2_CAP  1024       /* 200 accounts   */
-#define V2_GRP_CAP   16384
-#define V2_GRP_LOAD  (V2_GRP_CAP * 3 / 4)
+/*
+ * Group hash table.
+ *
+ * Until Hash Aggregate Growth v1 this was a fixed array of V2_GRP_CAP slots
+ * with a hard 3/4 load limit and an ERROR past it; benchmark 05-E measured
+ * that ceiling at 12 288 groups and showed it was a chosen constant rather
+ * than a resource limit.  The table now grows instead.
+ *
+ * The growth policy is PREREGISTERED -- fixed before any measurement, and not
+ * to be tuned from the first results:
+ *
+ *     grow when the table is half full
+ *     double the capacity
+ *
+ * Everything else is deliberately untouched, so that this milestone isolates
+ * growth alone: same hash function, same key equality, same linear probing,
+ * same key and aggregate-state layout, same grouping semantics.
+ */
+#define V2_GRP_CAP   16384      /* INITIAL capacity; the table grows from here */
+
+/*
+ * Written as a fraction of the live capacity rather than a second constant,
+ * so the threshold cannot drift out of step with the capacity it refers to.
+ */
+#define V2_GRP_GROW_AT(cap)  ((cap) / 2)
 
 /* batch column order; the predicate column must be first and int4 */
 #define V2_C_PERIOD  0
@@ -81,6 +105,242 @@ typedef struct V2Group
     int64   debit;
     int64   credit;
 } V2Group;
+
+/*
+ * Test-only policy overrides.  Zero means "use the production policy".  They
+ * exist so the correctness tests can force several growths, and hit the exact
+ * growth threshold, without building a million-group dataset -- and so that a
+ * refused growth can be exercised deliberately instead of by inducing a real
+ * OOM.  The benchmark never sets them.
+ */
+static int  v2_grp_test_init_cap = 0;
+static int  v2_grp_test_max_cap = 0;
+
+typedef struct V2GroupTable
+{
+    V2Group        *slots;
+    int             capacity;       /* always a power of two                 */
+    int             ngroups;
+    MemoryContext   cxt;            /* owns every generation of slots        */
+
+    /* observation; none of it is derived after the fact */
+    int             initial_capacity;
+    int64           inserts;        /* new groups created                    */
+    int64           hits;           /* existing group found                  */
+    int64           probes;         /* slots examined by the aggregate loop  */
+    int             max_probe;
+    int             growths;
+    int64           rehash_groups;  /* groups reinserted, summed over growths */
+    int64           rehash_probes;  /* kept apart from aggregate-loop probes  */
+    double          rehash_ms;
+    size_t          bytes_current;
+    size_t          bytes_peak;     /* includes both tables during a rehash  */
+} V2GroupTable;
+
+/*
+ * Unchanged from the fixed-capacity implementation, character for character.
+ * Factored into a function only because rehash has to recompute the same
+ * value from the stored keys; this milestone must not alter hash behaviour
+ * (section 5), and 05-E's probe statistics remain comparable because of it.
+ */
+static inline uint32
+v2_group_hash(int32 g1, int32 g2, int32 ck)
+{
+    return (uint32) g1 * 2654435761u ^ (uint32) g2 * 2246822519u
+         ^ (uint32) ck * 0x45d9f3bu;
+}
+
+static void
+v2_grp_init(V2GroupTable *t)
+{
+    int cap = v2_grp_test_init_cap > 0 ? v2_grp_test_init_cap : V2_GRP_CAP;
+
+    memset(t, 0, sizeof(*t));
+    /*
+     * A context of its own, so that "growth does not accumulate obsolete
+     * tables" can be checked from outside this file's own accounting
+     * (section 8) rather than only by trusting the counters below.
+     */
+    t->cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                   "xpb v2 group hash",
+                                   ALLOCSET_DEFAULT_SIZES);
+    t->capacity = cap;
+    t->initial_capacity = cap;
+    t->bytes_current = (size_t) cap * sizeof(V2Group);
+    t->bytes_peak = t->bytes_current;
+    t->slots = MemoryContextAllocZero(t->cxt, t->bytes_current);
+}
+
+/*
+ * Double the table and reinsert every live group.
+ *
+ * Called only when a new group is needed and the table is already at least
+ * half full, so the decision depends on ngroups and capacity alone and never
+ * on where probing happened to stop (section 12).
+ */
+static void
+v2_grp_grow(V2GroupTable *t)
+{
+    V2Group    *old = t->slots;
+    int         oldcap = t->capacity;
+    int         newcap;
+    size_t      newbytes;
+    instr_time  gs, ge;
+
+    INSTR_TIME_SET_CURRENT(gs);
+
+    /*
+     * Overflow safety (section 7): the slot count and the byte size are both
+     * checked BEFORE anything is allocated, and the table is left entirely
+     * untouched if either cannot be represented.  Capacity is never wrapped.
+     */
+    if (oldcap > INT_MAX / 2)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: group hash cannot grow past %d slots",
+                        oldcap),
+                 errdetail("Doubling would overflow the slot count.")));
+    newcap = oldcap * 2;
+
+    if ((size_t) newcap > SIZE_MAX / sizeof(V2Group))
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: group hash cannot grow past %d slots",
+                        oldcap),
+                 errdetail("Doubling would overflow the allocation size.")));
+    newbytes = (size_t) newcap * sizeof(V2Group);
+
+    if (v2_grp_test_max_cap > 0 && newcap > v2_grp_test_max_cap)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: group hash may not grow past %d slots (test policy)",
+                        v2_grp_test_max_cap),
+                 errdetail("%d groups held in %d slots.", t->ngroups, oldcap)));
+
+    /*
+     * v1 keeps the table inside one ordinary palloc.  Past MaxAllocSize that
+     * is a real boundary and is refused cleanly rather than worked around
+     * with a huge allocation: no spill, no partitioning in this milestone
+     * (section 25).
+     */
+    if (newbytes > MaxAllocSize)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: group hash would need " UINT64_FORMAT " bytes, over the %zu byte allocation limit",
+                        (uint64) newbytes, (size_t) MaxAllocSize),
+                 errdetail("%d groups held in %d slots.", t->ngroups, oldcap)));
+
+    /* Both tables are live between here and the pfree below (section 22). */
+    if (t->bytes_current + newbytes > t->bytes_peak)
+        t->bytes_peak = t->bytes_current + newbytes;
+
+    t->slots = MemoryContextAllocZero(t->cxt, newbytes);
+    t->capacity = newcap;
+
+    /*
+     * Reinsert, do not copy.  A slot index is a function of the capacity, so
+     * memcpying occupied slots to the same indexes would leave groups sitting
+     * where the probe sequence for their key can no longer reach them --
+     * every subsequent lookup would create a duplicate group and the sums
+     * would silently split (section 6).
+     */
+    for (int i = 0; i < oldcap; i++)
+    {
+        V2Group    *g = &old[i];
+        uint32      h;
+        bool        placed = false;
+
+        if (!g->occupied)
+            continue;
+
+        h = v2_group_hash(g->company_group, g->account_group, g->company_key);
+        for (int probe = 0; probe < newcap; probe++)
+        {
+            int         idx = (int) ((h + probe) & (newcap - 1));
+            V2Group    *dst = &t->slots[idx];
+
+            if (!dst->occupied)
+            {
+                *dst = *g;
+                t->rehash_probes += probe + 1;
+                placed = true;
+                break;
+            }
+        }
+        /*
+         * Unreachable: the new table is at most a quarter full here.  Checked
+         * anyway, because the alternative to noticing is losing a group's
+         * accumulated sums without any other symptom.
+         */
+        if (!placed)
+            elog(ERROR, "v2_register_report: rehash found no free slot in %d",
+                 newcap);
+        t->rehash_groups++;
+    }
+
+    pfree(old);
+    t->bytes_current = newbytes;
+    t->growths++;
+
+    INSTR_TIME_SET_CURRENT(ge);
+    t->rehash_ms += INSTR_TIME_GET_MILLISEC(ge) - INSTR_TIME_GET_MILLISEC(gs);
+}
+
+/*
+ * Accumulate one row into its group, growing the table first if a new group
+ * is needed and the table is already half full.
+ *
+ * Invariant, and the thing the threshold tests pin down: a group is only ever
+ * added to a table that is strictly less than half full, so ngroups can reach
+ * exactly capacity/2 but the load factor never exceeds 0.5.
+ */
+static inline void
+v2_grp_upsert(V2GroupTable *t, int32 g1, int32 g2, int32 ck,
+              int64 dt, int64 kt)
+{
+    uint32  h = v2_group_hash(g1, g2, ck);
+
+    for (;;)
+    {
+        int     cap = t->capacity;
+
+        for (int probe = 0; probe < cap; probe++)
+        {
+            int         idx = (int) ((h + probe) & (cap - 1));
+            V2Group    *g = &t->slots[idx];
+
+            if (!g->occupied)
+            {
+                if (t->ngroups >= V2_GRP_GROW_AT(cap))
+                    break;          /* grow, then probe again from the top */
+                g->occupied = true;
+                g->company_group = g1;
+                g->account_group = g2;
+                g->company_key = ck;
+                g->debit = dt;
+                g->credit = kt;
+                t->ngroups++;
+                t->inserts++;
+                t->probes += probe + 1;
+                if (probe + 1 > t->max_probe)
+                    t->max_probe = probe + 1;
+                return;
+            }
+            if (g->company_group == g1 && g->account_group == g2 &&
+                g->company_key == ck)
+            {
+                g->debit += dt;
+                g->credit += kt;
+                t->hits++;
+                t->probes += probe + 1;
+                if (probe + 1 > t->max_probe)
+                    t->max_probe = probe + 1;
+                return;
+            }
+        }
+        v2_grp_grow(t);
+    }
+}
 
 /*
  * Dimensions are read through the typed heap source on the deform path, so
@@ -271,11 +531,10 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     XpColumnBatch   batch;
     V2Dim1         *dim1;
     V2Dim2         *dim2;
-    V2Group        *ht;
+    V2GroupTable    grp;
     int32          *grp1_buf,
                    *grp2_buf;
     bool           *keep;
-    int             ngroups = 0;
     int64           rows_in = 0;
     int             nbatches = 0;
     bool            is_pgcn = (strcmp(mode, "pgcolumnar") == 0);
@@ -290,10 +549,6 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * absence is itself part of the 05-E result and is reported explicitly
      * rather than left to be inferred.
      */
-    int64           agg_probes = 0;     /* slots examined, insert + hit      */
-    int64           agg_inserts = 0;    /* new groups created                */
-    int64           agg_hits = 0;       /* existing group found              */
-    int             agg_max_probe = 0;  /* longest single chain walked       */
     instr_time      t0, t1, tp, tn;
     double          build_ms = 0, open_ms = 0, source_ms = 0,
                     j1_ms = 0, j2_ms = 0, agg_ms = 0;
@@ -360,7 +615,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     dim2 = palloc0(V2_DIM2_CAP * sizeof(V2Dim2));
     v2_dim1_build(dim1, dim1_relid);
     v2_dim2_build(dim2, dim2_relid);
-    ht = palloc0(V2_GRP_CAP * sizeof(V2Group));
+    v2_grp_init(&grp);
     INSTR_TIME_SET_CURRENT(tn);
     build_ms = INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
 
@@ -457,7 +712,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
                                 mode),
-                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout or card; or pgcolumnar, zlfs or card-zlfs.")));
+                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout, or card; or pgcolumnar, zlfs or card-zlfs.")));
         }
 
         heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed"
@@ -531,7 +786,6 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         {
             int32   g1, g2, ck;
             int64   dt, kt;
-            uint32  h;
 
             if (!keep[r])
                 continue;
@@ -541,42 +795,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             dt = col_dt[r];
             kt = col_kt[r];
 
-            h = (uint32) g1 * 2654435761u ^ (uint32) g2 * 2246822519u
-              ^ (uint32) ck * 0x45d9f3bu;
-            for (int probe = 0; probe < V2_GRP_CAP; probe++)
-            {
-                int       idx = (int) ((h + probe) & (V2_GRP_CAP - 1));
-                V2Group  *g = &ht[idx];
-
-                if (!g->occupied)
-                {
-                    if (ngroups >= V2_GRP_LOAD)
-                        ereport(ERROR,
-                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                                 errmsg("v2_register_report: group hash overflow (%d groups, cap %d)",
-                                        ngroups, V2_GRP_CAP)));
-                    g->occupied = true;
-                    g->company_group = g1; g->account_group = g2;
-                    g->company_key = ck;
-                    g->debit = dt; g->credit = kt;
-                    ngroups++;
-                    agg_inserts++;
-                    agg_probes += probe + 1;
-                    if (probe + 1 > agg_max_probe)
-                        agg_max_probe = probe + 1;
-                    break;
-                }
-                if (g->company_group == g1 && g->account_group == g2 &&
-                    g->company_key == ck)
-                {
-                    g->debit += dt; g->credit += kt;
-                    agg_hits++;
-                    agg_probes += probe + 1;
-                    if (probe + 1 > agg_max_probe)
-                        agg_max_probe = probe + 1;
-                    break;
-                }
-            }
+            v2_grp_upsert(&grp, g1, g2, ck, dt, kt);
         }
         INSTR_TIME_SET_CURRENT(tn);
         agg_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
@@ -642,20 +861,50 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
          * measurement rather than something a reader has to take on trust.
          */
         appendStringInfo(&extra,
-                         "  grp_cap=%d grp_load_limit=%d grp_occupied=%d"
-                         " grp_load_factor=%.4f grp_bytes=%zu grp_entry_bytes=%zu"
+                         "  grp_initial_cap=%d grp_cap=%d grp_grow_at=%d"
+                         " grp_occupied=%d grp_load_factor=%.4f"
+                         " grp_bytes=%zu grp_bytes_peak=%zu grp_entry_bytes=%zu"
                          " grp_inserts=" INT64_FORMAT " grp_hits=" INT64_FORMAT
+                         " grp_lookups=" INT64_FORMAT
                          " grp_probes=" INT64_FORMAT " grp_probes_per_lookup=%.4f"
-                         " grp_max_probe=%d grp_growths=0 grp_rehashes=0"
+                         " grp_max_probe=%d"
+                         " grp_growths=%d grp_rehashes=%d"
+                         " grp_rehash_groups=" INT64_FORMAT
+                         " grp_rehash_probes=" INT64_FORMAT
+                         " grp_rehash_ms=%.3f grp_agg_minus_rehash_ms=%.3f"
+                         " grp_cxt_bytes=%zu"
                          " dim1_bytes=%zu dim2_bytes=%zu",
-                         V2_GRP_CAP, V2_GRP_LOAD, ngroups,
-                         (double) ngroups / V2_GRP_CAP,
-                         (size_t) V2_GRP_CAP * sizeof(V2Group), sizeof(V2Group),
-                         agg_inserts, agg_hits, agg_probes,
-                         (agg_inserts + agg_hits) > 0
-                             ? (double) agg_probes / (double) (agg_inserts + agg_hits)
+                         grp.initial_capacity, grp.capacity,
+                         V2_GRP_GROW_AT(grp.capacity),
+                         grp.ngroups, (double) grp.ngroups / grp.capacity,
+                         grp.bytes_current, grp.bytes_peak, sizeof(V2Group),
+                         grp.inserts, grp.hits, grp.inserts + grp.hits,
+                         grp.probes,
+                         (grp.inserts + grp.hits) > 0
+                             ? (double) grp.probes / (double) (grp.inserts + grp.hits)
                              : 0.0,
-                         agg_max_probe,
+                         grp.max_probe,
+                         /*
+                          * One rehash per growth by construction, reported
+                          * separately anyway so the two stay distinguishable
+                          * if a later policy ever rehashes without growing.
+                          */
+                         grp.growths, grp.growths,
+                         grp.rehash_groups, grp.rehash_probes,
+                         grp.rehash_ms,
+                         /*
+                          * Not a fake subtraction: rehash runs inside the
+                          * aggregate phase and is timed with the same clock,
+                          * so the difference is exact by construction
+                          * (section 10).
+                          */
+                         agg_ms - grp.rehash_ms,
+                         /*
+                          * Measured by the memory system, not by this file's
+                          * own arithmetic: if a growth ever failed to release
+                          * its predecessor, this would exceed grp_bytes.
+                          */
+                         MemoryContextMemAllocated(grp.cxt, false),
                          (size_t) V2_DIM1_CAP * sizeof(V2Dim1),
                          (size_t) V2_DIM2_CAP * sizeof(V2Dim2));
 
@@ -664,28 +913,81 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
              "open=%.1f ms  source=%.1f ms  join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
              "operators=%.1f ms  rows=" INT64_FORMAT "  batches=%d  groups=%d%s",
              lo, hi, mode, total_ms, build_ms, open_ms, source_ms, j1_ms, j2_ms, agg_ms,
-             j1_ms + j2_ms + agg_ms, rows_in, nbatches, ngroups, extra.data);
+             j1_ms + j2_ms + agg_ms, rows_in, nbatches, grp.ngroups, extra.data);
 
-        for (int i = 0; i < V2_GRP_CAP; i++)
+        for (int i = 0; i < grp.capacity; i++)
         {
             Datum   vals[7];
             bool    nulls[7] = {false, false, false, false, false, false, false};
 
-            if (!ht[i].occupied)
+            if (!grp.slots[i].occupied)
                 continue;
-            vals[0] = Int32GetDatum(ht[i].company_group);
-            vals[1] = Int32GetDatum(ht[i].account_group);
-            vals[2] = Int32GetDatum(ht[i].company_key);
-            vals[3] = Int64GetDatum(ht[i].debit);
-            vals[4] = Int64GetDatum(ht[i].credit);
+            vals[0] = Int32GetDatum(grp.slots[i].company_group);
+            vals[1] = Int32GetDatum(grp.slots[i].account_group);
+            vals[2] = Int32GetDatum(grp.slots[i].company_key);
+            vals[3] = Int64GetDatum(grp.slots[i].debit);
+            vals[4] = Int64GetDatum(grp.slots[i].credit);
             /* net is derived at emit time from two exact int64 sums, not by a
              * second pass over the data */
-            vals[5] = Int64GetDatum(ht[i].debit - ht[i].credit);
+            vals[5] = Int64GetDatum(grp.slots[i].debit - grp.slots[i].credit);
             vals[6] = Float8GetDatum(total_ms);
             tuplestore_putvalues(store, rsi->setDesc, vals, nulls);
         }
     }
 
+    /*
+     * The group table is released explicitly once its rows have been copied
+     * into the tuplestore, rather than left for the surrounding context to
+     * reset.  Growth allocates a fresh table each time and pfrees the old one
+     * immediately, so this should be reclaiming exactly one live table; the
+     * grp_cxt_bytes counter reported above is the independent check on that
+     * (section 8).
+     */
+    MemoryContextDelete(grp.cxt);
+
     src->ops->end(src);
     return (Datum) 0;
+}
+
+/*
+ * xpb_grp_test_policy(initial_capacity int, max_capacity int) -> text
+ *
+ * Test-only.  Forces a small initial capacity so that several growths and the
+ * exact growth threshold can be exercised without a million-group dataset,
+ * and an artificial ceiling so that a refused growth can be tested without
+ * inducing a real OOM.  Passing 0 restores the production policy.
+ *
+ * The benchmark never calls this; run-hash-growth.sh asserts the production
+ * policy is in force before it measures anything.
+ */
+PG_FUNCTION_INFO_V1(xpb_grp_test_policy);
+
+Datum
+xpb_grp_test_policy(PG_FUNCTION_ARGS)
+{
+    int     init = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
+    int     maxc = PG_ARGISNULL(1) ? 0 : PG_GETARG_INT32(1);
+
+    /*
+     * The slot index is computed with a mask, so a capacity that is not a
+     * power of two would silently address only part of the table.
+     */
+    if (init < 0 || (init > 0 && (init < 2 || (init & (init - 1)) != 0)))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xpb_grp_test_policy: initial capacity must be 0 or a power of two >= 2, got %d",
+                        init)));
+    if (maxc < 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xpb_grp_test_policy: max capacity must be >= 0, got %d",
+                        maxc)));
+
+    v2_grp_test_init_cap = init;
+    v2_grp_test_max_cap = maxc;
+
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+        "initial_capacity=%d max_capacity=%d",
+        init > 0 ? init : V2_GRP_CAP,
+        maxc)));
 }
