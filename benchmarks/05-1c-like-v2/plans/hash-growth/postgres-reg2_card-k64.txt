@@ -1,0 +1,32 @@
+Finalize HashAggregate (actual time=332.759..336.058 rows=8192.00 loops=1)
+  Group Key: c.company_group, a.account_group, r.company_key
+  Batches: 1  Memory Usage: 4113kB
+  Buffers: shared hit=11515 dirtied=1 written=1
+  ->  Hash Join (actual time=267.867..306.724 rows=49152.00 loops=1)
+        Hash Cond: (r.account_key = a.account_key)
+        Buffers: shared hit=11515 dirtied=1 written=1
+        ->  Hash Join (actual time=267.591..299.445 rows=49152.00 loops=1)
+              Hash Cond: (r.company_key = c.company_key)
+              Buffers: shared hit=11510
+              ->  Partial HashAggregate (actual time=267.502..293.480 rows=49152.00 loops=1)
+                    Group Key: r.company_key, r.account_key
+                    Batches: 1  Memory Usage: 17425kB
+                    Buffers: shared hit=11509
+                    ->  Seq Scan on reg2_card r (actual time=0.010..84.466 rows=983040.00 loops=1)
+                          Filter: ((period >= 1) AND (period <= 12))
+                          Buffers: shared hit=11509
+              ->  Hash (actual time=0.034..0.036 rows=128.00 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 13kB
+                    Buffers: shared hit=1
+                    ->  Seq Scan on dim_company_c c (actual time=0.015..0.021 rows=128.00 loops=1)
+                          Buffers: shared hit=1
+        ->  Hash (actual time=0.256..0.275 rows=384.00 loops=1)
+              Buckets: 1024  Batches: 1  Memory Usage: 26kB
+              Buffers: shared hit=5 dirtied=1 written=1
+              ->  Seq Scan on dim_account_c a (actual time=0.188..0.217 rows=384.00 loops=1)
+                    Buffers: shared hit=5 dirtied=1 written=1
+Settings: work_mem = '64MB', max_parallel_workers_per_gather = '0'
+Planning:
+  Buffers: shared hit=206
+Planning Time: 1.026 ms
+Execution Time: 338.662 ms
