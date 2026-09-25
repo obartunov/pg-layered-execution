@@ -90,6 +90,15 @@ RETURNS TABLE(rownum bigint, col int, coltype text, is_null bool, val text)
 LANGUAGE C
 AS '$libdir/xp_batch', 'xpb_contract_probe';
 
+-- Test-only: force a small initial capacity and/or an artificial ceiling on
+-- the group aggregation hash table, so that growth, the exact growth
+-- threshold and a refused growth can all be exercised without a huge dataset
+-- and without inducing a real OOM. 0 restores the production policy.
+CREATE OR REPLACE FUNCTION xpb_grp_test_policy(initial_capacity int, max_capacity int)
+RETURNS text
+LANGUAGE C
+AS '$libdir/xp_batch', 'xpb_grp_test_policy';
+
 -- Typed pipeline: join + GROUP BY + SUM over the typed batch contract, with
 -- PostgreSQL NULL semantics (join: NULL matches nothing; GROUP BY: NULLs are
 -- one group; SUM: skips NULLs, all-NULL group sums to NULL). Separate from

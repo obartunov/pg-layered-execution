@@ -372,8 +372,6 @@ if [ -n "$zfile" ] && [ -w "$zfile" ]; then
     cp "$zfile" "$zfile.bak"
     # version is the second uint32 of the header
     printf '\2\0\0\0' | dd of="$zfile" bs=1 seek=4 conv=notrunc status=none
-    # Foreign zones in the same directory warn on every registry scan; the
-    # refusal being asserted is itself a WARNING, so only that noise is filtered.
     out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_typed_report('z_f', ARRAY[2], ARRAY[3], NULL, NULL, 'zlfs')" 2>&1 \
           | grep -v 'cannot validate schema')
     mv "$zfile.bak" "$zfile"
@@ -755,6 +753,271 @@ SQL
        FROM xpb_v2_register_report(1,12,'bad-deform') ORDER BY 1"
 else
     echo "  SKIP  xpb_v2_register_report not installed"
+fi
+
+echo
+echo "=== growing group hash (Hash Aggregate Growth v1) ==="
+
+if "${PSQL[@]}" -c "SELECT 1 FROM pg_proc WHERE proname='xpb_grp_test_policy'" \
+        2>/dev/null | grep -q 1; then
+
+    # One company and 256 accounts, so the group count is exactly the number of
+    # distinct account_group values and can be dialled to hit the growth
+    # threshold on the nose. Small initial capacity via the test hook, so that
+    # several growths cost 129 groups rather than a hundred thousand.
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE reg2_card (period int4 NOT NULL, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL,
+    quantity int8, debit numeric(18,2), credit numeric(18,2) NOT NULL, comment text);
+CREATE TABLE dim_company_c (company_key int4 NOT NULL, company_group int4 NOT NULL);
+CREATE TABLE dim_account_c (account_key int8 NOT NULL, account_group int4 NOT NULL);
+INSERT INTO dim_company_c VALUES (1, 7);
+-- 4 rows per (company, account) pair, and a NULL-keyed dimension row plus a
+-- fact row pointing at an absent account, so grouping/NULL semantics are
+-- exercised at every growth count rather than only on the happy path.
+-- 512 accounts, which is inside the dimension hash's own 768-key limit:
+-- overflowing THAT is a different failure and has its own test below.
+INSERT INTO reg2_card
+SELECT (g % 12) + 1, 1, (g % 512) + 1, g * 3, g * 2,
+       NULL, NULL, 1.00, CASE WHEN g % 3 = 0 THEN NULL ELSE 'c' END
+FROM generate_series(0, 2047) g;
+INSERT INTO reg2_card VALUES (1, 1, 999999, 5, 1, NULL, NULL, 1.00, NULL);
+SQL
+
+    # groups = k, because there is exactly one company.
+    card_k() {
+        "${PSQL[@]}" -c "TRUNCATE dim_account_c;
+             INSERT INTO dim_account_c SELECT g + 1, (g % $1) + 1
+             FROM generate_series(0, 511) g;" >/dev/null
+    }
+
+    # Every growth count must still agree with PostgreSQL, per group, not just
+    # on a grand total: a rehash that lost or duplicated a group would keep the
+    # row count right while splitting one group's sums across two slots.
+    grow_case() {   # grow_case <label> <k> <want_growths>
+        local label="$1" k="$2" want="$3" line g b p
+        card_k "$k"
+        line=$("${PSQL[@]}" -c "SET jit=off; SET max_parallel_workers_per_gather=0;
+                SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+               | sed -n 's/^NOTICE:  v2_register_report //p')
+        g=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+        b=$("${PSQL[@]}" -c "SET jit=off; SET max_parallel_workers_per_gather=0;
+             SELECT md5(string_agg(company_group||','||account_group||','||company_key
+                        ||','||debit_turnover||','||credit_turnover||','||net_turnover,
+                        '|' ORDER BY company_group, account_group, company_key))
+             FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
+        p=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d||','||c||','||n,
+                    '|' ORDER BY cg, ag, ck)) FROM (
+                 SELECT c.company_group cg, a.account_group ag, r.company_key ck,
+                        sum(r.debit_cents)::bigint d, sum(r.credit_cents)::bigint c,
+                        sum(r.debit_cents - r.credit_cents)::bigint n
+                 FROM reg2_card r
+                 JOIN dim_company_c c ON c.company_key = r.company_key
+                 JOIN dim_account_c a ON a.account_key = r.account_key
+                 WHERE r.period BETWEEN 1 AND 12
+                 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
+        if [ "$g" = "$want" ] && [ -n "$b" ] && [ "$b" = "$p" ]; then
+            echo "  PASS  $label: $g growth(s), per-group result matches PostgreSQL"
+            pass_count=$((pass_count + 1))
+        else
+            echo "  FAIL  $label: growths=$g (want $want) batch=${b:0:12} sql=${p:0:12}"
+            fail=1
+        fi
+    }
+
+    # The policy hook is a process-local static and every psql invocation is a
+    # new backend, so it has to be set in the SAME connection as the report it
+    # governs. POL does that; forgetting it silently measures the production
+    # policy instead, which is how the first version of these tests failed.
+    POL="SELECT xpb_grp_test_policy(64, 0);"
+    GUCS="SET jit=off; SET max_parallel_workers_per_gather=0;"
+
+    grow_case() {   # grow_case <label> <k> <want_growths>
+        local label="$1" k="$2" want="$3" line g b p
+        card_k "$k"
+        line=$("${PSQL[@]}" -c "$GUCS $POL
+                SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+               | sed -n 's/^NOTICE:  v2_register_report //p')
+        g=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+        b=$("${PSQL[@]}" -c "$GUCS $POL
+             SELECT md5(string_agg(company_group||','||account_group||','||company_key
+                        ||','||debit_turnover||','||credit_turnover||','||net_turnover,
+                        '|' ORDER BY company_group, account_group, company_key))
+             FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
+        p=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d||','||c||','||n,
+                    '|' ORDER BY cg, ag, ck)) FROM (
+                 SELECT c.company_group cg, a.account_group ag, r.company_key ck,
+                        sum(r.debit_cents)::bigint d, sum(r.credit_cents)::bigint c,
+                        sum(r.debit_cents - r.credit_cents)::bigint n
+                 FROM reg2_card r
+                 JOIN dim_company_c c ON c.company_key = r.company_key
+                 JOIN dim_account_c a ON a.account_key = r.account_key
+                 WHERE r.period BETWEEN 1 AND 12
+                 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
+        if [ "$g" = "$want" ] && [ -n "$b" ] && [ "$b" = "$p" ]; then
+            echo "  PASS  $label: $g growth(s), per-group result matches PostgreSQL"
+            pass_count=$((pass_count + 1))
+        else
+            echo "  FAIL  $label: growths=$g (want $want) batch=${b:0:12} sql=${p:0:12}"
+            fail=1
+        fi
+    }
+
+    # Initial capacity 64 => grows when a NEW group is needed and 32 are held.
+    # Section 12: the threshold, exactly. The decision reads ngroups and
+    # capacity only, so it cannot depend on where probing happened to stop.
+    grow_case "31 groups, below half of 64"    31 0
+    grow_case "32 groups, exactly half of 64"  32 0
+    grow_case "33 groups, one past half"       33 1
+
+    # Section 11: 0 / 1 / 2 / 3+ growths.
+    grow_case "65 groups"                      65 2
+    grow_case "129 groups"                     129 3
+    grow_case "256 groups, exactly half of 512" 256 3
+    grow_case "257 groups, one past half"       257 4
+    grow_case "512 groups"                      512 4
+
+    # Load factor must never exceed 0.5, and after four growths the context
+    # must still hold exactly one table (section 8). Both read from the same
+    # run, and grp_cxt_bytes is the memory system's own accounting rather than
+    # this file's arithmetic: had any predecessor survived, the context would
+    # hold roughly twice the live table instead of it plus block overhead.
+    # Initial capacity 512 so that every generation (16 KB, then 32 KB) is
+    # larger than AllocSet's chunk limit and therefore its own block, which a
+    # pfree returns outright. Below that limit a freed table goes on a
+    # freelist the context keeps, and the context's figure would look like a
+    # leak when nothing had leaked.
+    card_k 512
+    line=$("${PSQL[@]}" -c "$GUCS SELECT xpb_grp_test_policy(512, 0);
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    lf=$(sed -n 's/.*grp_load_factor=\([0-9.]*\).*/\1/p' <<<"$line")
+    cur=$(sed -n 's/.*[ =]grp_bytes=\([0-9]*\).*/\1/p' <<<"$line")
+    cxt=$(sed -n 's/.*[ =]grp_cxt_bytes=\([0-9]*\).*/\1/p' <<<"$line")
+    gro=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ -n "$lf" ] && awk "BEGIN{exit !($lf <= 0.5)}"; then
+        echo "  PASS  load factor stays at or below 0.5 ($lf after $gro growths)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  load factor $lf exceeds the 0.5 growth policy"
+        fail=1
+    fi
+    pk=$(sed -n 's/.*grp_bytes_peak=\([0-9]*\).*/\1/p' <<<"$line")
+    # Every generation summed: had the predecessor survived, the context would
+    # have to hold at least this much. Releasing it leaves roughly the live
+    # table plus one block of context overhead, comfortably under.
+    allgen=$(( cur + cur / 2 ))
+    if [ "$gro" -ge 1 ] && [ -n "$cxt" ] && [ "$cxt" -lt "$allgen" ]; then
+        echo "  PASS  $gro growth(s) leave one live table ($cxt held, table $cur, all generations $allgen)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  after $gro growths the context holds $cxt bytes; all generations total $allgen"
+        fail=1
+    fi
+    # Peak must be exactly old+new at the last growth: the two tables really
+    # are both live across a rehash, and that is reported rather than smoothed.
+    if [ "$pk" = "$allgen" ]; then
+        echo "  PASS  peak memory is old+new across the rehash ($pk for a $cur table)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  peak memory $pk is not old+new ($allgen) for a $cur byte table"
+        fail=1
+    fi
+
+    # Section 11/28: two reports in ONE backend. The second must start from the
+    # initial capacity again and carry nothing over from the first -- run in a
+    # single connection, or "starts fresh" would be true for the wrong reason.
+    card_k 129
+    line=$("${PSQL[@]}" -c "$GUCS $POL
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card');
+            TRUNCATE dim_account_c;
+            INSERT INTO dim_account_c SELECT g + 1, (g % 31) + 1 FROM generate_series(0,511) g;
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card');" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p' | tail -1)
+    ic=$(sed -n 's/.*grp_initial_cap=\([0-9]*\).*/\1/p' <<<"$line")
+    oc=$(sed -n 's/.*[ =]grp_occupied=\([0-9]*\).*/\1/p' <<<"$line")
+    gr=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$ic" = "64" ] && [ "$oc" = "31" ] && [ "$gr" = "0" ]; then
+        echo "  PASS  a later, smaller report in the same backend starts fresh at 64 with 31 groups"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  rescan state leaked: initial_cap=$ic groups=$oc growths=$gr (want 64/31/0)"
+        fail=1
+    fi
+
+    # Section 13: a growth that cannot be satisfied must still fail cleanly.
+    # Forced with a test-only ceiling rather than by inducing a real OOM.
+    card_k 129
+    out=$("${PSQL[@]}" -c "$GUCS SELECT xpb_grp_test_policy(64, 64);
+           SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1)
+    if grep -q "may not grow past 64 slots" <<<"$out"; then
+        echo "  PASS  a refused growth errors, naming the limit and the groups held"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  refused growth not reported: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        fail=1
+    fi
+    if [ "$("${PSQL[@]}" -c 'SELECT 42')" = "42" ]; then
+        echo "  PASS  backend survives a refused growth"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  backend did not survive a refused growth"
+        fail=1
+    fi
+    # A refused growth must not leave a half-grown table behind either: the
+    # same backend, asked for a size that fits, must still answer correctly.
+    card_k 31
+    b=$("${PSQL[@]}" -c "$GUCS SELECT xpb_grp_test_policy(64, 64);
+         SELECT count(*) FROM xpb_v2_register_report(1,12,'card');
+         SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 | grep -c "groups=31")
+    if [ "$b" = "2" ]; then
+        echo "  PASS  the backend still reports correctly after a refused growth"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  after a refused growth a fitting report did not succeed twice ($b)"
+        fail=1
+    fi
+
+    # A dimension larger than its hash must be REFUSED, not silently truncated.
+    # Before this milestone the probe loop ran off the end of a full dimension
+    # table and dropped the row, after which every fact row referencing that
+    # key vanished from the aggregate and the report returned smaller sums
+    # with no error. Found by this section's own dataset overflowing dim2.
+    "${PSQL[@]}" -c "INSERT INTO dim_account_c SELECT g + 1000, 1
+                     FROM generate_series(1, 900) g" >/dev/null
+    out=$("${PSQL[@]}" -c "$GUCS SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1)
+    if grep -q "dim2 hash overflow" <<<"$out"; then
+        echo "  PASS  an oversized dimension is refused, not silently truncated"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  oversized dimension not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        fail=1
+    fi
+    card_k 31
+
+    # A non-power-of-two capacity would silently address part of the table.
+    out=$("${PSQL[@]}" -c "SELECT xpb_grp_test_policy(100, 0)" 2>&1)
+    if grep -q "power of two" <<<"$out"; then
+        echo "  PASS  a capacity that is not a power of two is refused"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  non-power-of-two capacity accepted: $(tr '\n' ' ' <<<"$out" | cut -c1-80)"
+        fail=1
+    fi
+
+    # The production policy is what a connection that never calls the hook gets.
+    line=$("${PSQL[@]}" -c "$GUCS SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    ic=$(sed -n 's/.*grp_initial_cap=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$ic" = "16384" ]; then
+        echo "  PASS  a connection that never sets the hook gets the production policy (16384)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  production policy not in force by default: initial_cap=$ic"
+        fail=1
+    fi
+else
+    echo "  SKIP  xpb_grp_test_policy not installed"
 fi
 
 echo
