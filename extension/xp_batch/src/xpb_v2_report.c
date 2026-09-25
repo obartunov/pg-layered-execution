@@ -540,6 +540,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     bool            is_pgcn = (strcmp(mode, "pgcolumnar") == 0);
     bool            is_heap = false;
     bool            is_card;
+    bool            is_card2;
     const char     *heap_path_used = "n/a";
     /*
      * Benchmark 05-E: observation of the aggregation hash table.  Counted in
@@ -565,6 +566,12 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * measured.
      */
     is_card = (strncmp(mode, "card", 4) == 0);
+    /*
+     * card2 is the wide variant: 192 companies x 768 accounts, the most this
+     * report's dimension hashes can hold, used for the high end of the
+     * cardinality ladder that reg2_card cannot express.
+     */
+    is_card2 = (strncmp(mode, "card2", 5) == 0);
 
     if (is_pgcn)
         fact_relid = RelnameGetRelid("reg2_col");
@@ -572,6 +579,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         fact_relid = RelnameGetRelid("reg2_bad");
     else if (strncmp(mode, "fixedlayout", 11) == 0)
         fact_relid = RelnameGetRelid("reg2_fixed");
+    else if (is_card2)
+        fact_relid = RelnameGetRelid("reg2_card2");
     else if (is_card)
         fact_relid = RelnameGetRelid("reg2_card");
     else
@@ -585,8 +594,10 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * that the fact table -- and therefore source cost, join shape and both
      * dimension hash occupancies -- stays identical across the whole ladder.
      */
-    dim1_relid = RelnameGetRelid(is_card ? "dim_company_c" : "dim_company");
-    dim2_relid = RelnameGetRelid(is_card ? "dim_account_c" : "dim_account2");
+    dim1_relid = RelnameGetRelid(is_card2 ? "dim_company_c2"
+                                 : is_card ? "dim_company_c" : "dim_company");
+    dim2_relid = RelnameGetRelid(is_card2 ? "dim_account_c2"
+                                 : is_card ? "dim_account_c" : "dim_account2");
     if (!OidIsValid(fact_relid) || !OidIsValid(dim1_relid) || !OidIsValid(dim2_relid))
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_TABLE),
@@ -630,7 +641,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      */
     INSTR_TIME_SET_CURRENT(tp);
 
-    if (strcmp(mode, "zlfs") == 0 || strcmp(mode, "card-zlfs") == 0)
+    if (strcmp(mode, "zlfs") == 0 || strcmp(mode, "card-zlfs") == 0 ||
+        strcmp(mode, "card2-zlfs") == 0)
     {
         ZlfsZone *zone = NULL;
 
@@ -655,9 +667,10 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             ereport(ERROR,
                     (errcode(ERRCODE_UNDEFINED_OBJECT),
                      errmsg("xpb_v2_register_report: no VALID ZLFS zone for %s covering [%d..%d]",
-                            is_card ? "reg2_card" : "reg2", lo, hi),
+                            is_card2 ? "reg2_card2" : is_card ? "reg2_card" : "reg2",
+                            lo, hi),
                      errhint("Build one with zlfs_build_zone('%s','%s',%d,%d).",
-                             is_card ? "reg2_card" : "reg2",
+                             is_card2 ? "reg2_card2" : is_card ? "reg2_card" : "reg2",
                              is_card ? "1,2,3,4,5" : "1,3,4,8,9", lo, hi)));
         src = xpb_zlfs_source_create(zone, attnos, V2_NCOLS);
     }
@@ -712,7 +725,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
                                 mode),
-                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout, or card; or pgcolumnar, zlfs or card-zlfs.")));
+                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout, card or card2; or pgcolumnar, zlfs, card-zlfs or card2-zlfs.")));
         }
 
         heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed"
