@@ -362,12 +362,20 @@ compare_sql "heap deform agrees with the zone" "$(printf "$Z_BATCH" deform)" "$Z
 # the version field to the untyped value is the whole test: if the reader
 # accepted it, the int32 payload would be read as typed columns.
 zpath=$("${PSQL[@]}" -c "SELECT setting || '/zlfs' FROM pg_settings WHERE name='data_directory'")
-zfile=$(ls "$zpath"/zone_*.zlfs 2>/dev/null | head -1)
+# THIS test's own zone, by its relation oid. The ZLFS registry is global to the
+# data directory, so picking the first zone_*.zlfs alphabetically could pick up
+# -- and patch the header of -- a zone belonging to another database entirely,
+# which made this case pass or fail depending on what else had run first.
+zoid=$("${PSQL[@]}" -c "SELECT oid FROM pg_class WHERE relname='z_f'")
+zfile=$(ls "$zpath"/zone_${zoid}_*.zlfs 2>/dev/null | head -1)
 if [ -n "$zfile" ] && [ -w "$zfile" ]; then
     cp "$zfile" "$zfile.bak"
     # version is the second uint32 of the header
     printf '\2\0\0\0' | dd of="$zfile" bs=1 seek=4 conv=notrunc status=none
-    out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_typed_report('z_f', ARRAY[2], ARRAY[3], NULL, NULL, 'zlfs')" 2>&1)
+    # Foreign zones in the same directory warn on every registry scan; the
+    # refusal being asserted is itself a WARNING, so only that noise is filtered.
+    out=$("${PSQL[@]}" -c "SELECT count(*) FROM xpb_typed_report('z_f', ARRAY[2], ARRAY[3], NULL, NULL, 'zlfs')" 2>&1 \
+          | grep -v 'cannot validate schema')
     mv "$zfile.bak" "$zfile"
 
     if grep -qi "format version 2" <<<"$out"; then
