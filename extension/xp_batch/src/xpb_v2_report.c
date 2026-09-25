@@ -96,6 +96,8 @@ v2_dim1_build(V2Dim1 *d, Oid relid)
                                                     XPB_HEAP_DEFORM, false, 0, 0);
     XpColumnBatch   batch;
 
+    int             nrows_in = 0;
+
     memset(d, 0, V2_DIM1_CAP * sizeof(V2Dim1));
     memset(&batch, 0, sizeof(batch));
     batch.capacity = 1024;
@@ -119,9 +121,26 @@ v2_dim1_build(V2Dim1 *d, Oid relid)
 
                 if (!d[idx].occupied)
                 {
+                    /*
+                     * Refuse rather than drop.  Without this the probe loop
+                     * simply ran off the end of a full table and the
+                     * dimension row was discarded in silence -- and every
+                     * fact row referencing that key then failed the join
+                     * lookup and vanished from the aggregate, so the report
+                     * returned smaller sums with no error at all.  The typed
+                     * pipeline's tp_dim_build has always checked this; these
+                     * two did not.
+                     */
+                    if (nrows_in >= V2_DIM1_CAP * 3 / 4)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                 errmsg("v2_register_report: dim1 hash overflow (%d keys, cap %d)",
+                                        nrows_in, V2_DIM1_CAP),
+                                 errdetail("The dimension is larger than this benchmark harness can hold.")));
                     d[idx].occupied = true;
                     d[idx].key = k[r];
                     d[idx].payload = p[r];
+                    nrows_in++;
                     break;
                 }
                 if (d[idx].key == k[r])
@@ -140,6 +159,8 @@ v2_dim2_build(V2Dim2 *d, Oid relid)
     XpBatchSource  *src = xpb_heap_source_create_ex(relid, attnos, 2,
                                                     XPB_HEAP_DEFORM, false, 0, 0);
     XpColumnBatch   batch;
+
+    int             nrows_in = 0;
 
     memset(d, 0, V2_DIM2_CAP * sizeof(V2Dim2));
     memset(&batch, 0, sizeof(batch));
@@ -164,9 +185,26 @@ v2_dim2_build(V2Dim2 *d, Oid relid)
 
                 if (!d[idx].occupied)
                 {
+                    /*
+                     * Refuse rather than drop.  Without this the probe loop
+                     * simply ran off the end of a full table and the
+                     * dimension row was discarded in silence -- and every
+                     * fact row referencing that key then failed the join
+                     * lookup and vanished from the aggregate, so the report
+                     * returned smaller sums with no error at all.  The typed
+                     * pipeline's tp_dim_build has always checked this; these
+                     * two did not.
+                     */
+                    if (nrows_in >= V2_DIM2_CAP * 3 / 4)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                 errmsg("v2_register_report: dim2 hash overflow (%d keys, cap %d)",
+                                        nrows_in, V2_DIM2_CAP),
+                                 errdetail("The dimension is larger than this benchmark harness can hold.")));
                     d[idx].occupied = true;
                     d[idx].key = k[r];
                     d[idx].payload = p[r];
+                    nrows_in++;
                     break;
                 }
                 if (d[idx].key == k[r])
