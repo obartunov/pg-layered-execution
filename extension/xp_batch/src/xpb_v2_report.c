@@ -136,7 +136,17 @@ typedef struct V2GroupTable
     int64           inserts;        /* new groups created                    */
     int64           hits;           /* existing group found                  */
     int64           probes;         /* slots examined by the aggregate loop  */
-    int             max_probe;
+    /*
+      * Two probe high-water marks, because one number cannot answer both
+      * questions.  max_probe_lifetime is the worst chain ever walked, which
+      * happens just before a growth when the table is at its densest;
+      * max_probe_current is reset on every growth and therefore describes the
+      * table that actually answered the query.  They were previously one
+      * counter, which reported the pre-growth figure and made it look like a
+      * property of the grown table.
+      */
+    int             max_probe_current;
+    int             max_probe_lifetime;
     int             growths;
     int64           rehash_groups;  /* groups reinserted, summed over growths */
     int64           rehash_probes;  /* kept apart from aggregate-loop probes  */
@@ -156,6 +166,15 @@ v2_group_hash(int32 g1, int32 g2, int32 ck)
 {
     return (uint32) g1 * 2654435761u ^ (uint32) g2 * 2246822519u
          ^ (uint32) ck * 0x45d9f3bu;
+}
+
+static inline void
+v2_grp_note_probe(V2GroupTable *t, int len)
+{
+    if (len > t->max_probe_current)
+        t->max_probe_current = len;
+    if (len > t->max_probe_lifetime)
+        t->max_probe_lifetime = len;
 }
 
 static void
@@ -289,6 +308,11 @@ v2_grp_grow(V2GroupTable *t)
     pfree(old);
     t->bytes_current = newbytes;
     t->growths++;
+    /*
+     * The chain lengths just measured belong to the table that has been
+     * replaced.  Only the lifetime mark carries across.
+     */
+    t->max_probe_current = 0;
 
     INSTR_TIME_SET_CURRENT(ge);
     t->rehash_ms += INSTR_TIME_GET_MILLISEC(ge) - INSTR_TIME_GET_MILLISEC(gs);
@@ -330,8 +354,7 @@ v2_grp_upsert(V2GroupTable *t, int32 g1, int32 g2, int32 ck,
                 t->ngroups++;
                 t->inserts++;
                 t->probes += probe + 1;
-                if (probe + 1 > t->max_probe)
-                    t->max_probe = probe + 1;
+                v2_grp_note_probe(t, probe + 1);
                 return;
             }
             if (g->company_group == g1 && g->account_group == g2 &&
@@ -353,8 +376,7 @@ v2_grp_upsert(V2GroupTable *t, int32 g1, int32 g2, int32 ck,
                                        g1, g2, ck)));
                 t->hits++;
                 t->probes += probe + 1;
-                if (probe + 1 > t->max_probe)
-                    t->max_probe = probe + 1;
+                v2_grp_note_probe(t, probe + 1);
                 return;
             }
         }
@@ -900,7 +922,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                          " grp_inserts=" INT64_FORMAT " grp_hits=" INT64_FORMAT
                          " grp_lookups=" INT64_FORMAT
                          " grp_probes=" INT64_FORMAT " grp_probes_per_lookup=%.4f"
-                         " grp_max_probe=%d"
+                         " grp_max_probe_current=%d grp_max_probe_lifetime=%d"
                          " grp_growths=%d grp_rehashes=%d"
                          " grp_rehash_groups=" INT64_FORMAT
                          " grp_rehash_probes=" INT64_FORMAT
@@ -916,7 +938,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                          (grp.inserts + grp.hits) > 0
                              ? (double) grp.probes / (double) (grp.inserts + grp.hits)
                              : 0.0,
-                         grp.max_probe,
+                         grp.max_probe_current, grp.max_probe_lifetime,
                          /*
                           * One rehash per growth by construction, reported
                           * separately anyway so the two stay distinguishable

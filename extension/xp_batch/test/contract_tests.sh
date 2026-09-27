@@ -978,6 +978,65 @@ SQL
         fail=1
     fi
 
+    # ---- probe high-water marks ----------------------------------------
+    # Nothing asserted these before, and one counter was doing both jobs: it
+    # reported the densest pre-growth chain while being read as a property of
+    # the table that answered the query.
+    #
+    # This needs its own dataset. The threshold dataset above varies ONE key
+    # component, and the group hash multiplies each key by an odd constant, so
+    # consecutive keys land on a stride that never collides -- every chain is
+    # length 1 at any load and a reset is invisible. Collisions need two key
+    # components to vary, so here company_key does too.
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE probe_reg (period int4 NOT NULL, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL,
+    quantity int8, debit numeric(18,2), credit numeric(18,2) NOT NULL, comment text);
+INSERT INTO probe_reg
+SELECT (g % 12) + 1, (g % 16) + 1, ((g / 16) % 128) + 1, g * 3, g * 2,
+       NULL, NULL, 1.00, NULL
+FROM generate_series(0, 4095) g;
+INSERT INTO dim_company_c SELECT g + 2, g + 2 FROM generate_series(0, 14) g;
+ALTER TABLE reg2_card RENAME TO reg2_card_keep;
+ALTER TABLE probe_reg RENAME TO reg2_card;
+SQL
+    # 16 companies x 128 account groups = 2048 groups from a 64-slot table:
+    # five growths, and dense enough before each one to build real chains.
+    card_k 128
+    line=$("${PSQL[@]}" -c "$GUCS SELECT xpb_grp_test_policy(64, 0);
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    pc=$(sed -n 's/.*grp_max_probe_current=\([0-9]*\).*/\1/p' <<<"$line")
+    pl=$(sed -n 's/.*grp_max_probe_lifetime=\([0-9]*\).*/\1/p' <<<"$line")
+    gw=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$gw" -ge 1 ] && [ -n "$pc" ] && [ -n "$pl" ] && [ "$pc" -lt "$pl" ]; then
+        echo "  PASS  after $gw growths the current probe mark ($pc) is below the lifetime mark ($pl)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  probe marks after $gw growths: current=$pc lifetime=$pl (current must be lower)"
+        fail=1
+    fi
+    # With no growth nothing has been reset, so the two must agree.
+    line=$("${PSQL[@]}" -c "$GUCS SELECT xpb_grp_test_policy(16384, 0);
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    pc=$(sed -n 's/.*grp_max_probe_current=\([0-9]*\).*/\1/p' <<<"$line")
+    pl=$(sed -n 's/.*grp_max_probe_lifetime=\([0-9]*\).*/\1/p' <<<"$line")
+    gw=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$gw" = "0" ] && [ "$pc" = "$pl" ] && [ "$pc" -ge 1 ]; then
+        echo "  PASS  with no growth the two probe marks agree ($pc)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  no-growth probe marks: growths=$gw current=$pc lifetime=$pl"
+        fail=1
+    fi
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+ALTER TABLE reg2_card RENAME TO probe_reg;
+ALTER TABLE reg2_card_keep RENAME TO reg2_card;
+DELETE FROM dim_company_c WHERE company_key > 1;
+SQL
+    card_k 31
+
     # ---- int8 turnover overflow ----------------------------------------
     # The accumulator used to wrap: on inputs PostgreSQL refuses outright it
     # returned a negative turnover with no error at all. Three things are
