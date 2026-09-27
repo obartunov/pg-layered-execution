@@ -206,8 +206,13 @@ if not drows:
 else:
     print(f'passes={len({p for p, _ in drows})}')
     dd = collections.defaultdict(list)
-    for _, f in drows:
-        dd[(int(f[0]), int(f[1]), int(f[2]))].append(f)
+    # Same rows indexed by pass as well, for the flatness baseline below: it
+    # needs the spread of per-pass medians, not of raw runs.
+    per_pass = collections.defaultdict(lambda: collections.defaultdict(list))
+    for p, f in drows:
+        k = (int(f[0]), int(f[1]), int(f[2]))
+        dd[k].append(f)
+        per_pass[k][p].append(f)
     print(f'  {"comp":>5s}{"acct":>6s}{"groups":>8s}{"d1cap":>7s}{"d1e":>6s}{"d1ld":>8s}'
           f'{"d1g":>4s}{"d2cap":>7s}{"d2e":>6s}{"d2ld":>8s}{"d2g":>4s}'
           f'{"join1":>7s}{"join2":>7s}{"n":>4s}')
@@ -303,12 +308,22 @@ else:
     # cardinalities is no larger than the variation WITHIN a single
     # cardinality, the ladder has not resolved an effect. No external
     # threshold, so nothing here can be tuned to the answer.
+    # Both sides must be the SAME statistic or the comparison is not like for
+    # like: an earlier version put the across-ladder spread of 25-run medians
+    # against the raw min-max inside one cell, which is an extreme value
+    # dominated by a single spike and left 15x headroom -- a 60% regression
+    # would have passed. Both sides are now spreads of per-pass medians.
     for name, col, xs in (('join1', 10, j1s), ('join2', 11, j2s)):
         across = (max(xs) - min(xs)) / med(xs)
-        within = max((max(c) - min(c)) / med(c)
-                     for c in ([float(r[col]) for r in dd[k]] for k in dd))
+        within = 0.0
+        for k in dd:
+            pm = [med([float(r[col]) for r in rs])
+                  for rs in per_pass[k].values() if rs]
+            if len(pm) > 1:
+                within = max(within, (max(pm) - min(pm)) / med(pm))
         print(f'  {name}: across-ladder spread of medians {across * 100:.1f}%, '
-              f'widest within-cardinality spread {within * 100:.0f}%')
+              f'widest within-cardinality spread of per-pass medians '
+              f'{within * 100:.1f}%')
         if across >= within:
             problems.append(f'dim ladder: {name} varies more across the ladder '
                             f'({across * 100:.1f}%) than within a single cardinality '
