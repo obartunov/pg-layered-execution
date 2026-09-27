@@ -1058,21 +1058,39 @@ SQL
         fail=1
     fi
 
-    # A dimension larger than its hash must be REFUSED, not silently truncated.
-    # Before this milestone the probe loop ran off the end of a full dimension
-    # table and dropped the row, after which every fact row referencing that
-    # key vanished from the aggregate and the report returned smaller sums
-    # with no error. Found by this section's own dataset overflowing dim2.
+    # A dimension larger than its hash must never silently lose rows. The
+    # mechanism has changed twice and the invariant has not: originally the
+    # probe loop ran off the end of a full table and dropped the row, so every
+    # fact row referencing that key vanished from the aggregate and the sums
+    # came back smaller with no error; then it was made to refuse; and since
+    # Dimension Hash Growth v1 it grows instead. So this asserts the property,
+    # not the mechanism -- no error, a growth, and a join result that still
+    # matches PostgreSQL row for row.
     "${PSQL[@]}" -c "INSERT INTO dim_account_c SELECT g + 1000, 1
                      FROM generate_series(1, 900) g" >/dev/null
     out=$("${PSQL[@]}" -c "$GUCS SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1)
-    if grep -q "dim2 hash overflow" <<<"$out"; then
-        echo "  PASS  an oversized dimension is refused, not silently truncated"
+    g2=$(sed -n 's/.*dim2_growths=\([0-9]*\).*/\1/p' <<<"$out")
+    ob=$("${PSQL[@]}" -c "$GUCS
+          SELECT md5(string_agg(company_group||','||account_group||','||company_key
+                     ||','||debit_turnover, '|'
+                     ORDER BY company_group, account_group, company_key))
+          FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
+    op=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d, '|'
+                 ORDER BY cg, ag, ck)) FROM (
+              SELECT c.company_group cg, a.account_group ag, r.company_key ck,
+                     sum(r.debit_cents)::bigint d
+              FROM reg2_card r
+              JOIN dim_company_c c ON c.company_key = r.company_key
+              JOIN dim_account_c a ON a.account_key = r.account_key
+              WHERE r.period BETWEEN 1 AND 12 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
+    if ! grep -q '^ERROR' <<<"$out" && [ "${g2:-0}" -ge 1 ] && [ -n "$ob" ] && [ "$ob" = "$op" ]; then
+        echo "  PASS  an oversized dimension grows ($g2 growth) and loses no rows"
         pass_count=$((pass_count + 1))
     else
-        echo "  FAIL  oversized dimension not refused: $(tr '\n' ' ' <<<"$out" | cut -c1-90)"
+        echo "  FAIL  oversized dimension: growths=$g2 batch=${ob:0:12} sql=${op:0:12} $(grep -c '^ERROR' <<<"$out") errors"
         fail=1
     fi
+    "${PSQL[@]}" -c "DELETE FROM dim_account_c WHERE account_key > 1000" >/dev/null
     card_k 31
 
     # A non-power-of-two capacity would silently address part of the table.
@@ -1098,6 +1116,208 @@ SQL
     fi
 else
     echo "  SKIP  xpb_grp_test_policy not installed"
+fi
+
+echo
+echo "=== growing dimension hashes (Dimension Hash Growth v1) ==="
+
+if "${PSQL[@]}" -c "SELECT 1 FROM pg_proc WHERE proname='xpb_v2_register_report'" \
+        2>/dev/null | grep -q 1; then
+
+    GUCS="SET jit=off; SET max_parallel_workers_per_gather=0;"
+
+    # Dimension cardinality is what varies here, so the fact table is built once
+    # to reference a wide key space and the dimensions are repopulated per case.
+    # reg2_card is renamed aside while this runs, exactly as the overflow case
+    # does, so the group-hash cases above keep their own dataset.
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE dimgrow_fact (period int4 NOT NULL, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL,
+    quantity int8, debit numeric(18,2), credit numeric(18,2) NOT NULL, comment text);
+ALTER TABLE reg2_card RENAME TO reg2_card_dimkeep;
+ALTER TABLE dimgrow_fact RENAME TO reg2_card;
+SQL
+
+    # dim_fill <n_companies> <n_accounts> <company_stride> <account_stride>
+    # A stride of 1 gives sequential keys, which the hash maps collision-free.
+    # A stride equal to a capacity gives guaranteed collisions: the index comes
+    # from the low bits of key * odd, so keys differing by a multiple of the
+    # capacity land on the same slot.
+    dim_fill() {
+        "${PSQL[@]}" >/dev/null <<SQL
+TRUNCATE dim_company_c; TRUNCATE dim_account_c; TRUNCATE reg2_card;
+INSERT INTO dim_company_c SELECT 1 + g * $3, (g % 8) + 1 FROM generate_series(0, $1 - 1) g;
+INSERT INTO dim_account_c SELECT 1 + g * $4, (g % 4) + 1 FROM generate_series(0, $2 - 1) g;
+INSERT INTO reg2_card
+SELECT (g % 12) + 1,
+       1 + (g % $1) * $3,
+       1 + ((g / $1) % $2) * $4,
+       g * 3, g * 2, NULL, NULL, 1.00, NULL
+FROM generate_series(0, $(( $1 * $2 * 2 - 1 ))) g;
+SQL
+    }
+
+    # dim_case <label> <ncomp> <nacc> <cstride> <astride> <want_d1_growths> <want_d2_growths>
+    # Join results are compared per row against PostgreSQL: a rehash that lost
+    # an entry would silently drop every fact row referencing that key, which is
+    # a wrong join result and not an error.
+    dim_case() {
+        local label="$1" line g1 g2 b p
+        dim_fill "$2" "$3" "$4" "$5"
+        line=$("${PSQL[@]}" -c "$GUCS
+                SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+               | sed -n 's/^NOTICE:  v2_register_report //p')
+        g1=$(sed -n 's/.*dim1_growths=\([0-9]*\).*/\1/p' <<<"$line")
+        g2=$(sed -n 's/.*dim2_growths=\([0-9]*\).*/\1/p' <<<"$line")
+        b=$("${PSQL[@]}" -c "$GUCS
+             SELECT md5(string_agg(company_group||','||account_group||','||company_key
+                        ||','||debit_turnover||','||credit_turnover||','||net_turnover,
+                        '|' ORDER BY company_group, account_group, company_key))
+             FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
+        p=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d||','||c||','||n,
+                    '|' ORDER BY cg, ag, ck)) FROM (
+                 SELECT c.company_group cg, a.account_group ag, r.company_key ck,
+                        sum(r.debit_cents)::bigint d, sum(r.credit_cents)::bigint c,
+                        sum(r.debit_cents - r.credit_cents)::bigint n
+                 FROM reg2_card r
+                 JOIN dim_company_c c ON c.company_key = r.company_key
+                 JOIN dim_account_c a ON a.account_key = r.account_key
+                 WHERE r.period BETWEEN 1 AND 12
+                 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
+        if [ "$g1" = "$6" ] && [ "$g2" = "$7" ] && [ -n "$b" ] && [ "$b" = "$p" ]; then
+            echo "  PASS  $label: dim1 $g1 growth(s), dim2 $g2, join matches PostgreSQL"
+            pass_count=$((pass_count + 1))
+        else
+            echo "  FAIL  $label: dim1=$g1 (want $6) dim2=$g2 (want $7) batch=${b:0:12} sql=${p:0:12}"
+            fail=1
+        fi
+    }
+
+    # dim1 capacity 256 (grow at 128), dim2 capacity 1024 (grow at 512).
+    # Section 15: the threshold, exactly, for each table independently.
+    dim_case "dim1 127 entries, below half of 256"   127 16  1 1  0 0
+    dim_case "dim1 128 entries, exactly half"        128 16  1 1  0 0
+    dim_case "dim1 129 entries, one past half"       129 16  1 1  1 0
+    dim_case "dim2 511 entries, below half of 1024"   8 511 1 1  0 0
+    dim_case "dim2 512 entries, exactly half"         8 512 1 1  0 0
+    dim_case "dim2 513 entries, one past half"        8 513 1 1  0 1
+    # Section 14: 0 / 1 / 2 / 3+ growths.
+    dim_case "dim1 2 growths"                       300 16  1 1  2 0
+    dim_case "dim1 3 growths, dim2 2"               600 1100 1 1  3 2
+    # A key absent from the dimension must still drop its fact rows, and a
+    # duplicate dimension key must still keep the first payload.
+    "${PSQL[@]}" >/dev/null <<'SQL'
+INSERT INTO reg2_card VALUES (1, 999999, 1, 7, 3, NULL, NULL, 1.00, NULL);
+INSERT INTO dim_company_c VALUES (1, 4242);
+SQL
+    dim_missing=$("${PSQL[@]}" -c "$GUCS
+         SELECT md5(string_agg(company_group||','||account_group||','||company_key
+                    ||','||debit_turnover, '|'
+                    ORDER BY company_group, account_group, company_key))
+         FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
+    sql_missing=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d,
+                '|' ORDER BY cg, ag, ck)) FROM (
+             SELECT c.company_group cg, a.account_group ag, r.company_key ck,
+                    sum(r.debit_cents)::bigint d
+             FROM reg2_card r
+             JOIN (SELECT DISTINCT ON (company_key) company_key, company_group
+                   FROM dim_company_c ORDER BY company_key, ctid) c
+                  ON c.company_key = r.company_key
+             JOIN dim_account_c a ON a.account_key = r.account_key
+             WHERE r.period BETWEEN 1 AND 12 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
+    if [ -n "$dim_missing" ] && [ "$dim_missing" = "$sql_missing" ]; then
+        echo "  PASS  absent keys drop their rows and a duplicate key keeps the first payload"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  missing/duplicate key semantics changed: ${dim_missing:0:12} vs ${sql_missing:0:12}"
+        fail=1
+    fi
+
+    # Section 16: collisions, and the reset. A stride of 256 makes every
+    # company key collide at capacity 256; after the table doubles to 512 the
+    # same keys split across two slots, so the current mark must fall while the
+    # lifetime mark keeps the pre-growth maximum. This case fails if the reset
+    # in v2_dim1_grow is removed.
+    dim_fill 200 8 256 1
+    line=$("${PSQL[@]}" -c "$GUCS
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    pc=$(sed -n 's/.*dim1_max_probe_current=\([0-9]*\).*/\1/p' <<<"$line")
+    pl=$(sed -n 's/.*dim1_max_probe_lifetime=\([0-9]*\).*/\1/p' <<<"$line")
+    gw=$(sed -n 's/.*dim1_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$gw" -ge 1 ] && [ "$pl" -gt 1 ] && [ "$pc" -lt "$pl" ]; then
+        echo "  PASS  colliding keys build chains ($pl) and the current mark resets on growth ($pc)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  collision case: dim1 growths=$gw current=$pc lifetime=$pl (want lifetime>1, current<lifetime)"
+        fail=1
+    fi
+
+    # Section 9: repeated growth must leave one live table. Checked against the
+    # memory system's own accounting, at a capacity where each generation is
+    # its own allocation block rather than a freelist chunk.
+    dim_fill 8 1100 1 1
+    line=$("${PSQL[@]}" -c "$GUCS
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p')
+    cur=$(sed -n 's/.*dim2_bytes=\([0-9]*\).*/\1/p' <<<"$line")
+    cxt=$(sed -n 's/.*dim2_cxt_bytes=\([0-9]*\).*/\1/p' <<<"$line")
+    pk=$(sed -n 's/.*dim2_bytes_peak=\([0-9]*\).*/\1/p' <<<"$line")
+    gw=$(sed -n 's/.*dim2_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    allgen=$(( cur + cur / 2 ))
+    if [ "$gw" -ge 1 ] && [ "$cxt" -lt "$allgen" ]; then
+        echo "  PASS  dim2 after $gw growths holds one live table ($cxt bytes, table $cur)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  dim2 after $gw growths: context holds $cxt for a $cur byte table"
+        fail=1
+    fi
+    if [ "$pk" = "$allgen" ]; then
+        echo "  PASS  dim2 peak memory is old+new across the rehash ($pk)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  dim2 peak $pk is not old+new ($allgen)"
+        fail=1
+    fi
+
+    # Two reports in ONE backend: the second must start from the initial
+    # capacity with no entries carried over.
+    dim_fill 300 16 1 1
+    line=$("${PSQL[@]}" -c "$GUCS
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card');
+            TRUNCATE dim_company_c;
+            INSERT INTO dim_company_c SELECT g + 1, 1 FROM generate_series(0, 9) g;
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card');" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p' | tail -1)
+    ic=$(sed -n 's/.*dim1_initial_cap=\([0-9]*\).*/\1/p' <<<"$line")
+    en=$(sed -n 's/.*dim1_entries=\([0-9]*\).*/\1/p' <<<"$line")
+    gw=$(sed -n 's/.*dim1_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    if [ "$ic" = "256" ] && [ "$en" = "10" ] && [ "$gw" = "0" ]; then
+        echo "  PASS  a later report in the same backend starts fresh at 256 with 10 entries"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  dimension rescan state leaked: initial=$ic entries=$en growths=$gw (want 256/10/0)"
+        fail=1
+    fi
+
+    # Load must never exceed 0.5 on either table once it has grown.
+    for d in dim1 dim2; do
+        lf=$(sed -n "s/.*${d}_load_factor=\([0-9.]*\).*/\1/p" <<<"$line")
+        if [ -n "$lf" ] && awk "BEGIN{exit !($lf <= 0.5)}"; then
+            echo "  PASS  $d load factor stays at or below 0.5 ($lf)"
+            pass_count=$((pass_count + 1))
+        else
+            echo "  FAIL  $d load factor $lf exceeds the 0.5 policy"
+            fail=1
+        fi
+    done
+
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+ALTER TABLE reg2_card RENAME TO dimgrow_fact;
+ALTER TABLE reg2_card_dimkeep RENAME TO reg2_card;
+SQL
+else
+    echo "  SKIP  xpb_v2_register_report not installed"
 fi
 
 echo
