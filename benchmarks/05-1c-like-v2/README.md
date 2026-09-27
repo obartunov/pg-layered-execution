@@ -272,7 +272,7 @@ Same grouping, same row count, heap deform, money columns differing only in
 type (5 runs each, median):
 
 ```
-int8     (debit_cents, credit_cents)    73.9 ms
+int8     (debit_cents, credit_cents)    73.8 ms
 numeric  (debit, credit)               207.3 ms      2.8x
 ```
 
@@ -500,7 +500,7 @@ scan:
 
 | | 1/12 | 12/12 |
 |---|---|---|
-| heap, deform (05-A's arm) | 53.0 | 74.0 |
+| heap, deform (`reg2_bad`, re-run here) | 53.0 | 74.0 |
 | heap, fixed offsets | 20.9 | **32.1** |
 | pgColumnar | **8.4** | 36.0 |
 
@@ -561,7 +561,7 @@ asks for 5. 05-C tests one narrowly defined alternative:
 ## Answer
 
 **Case B, partially.** `fixed < projected < deform` at full scan, where
-projected closes ~40% of the deform→fixed gap. At low selectivity projected is
+projected closes ~33% of the deform→fixed gap. At low selectivity projected is
 *worse* than deform — for an identifiable implementation reason, not an
 architectural one. The walk itself turns out to be cheap; what deform pays for
 is materializing attributes nobody asked for.
@@ -605,7 +605,11 @@ skipped. That is the architecturally interesting case, and it is the one
 
 Warm cache, 1 warm-up + 5 measured runs, median (min–max), `source_ms`. Same
 GUCs and protocol as 05-B. The whole matrix was run twice; the second run is
-published and the first agrees within noise (both in `raw/projected/`).
+published, and **every number in this section is from that pass**. The first
+pass is kept alongside it in `raw/projected/` but the two differ by 11-13% at
+12/12 (fixed 40.3 against 35.7; bad-projected 60.5 against 65.0), enough to
+move this section's headline ratio from 33% to 41%, so they are not pooled and
+the first is not quoted.
 
 | predicate | `reg2_fixed` fixed | `reg2_fixed` deform | `reg2_fixed` **projected** | `reg2_bad` deform | `reg2_bad` **projected** |
 |---|---|---|---|---|---|
@@ -613,7 +617,7 @@ published and the first agrees within noise (both in `raw/projected/`).
 | 1/12 | 26.7 | 43.5 | **48.1** | 47.9 | **58.6** |
 | 12/12 | 35.7 | 66.2 | **56.0** | 70.9 | **65.0** |
 
-pgColumnar context, unchanged code: 8.8 ms at 1/12, 29.5 ms at 12/12.
+pgColumnar context, unchanged code: 7.7 ms at 1/12, 30.3 ms at 12/12.
 
 ### At full scan, where the comparison is clean
 
@@ -626,8 +630,10 @@ projected  56.0          projected -> fixed still costs 20.3 ms
 deform     66.2          projected closes ~33% of the gap
 ```
 
-Run 1 gave 40.3 / 58.3 / 70.6 — 40% of the gap. So **projected closes roughly
-a third to 40% of the distance from full deform to fixed offsets.**
+**Projected closes about a third of the distance from full deform to fixed
+offsets.** The unpublished first pass gave 41% on the same three arms; the
+spread between two passes on this host is wide enough that the figure should be
+read as "roughly a third", not as 33.4%.
 
 On `reg2_bad`, where all 9 attributes must be walked regardless, projected
 still beats deform (65.0 against 70.9). Skipping *materialization alone* —
@@ -694,7 +700,7 @@ Touching the toast relation at all would mean the value had been followed.
 | heap, full deform | 47.9 | 70.9 |
 | heap, projected | 58.6 | 65.0 |
 | heap, fixed offsets | 26.7 | 35.7 |
-| pgColumnar | **8.8** | **29.5** |
+| pgColumnar | **7.7** | **30.3** |
 
 Projected deform is a real but partial improvement, and only at full scan in
 its current form. It does not bring the generic heap path near either fixed
@@ -1271,7 +1277,7 @@ It aggregates 983 040 rows down to 49 152 **before** the joins, then joins two
 tiny dimensions and finalises. xp_batch joins all 983 040 rows and then
 aggregates. Two consequences:
 
-1. PostgreSQL's cost is nearly flat across the ladder (286 to 298 ms) because
+1. PostgreSQL's cost is nearly flat across the ladder (286.8 to 302.4 ms) because
    its dominant hash table is the partial aggregate, which holds 49 152 groups
    *at every point of the ladder*. Its flatness is a property of the plan, not
    evidence that its aggregation scales better.
@@ -1280,22 +1286,28 @@ aggregates. Two consequences:
    all three measured points; no switch to `GroupAggregate`, no partitioning,
    no batching.
 
-xp_batch is 4.5-5.7x faster here, on a pipeline that does strictly more work
-per row than the plan it is being compared against, and stops at a quarter of
-the cardinality.
+**This is an execution-path measurement, not a claim about PostgreSQL.** On
+this controlled workload the hand-wired xp_batch pipeline completed in 50-67 ms
+against 287-302 ms for the plan above. The two are not the same computation
+arranged the same way: PostgreSQL runs a planner-selected plan that aggregates
+before the joins, through the full executor, with MVCC and general expression
+evaluation; xp_batch is one hard-coded query shape that joins every row and
+then aggregates. Nothing here supports a statement of the form "xp_batch is N
+times faster than PostgreSQL". It also stops at a quarter of the cardinality
+PostgreSQL handles on the same query.
 
 ## Limitations
 
 * **`k` is bounded above by the aggregate's own capacity**, so §5's ~100 000
   group point is unreachable by construction and was not faked. The ladder
   ends where the implementation ends.
-* The instrumentation is not free and is included in the numbers above. The
-  probe counters cost **~1.1 ms per million aggregated rows** (`fixedlayout-fixed`
-  at 1..12: `operators_ms` median 7.70 across 05-D's 25 runs, 8.80 across 15
-  runs after this change). It is O(rows) and independent of group count, so it
-  offsets the cardinality curve by a constant and does not distort its shape —
-  uninstrumented, the 256-to-12 288 aggregate growth would read steeper, not
-  shallower. 05-A..05-D's published timings predate it.
+* The instrumentation is not free and is included in the numbers above, but
+  **its cost is not quantified here**: the comparison that was published
+  rested on a 15-run measurement that was never saved to `raw/`, so it has
+  been withdrawn rather than restated. What can be said without it: the probe
+  counters are O(rows) and independent of group count, so they offset the
+  cardinality curve by a constant rather than distorting its shape.
+  05-A..05-D's published timings predate them.
 * Uniform distribution only. No skew, no hot keys (§8, §28).
 * One row count. §27's optional row-count control was **not performed**: it
   needs a second fact table and a second report mode, and every
@@ -1305,12 +1317,16 @@ the cardinality.
   experimentally here; the flat region below load 0.375 is the closest thing
   to a per-row reading.
 * `ns/group` is reported in the CSV but is not a complexity model: it falls
-  from 14 453 to 830 and then rises again to 1 611, because group *sizes*
-  change by a factor of 48 across the ladder (§14).
+  from 14 844 to 798 and then rises again to 1 571 on the ZLFS arm, because
+  group *sizes* change by a factor of 48 across the ladder (§14). The heap arm
+  traces the same shape at different values; mixing the two would make the
+  sequence meaningless.
 * The ZLFS arm's `open_ms` is dominated by a registry scan over all zone files
   in the data directory. 55 orphaned zone files left by earlier sessions
   (their source relations dropped) were moved aside to `/tmp/zlfs-orphans`
-  before measuring, which cut `open_ms` from ~79 ms to ~51 ms. No zone
+  before measuring. That was environment hygiene done before the published
+  passes, not a measurement: no before/after `open_ms` figure was recorded, so
+  none is quoted. The published passes show `open_median_ms` 70.9-75.6. No zone
   belonging to 05-A..05-D was touched and their arms still run.
 * `zlfs_drop_zone(lo, hi)` keys on the period range alone, not on the
   relation, so any benchmark that drops zones for [1..12] -- 05-A and 04 both
@@ -1345,7 +1361,7 @@ puts it:
   grow at or before 0.5, which also means a growth design has to answer what
   the rehash costs, since 05-E establishes that today there is none.
 * Aggregation is **not** expensive in itself. At realistic occupancy the
-  aggregate is 4–5 ms against a 38 ms source — option B is not supported.
+  aggregate is 4-5 ms against a 39-41 ms source — option B is not supported.
 
 So: not A (the boundary is too close to move on to skew), not B (aggregation
 is cheap where it fits), not D (12 288 groups is not sufficient for realistic
@@ -1374,17 +1390,35 @@ since, which is the only reason the causality below is readable.
 No spill. No planner changes. No change to the hash algorithm, the key layout
 or the source paths.
 
+## Read the timings within this section only
+
+**Every timing here was taken on 2026-09-27. Timings in 05-A through 05-E were
+taken on 2026-09-24 and are not comparable with them.** This host drifts
+between sessions by more than the effects being measured. Measured on a code
+path this milestone does not touch at all — the fixed-offset heap source:
+
+```
+fixedlayout-fixed, 1..12, source_ms      05-D/05-E, 09-24:  35.6
+                                         same arm,  09-27:  57.4
+```
+
+1.6x on unchanged code. PostgreSQL's own baseline for the same query moved
+286 -> 450 ms over the same interval. So all cross-session comparisons have
+been removed from this section rather than caveated, and the two comparisons
+that matter are made **within** one session: the rehash control below, and
+xp_batch against PostgreSQL measured on the same day.
+
 ## Answer
 
-**Outcome A, with a B component appearing at the top of the range.**
+**Outcome A, with a B component that is now quantified.**
 
 The 05-E knee is gone. Load stays at or below 0.5 and is 0.375 at most
-measured points, probe cost is flat from 10 240 groups to 147 456, and the
+measured points, probe cost is flat from 10 240 to 147 456 groups, and the
 last successful cardinality is **147 456 groups — 12x the old ceiling**, which
 is where the *dimension* hashes run out, not the group table.
 
-The part that still grows is the rehash. At 147 456 groups it is 19.5 ms of a
-43.5 ms aggregate, and everything else has gone flat.
+The part that still grows is the rehash: at 147 456 groups it is 26.2 ms of a
+77.2 ms aggregate, and a paired control confirms it.
 
 ## What changed, and what deliberately did not
 
@@ -1397,14 +1431,13 @@ The part that still grows is the rehash. At 147 456 groups it is 19.5 ms of a
 | key and aggregate-state layout | unchanged |
 | NULL and grouping semantics | unchanged |
 
-The hash is now reached through a small function rather than being written
-inline, because rehash has to recompute the same value from the stored keys.
-That is the only reason it moved.
+The hash is now reached through a function rather than being written inline,
+because rehash has to recompute the same value from the stored keys. That is
+the only reason it moved.
 
-Initial capacity stayed at 16 384 rather than dropping to something smaller.
-Keeping it identical to 05-E's is what makes the comparison below isolate one
-variable — the growth policy — and section 27 forbids sizing the table from
-the cardinality the benchmark is about to produce.
+Initial capacity stayed at 16 384 rather than dropping to something smaller,
+and section 27 forbids sizing the table from the cardinality the benchmark is
+about to produce.
 
 ### Rehash reinserts, it does not copy
 
@@ -1425,12 +1458,26 @@ Past `MaxAllocSize` the growth is refused cleanly rather than worked around
 with a huge allocation — that is the group table's own next boundary, around
 16.8M groups, and it was not reached here.
 
+### The turnover sums are checked too
+
+Separate from table growth, and found by review of this milestone rather than
+by it: the int8 turnover accumulation was unchecked and wrapped silently on
+input PostgreSQL refuses outright. It now raises `bigint out of range` with
+PostgreSQL's own errcode. The benchmark gate could not have caught it — the
+gate asserts `sum(debit) - sum(credit) = sum(debit - credit)`, and under
+two's-complement wraparound both sides wrap identically, so the identity held
+on a wrong answer. The identity is a useful invariant; it is not an overflow
+detector, and there is now a regression that says so.
+
+Because this adds two checked adds per aggregated row, every timing in this
+section includes them and no earlier section's does.
+
 ## Correctness
 
-86 cases in `contract_tests.sh`, all passing, 18 of them new. Every growth
-count is compared **per group** against PostgreSQL — a rehash that lost or
-duplicated a group would keep the row count right while splitting one group's
-sums, so grand totals are not accepted anywhere in this milestone.
+90 cases in `contract_tests.sh`, all passing. Every growth count is compared
+**per group** against PostgreSQL — a rehash that lost or duplicated a group
+would keep the row count right while splitting one group's sums, so grand
+totals are not accepted anywhere in this milestone.
 
 | case | growths |
 |---|---|
@@ -1454,92 +1501,67 @@ across a rehash; repeated growth leaves one live table; a second, smaller
 report **in the same backend** starts fresh at the initial capacity with no
 groups carried over; a growth refused by a test-only ceiling errors cleanly,
 the backend survives, and the next fitting report still answers correctly; a
-capacity that is not a power of two is refused.
+capacity that is not a power of two is refused; the two probe marks behave as
+specified; int8 overflow raises rather than wrapping.
 
-The test hook that forces a small capacity is process-local, and every psql
-invocation is a new backend — so it has to be set in the same connection as
-the report it governs. The first version of these tests did not, and silently
-measured the production policy instead. The benchmark asserts the production
-policy is in force before measuring anything.
-
-## A pre-existing defect this found
-
-The dimension hashes had **no occupancy check at all**. Once full, the probe
-loop ran off the end of the table and the dimension row was discarded in
-silence — and every fact row referencing that key then failed its join lookup
-and vanished from the aggregate. The report returned **smaller sums with no
-error**.
-
-It surfaced when this milestone's own test dataset overflowed `dim2`: group
-keys matched PostgreSQL exactly while the sums did not. The typed pipeline's
-`tp_dim_build` has always had this check; these two builds did not. Both now
-refuse, naming the dimension and the limit.
-
-No published result was affected — 05-A through 05-E all used dimensions well
-inside the limits — but the defect would have produced wrong answers the
-moment cardinality was pushed, which is exactly what this milestone does.
+The probe tests needed their own dataset. The threshold dataset varies one key
+component, and since the hash multiplies each key by an odd constant,
+consecutive keys land on a stride that never collides — every chain is length
+1 at any load factor and a reset is invisible.
 
 ## Results
 
 Primary arm is ZLFS, so `source_ms` is 0.0 and what remains is operator
 behaviour. 5 passes x (1 warm-up + 5 measured runs) = 25 runs per cell,
-median ms. Raw in `raw/hash-growth/`, aggregate in `results-hash-growth.csv`.
+median ms, all 2026-09-27. Raw in `raw/hash-growth/`, aggregate in
+`results-hash-growth.csv`, recomputable with `check-summaries.py`.
 
-Two fact tables. `reg2_card` is **unchanged from 05-E**, so the comparison at
-matching cardinalities is like for like; `reg2_card2` (192 x 768 pairs) exists
-only because `reg2_card` cannot express more than 49 152 groups.
+Two fact tables. `reg2_card` is the 05-E table; `reg2_card2` (192 x 768 pairs,
+1 032 192 rows) exists only because `reg2_card` cannot express more than
+49 152 groups.
 
-| groups | cap | load | growths | agg | rehash | agg−rehash | probes/lookup | max probe | MB | peak MB |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 256 | 16 384 | 0.016 | 0 | 4.6 | 0.00 | 4.57 | 1.016 | 2 | 0.50 | 0.50 |
-| 2 048 | 16 384 | 0.125 | 0 | 5.6 | 0.00 | 5.57 | 1.076 | 4 | 0.50 | 0.50 |
-| 6 144 | 16 384 | 0.375 | 0 | 6.9 | 0.00 | 6.94 | 1.286 | 12 | 0.50 | 0.50 |
-| 8 192 | 16 384 | 0.500 | 0 | 9.6 | 0.00 | 9.64 | 1.540 | 37 | 0.50 | 0.50 |
-| 10 240 | 32 768 | 0.313 | 1 | 8.9 | 0.67 | 8.24 | 1.200 | 37 | 1.00 | 1.50 |
-| 12 288 | 32 768 | 0.375 | 1 | 10.4 | 0.70 | 9.56 | 1.275 | 37 | 1.00 | 1.50 |
-| 24 576 | 65 536 | 0.375 | 2 | 16.6 | 1.92 | 14.68 | 1.282 | 37 | 2.00 | 3.00 |
-| 49 152 | 131 072 | 0.375 | 3 | 22.3 | 4.36 | 18.03 | 1.312 | 37 | 4.00 | 6.00 |
-| 24 576 † | 65 536 | 0.375 | 2 | 17.8 | 1.89 | 15.98 | 1.308 | 32 | 2.00 | 3.00 |
-| 49 152 † | 131 072 | 0.375 | 3 | 23.7 | 4.35 | 19.42 | 1.316 | 32 | 4.00 | 6.00 |
-| 98 304 † | 262 144 | 0.375 | 4 | 31.3 | 9.52 | 21.72 | 1.279 | 32 | 8.00 | 12.00 |
-| **147 456** † | 524 288 | 0.281 | 5 | 43.5 | 19.48 | 23.55 | 1.284 | 32 | 16.00 | 24.00 |
+| groups | cap | load | growths | agg | rehash | agg−rehash | probes/lookup | probe cur | probe life | MB | peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | 16 384 | 0.016 | 0 | 8.9 | 0.00 | 8.93 | 1.016 | 2 | 2 | 0.50 | 0.50 |
+| 2 048 | 16 384 | 0.125 | 0 | 10.8 | 0.00 | 10.82 | 1.076 | 4 | 4 | 0.50 | 0.50 |
+| 6 144 | 16 384 | 0.375 | 0 | 13.8 | 0.00 | 13.77 | 1.286 | 12 | 12 | 0.50 | 0.50 |
+| 8 192 | 16 384 | 0.500 | 0 | 17.1 | 0.00 | 17.11 | 1.540 | 37 | 37 | 0.50 | 0.50 |
+| 10 240 | 32 768 | 0.313 | 1 | 15.2 | 0.86 | 14.38 | 1.200 | 17 | 37 | 1.00 | 1.50 |
+| 12 288 | 32 768 | 0.375 | 1 | 17.2 | 0.90 | 16.37 | 1.275 | 17 | 37 | 1.00 | 1.50 |
+| 24 576 | 65 536 | 0.375 | 2 | 21.1 | 2.46 | 18.73 | 1.282 | 10 | 37 | 2.00 | 3.00 |
+| 49 152 | 131 072 | 0.375 | 3 | 27.2 | 5.68 | 21.48 | 1.312 | 17 | 37 | 4.00 | 6.00 |
+| 24 576 † | 65 536 | 0.375 | 2 | 22.5 | 2.50 | 19.87 | 1.308 | 16 | 32 | 2.00 | 3.00 |
+| 49 152 † | 131 072 | 0.375 | 3 | 29.2 | 5.67 | 23.34 | 1.316 | 12 | 32 | 4.00 | 6.00 |
+| 98 304 † | 262 144 | 0.375 | 4 | 48.0 | 12.13 | 34.15 | 1.279 | 17 | 32 | 8.00 | 12.00 |
+| **147 456** † | 524 288 | 0.281 | 5 | 77.2 | 26.21 | 50.99 | 1.284 | 11 | 32 | 16.00 | 24.00 |
 
-† on `reg2_card2`. The two tables overlap at 24 576 and 49 152 and agree
-within noise, which is the check that the second dataset did not move
-anything but cardinality.
+† on `reg2_card2`, which has 5% more rows than `reg2_card`. The two overlap at
+24 576 and 49 152 and agree to within that row-count difference once
+normalised per input row; the raw overlap should not be read as agreement.
 
 The heap fixed-offset arm carries the same aggregate under a real source
-(`source_ms` 32.6–41.0 throughout) and its aggregate column agrees with the
-ZLFS arm at every point.
+(`source_ms` 32.8–48.7 today) and its aggregate column tracks the ZLFS arm's
+shape; it is 1–12 ms higher throughout, so the two are not interchangeable
+point by point.
 
-### Against the 05-E fixed table (section 19)
+### The 05-E comparison, withdrawn
 
-| groups | growths | 05-E fixed | growing | delta |
-|---|---|---|---|---|
-| 256 | 0 | 3.8 | 4.6 | **+0.8** |
-| 2 048 | 0 | 4.5 | 5.6 | **+1.1** |
-| 6 144 | 0 | 4.9 | 6.9 | **+2.0** |
-| 8 192 | 0 | 9.1 | 9.6 | **+0.5** |
-| 10 240 | 1 | 14.0 | 8.9 | **−5.1** |
-| 12 288 | 1 | 19.3 | 10.4 | **−8.9** |
+05-E's fixed-capacity numbers were taken in a different session on a host that
+has since drifted 1.6x on unchanged code. The per-point comparison table that
+stood here has been removed rather than caveated:
 
-Read the two halves separately, because they say different things.
+> Cross-session measurements were not stable enough to quantify the
+> steady-state overhead of dynamic capacity independently of rehash.
 
-**At zero growths the growing table is slower, by 0.5 to 2.0 ms.** Those
-points do identical work in an identically sized table, so that difference is
-the price of a capacity that is not a compile-time constant: the mask and the
-loop bound are now loads rather than immediates, and the counters live behind
-a pointer instead of in locals. It is a real cost and it is not amortised away
-by anything.
-
-**From the first growth onwards it is paid back several times over.** At
-12 288 groups — the exact point where the fixed table erred out one group
-later — the growing table is 1.9x faster, because one growth takes the load
-from 0.75 to 0.375 and the probe chain from 2.707 to 1.275.
+What is still established, because it does not depend on timing at all: at
+12 288 groups the fixed table held load 0.75 and erred one group later; the
+growing table holds the same 12 288 groups at load 0.375 with one growth, and
+probes per lookup fall from 2.707 to 1.275. Those are deterministic counters,
+identical in all 25 runs.
 
 ### Growth shape (section 20)
 
-Taken from the live counters, not inferred:
+From the live counters, not inferred:
 
 ```
 groups   10 240 →  capacity  32 768 after 1 growth,  load 0.313
@@ -1553,17 +1575,29 @@ Load settles into a 0.25–0.5 sawtooth, exactly as a doubling policy implies.
 
 ### Probe behaviour (section 21)
 
-This is the question the milestone turned on, and the answer is clean:
+Two marks, because one number was answering two questions. `probe life` is the
+worst chain ever walked, which happens just before a growth when the table is
+at its densest; `probe cur` is reset on every growth and describes the table
+that actually answered the query. Previously there was one counter, never
+reset, reported as though it described the grown table.
 
 | | 05-E fixed at its ceiling | growing, 10K–147K groups |
 |---|---|---|
 | probes/lookup | 2.707 | **1.20 – 1.32** |
-| max probe | 91 | **32 – 37** |
+| longest chain in the answering table | 91 | **10 – 17** |
+| longest chain ever walked | 91 | 32 – 37 |
 
-Holding load at or below 0.5 keeps probe cost **flat across a 14x change in
-cardinality**. The hash function was not touched, and on this evidence it did
-not need to be: 05-E's probe counts already tracked linear-probe theory, and
-what was expensive was the load factor, not the distribution.
+So the story is better than the single number allowed:
+
+```
+before grow   chain reaches 32-37
+after grow    current mark falls back to 10-17
+```
+
+Rehash does not merely make room, it restores the table's quality. Holding
+load at or below 0.5 keeps probes per lookup **flat across a 14x change in
+cardinality**. The hash function was not touched and on this evidence did not
+need to be.
 
 ### Memory (section 22)
 
@@ -1575,103 +1609,124 @@ what was expensive was the load factor, not the distribution.
 | 147 456 | 524 288 | 16.00 MB | 24.00 MB | 114 |
 
 Peak is **1.5x current at every growth point**, because old and new tables are
-both live across the rehash. That peak is real and is reported rather than
-smoothed into steady-state memory.
+both live across the rehash. `grp_cxt_bytes`, measured by the memory system
+rather than by this code's arithmetic, is the live table plus about 8 KB of
+block overhead at every point — five growths leave one live table, not six.
 
-`grp_cxt_bytes`, measured by the memory system rather than by this code's own
-arithmetic, is the live table plus about 8 KB of block overhead at every
-point — so five growths leave one live table, not six.
-
-### Rehash cost (section 23)
+### Rehash cost, with a control (section 23)
 
 | growths | groups | rehashed | rehash ms | % of aggregate |
 |---|---|---|---|---|
-| 1 | 12 288 | 8 192 | 0.70 | 7% |
-| 2 | 24 576 | 24 576 | 1.92 | 12% |
-| 3 | 49 152 | 57 344 | 4.36 | 20% |
-| 4 | 98 304 | 122 880 | 9.52 | 30% |
-| 5 | 147 456 | 253 952 | 19.48 | **45%** |
+| 1 | 12 288 | 8 192 | 0.90 | 5% |
+| 2 | 24 576 | 24 576 | 2.46 | 12% |
+| 3 | 49 152 | 57 344 | 5.68 | 21% |
+| 4 | 98 304 | 122 880 | 12.13 | 25% |
+| 5 | 147 456 | 253 952 | 26.21 | **34%** |
 
-Measured totals, not amortised complexity claimed from theory. The doubling
-series reinserts about 1.7x the final group count by the end.
+The doubling series reinserts about 1.7x the final group count by the end.
 
-The important shape is the column next to it: **`agg−rehash` flattens** —
-18.0, 19.4, 21.7, 23.6 ms from 49 152 to 147 456 groups. Steady-state
-aggregation has stopped growing; nearly all the remaining growth in aggregate
-time is rehash.
+`rehash_ms` is a counter, so it deserves an independent check. `run-rehash-control.sh`
+pre-sizes the table to the final capacity through the test-only policy hook,
+so both arms end with the **identical** final table — same capacity, same
+147 456 groups, same load 0.281, same current probe mark of 11 — and differ
+only in whether they got there by doubling. The arms alternate inside one
+connection, 10 pairs:
 
-## PostgreSQL context (section 24)
+| arm | growths | aggregate ms | reported rehash_ms |
+|---|---|---|---|
+| natural, 16 384 → 524 288 | 5 | 82.0 | 26.96 |
+| pre-sized to 524 288 | 0 | 54.4 | 0.00 |
 
-Single core, same query, plan captured at each point.
+Paired difference **+23.1 ms, 95% CI [+16.9, +29.4]**, natural slower in 10/10
+pairs. The counter says 27.0 ms; the control measures 23.1 ms with a CI that
+contains it. **The rehash accounting is independently confirmed.**
 
-| groups | xp_batch total (heap arm) | PostgreSQL | xp_batch memory | PostgreSQL memory |
+Pre-sizing is not a proposal — section 27 forbids sizing from a known
+cardinality precisely because it hides what is being measured. It is used here
+only as the control that measures it.
+
+The important shape is next to the table: **`agg−rehash` grows far more slowly
+than `agg`**. Steady-state aggregation is not what is driving the top of the
+range; rehash is.
+
+## PostgreSQL context (sections 24, 20)
+
+Single core, same query, same session as everything above, plan captured at
+each point.
+
+| groups | xp_batch, heap arm | PostgreSQL | xp_batch memory | PostgreSQL memory |
 |---|---|---|---|---|
-| 8 192 | 56.4 | 286.0 | 0.50 MB | 17.4 MB |
-| 49 152 | 58.4 | 319.3 | 4.00 MB | 17.4 MB |
-| 98 304 | 66.9 | 601.5 | 8.00 MB (12 peak) | 86.1 MB |
+| 8 192 | 72.2 | 450.1 | 0.50 MB | 21.0 MB |
+| 49 152 | 75.2 | 494.2 | 4.00 MB | 34.0 MB |
+| 98 304 | 103.0 | 906.6 | 8.00 MB (12 peak) | 86.1 MB |
 
-The plan shape is constant at every point — `HashAggregate`, `Batches: 1`, no
-spill, no switch to `GroupAggregate` — so the timings are comparable. It
-remains the two-stage eager-aggregation plan described in 05-E: PostgreSQL
-aggregates before the joins, xp_batch joins every row and then aggregates.
+PostgreSQL memory sums both hash aggregates of its two-stage plan, which is
+what it actually occupies.
 
-At 98 304 groups PostgreSQL needs 86 MB across its two hash aggregates where
-the growing table needs 8 MB, at 32 bytes per slot against PostgreSQL's much
-larger per-group state.
+**This is an execution-path measurement, not a claim about PostgreSQL.** On
+this controlled workload the hand-wired xp_batch pipeline completed in 103 ms
+against 907 ms for the PostgreSQL plan below, at 98 304 groups. The two are
+not the same computation arranged the same way:
+
+```
+PostgreSQL                          xp_batch
+planner-selected plan               hand-wired pipeline, no planner
+aggregate before the joins          join all rows, then aggregate
+full executor, MVCC, expressions    one hard-coded query shape
+```
+
+PostgreSQL's plan shape is constant at every point — `HashAggregate`,
+`Batches: 1`, no spill, no switch to `GroupAggregate` — so its own points are
+comparable with each other. Nothing here supports a statement of the form
+"xp_batch is N times faster than PostgreSQL".
 
 ## Limitations
 
 * **The last successful cardinality is limited by the dimensions, not the
-  group table.** 147 456 groups is 192 companies x 768 accounts, which is
-  exactly what `V2_DIM1_CAP` (256) and `V2_DIM2_CAP` (1024) hold at their 3/4
-  load limits. Those are the same kind of compile-time constant this milestone
-  just removed from the group hash, and they are now the binding one. The
-  group table's own next boundary is `MaxAllocSize`, around 16.8M groups,
-  untested.
-* **Dynamic capacity costs 0.5–2.0 ms per ~1M rows** at cardinalities that
-  never grow, as measured above. Reported rather than netted off.
-* **Instrumentation is included in every number.** The counters added in 05-E
-  cost ~1.1 ms per million aggregated rows; the growth counters added here are
-  per growth, not per row. No instrumented and uninstrumented numbers are
-  mixed anywhere in this section.
+  group table.** 147 456 groups is 192 companies x 768 accounts, exactly what
+  `V2_DIM1_CAP` (256) and `V2_DIM2_CAP` (1024) hold at their 3/4 load limits —
+  the same kind of compile-time constant this milestone removed from the group
+  hash, and now the binding one. The group table's own next boundary is
+  `MaxAllocSize`, around 16.8M groups, untested.
+* **The steady-state cost of dynamic capacity is not quantified.**
+  Cross-session measurements were not stable enough to separate it from
+  rehash, and it was not worth a measurement campaign of its own. What is
+  quantified is the rehash cost, by the paired control above.
+* Instrumentation is included in every number here: 05-E's counters, the
+  growth counters, and the two checked adds per row. Earlier sections' timings
+  include none of the latter.
 * Every measured run builds its table from the initial capacity. Nothing is
-  pre-sized from the known cardinality (section 27), and nothing is carried
-  across reports (section 28) — so the full rehash chain is paid on every run,
+  pre-sized from the known cardinality except the control, and nothing is
+  carried across reports — so the full rehash chain is paid on every run,
   which is the pessimistic reading of the policy.
-* No spill, no batches, no `work_mem` integration (section 25). No shrinking
-  (section 26).
-* Uniform distribution only. No skew.
-* Warm cache only.
+* No spill, no batches, no `work_mem` integration. No shrinking.
+* Uniform distribution only. No skew. Warm cache only. One query shape.
 * `reg2_card2`'s dimensions sit at their load limit to reach 147 456 groups,
-  so its join phases are not comparable with `reg2_card`'s. Its aggregate
-  column is, and that is what the ladder uses.
+  so its join phases are not comparable with `reg2_card`'s.
 * The growth policy has not been varied. 0.5 and 2x were measured as
-  preregistered; any alternative is a separate experiment (section 33).
+  preregistered; any alternative is a separate experiment.
 
 ## The decision after this milestone (section 39)
 
 The old answer was "12 288 groups, because `#define`". The measured answer is:
 
-> In-memory aggregation now scales smoothly to 147 456 groups at 16 MB, with
-> probe cost flat and load bounded at 0.5. The first genuine boundary is no
-> longer the group table — it is the dimension hashes, at 192 and 768 keys.
-> The first genuine *cost* is rehash, which is 45% of aggregate time at the
-> top of the range.
+> In-memory aggregation now scales to 147 456 groups at 16 MB with probe cost
+> flat and load bounded at 0.5. The first genuine boundary is no longer the
+> group table — it is the dimension hashes, at 192 and 768 keys. The first
+> genuine *cost* is rehash, now independently measured at 23 ms of an 82 ms
+> aggregate at the top of the range.
 
-That splits the next direction cleanly, and the evidence points at **A and C
-together, in that order**:
+The evidence points at **A and C together, in that order**:
 
-1. **A — growth solved the boundary, so skew is now the honest next test.**
-   Every number here is from a uniform distribution. The probe stability that
-   makes this result look good is exactly what a hot-key distribution would
-   attack, and 05-F was already the planned successor.
-2. **C — rehash policy is the one cost still growing**, and it is measurable
-   now in a way it was not before. Halving the work by growing 4x instead of
-   2x, or growing earlier, are single-variable experiments against this
-   preregistered baseline. Not to be done by adjusting the constant that was
-   just measured.
+1. **A — growth solved the boundary, so skew is the honest next test.** Every
+   number here is from a uniform distribution, and the probe stability this
+   result rests on is exactly what a hot-key distribution would attack.
+2. **C — rehash policy is the one cost still growing**, and the control makes
+   it measurable. Growing 4x instead of 2x, or growing earlier, are
+   single-variable experiments against this preregistered baseline — not to be
+   done by adjusting the constant that was just measured.
 
-Not B: memory footprint is 16 MB at 147K groups, a fifth of what PostgreSQL
-spends on two thirds as many. Not D: probe behaviour did not degrade. Not E
-(10M rows) yet — the dimension caps would have to be raised first, and that
-is the same conversation as C.
+Not B: memory is 16 MB at 147K groups against PostgreSQL's 86 MB for two
+thirds as many. Not D: probe behaviour did not degrade. Not E (10M rows) yet —
+the dimension caps would have to be raised first, which is the same
+conversation as C.

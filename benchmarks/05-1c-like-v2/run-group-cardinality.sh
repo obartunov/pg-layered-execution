@@ -133,7 +133,7 @@ done
 
 echo
 echo "############ timings: 1 warm-up + $RUNS measured runs ############"
-echo "# arm,k,run,groups,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,operators_ms,rows,cap,load_limit,occupied,load_factor,grp_bytes,entry_bytes,inserts,hits,probes,probes_per_lookup,max_probe,growths,rehashes,status"
+echo "# arm,k,run,groups,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,operators_ms,rows,cap,load_limit,occupied,load_factor,grp_bytes,entry_bytes,inserts,hits,probes,probes_per_lookup,max_probe_lifetime,growths,rehashes,status"
 
 for arm in card-zlfs card; do
     for k in $LADDER $OVER; do
@@ -152,7 +152,7 @@ for arm in card-zlfs card; do
             line=$(sed -n 's/^NOTICE:  v2_register_report //p' <<<"$line")
             [ "$i" -eq 0 ] && continue
             g()  { sed -n "s/.*[ =]$1=\([0-9.]*\).*/\1/p" <<<"$line"; }
-            echo "$arm,$k,$i,$(g groups),$(g total),$(g open),$(g source),$(g join1),$(g join2),$(g agg),$(g operators),$(g rows),$(g grp_cap),$(g grp_load_limit),$(g grp_occupied),$(g grp_load_factor),$(g grp_bytes),$(g grp_entry_bytes),$(g grp_inserts),$(g grp_hits),$(g grp_probes),$(g grp_probes_per_lookup),$(g grp_max_probe),$(g grp_growths),$(g grp_rehashes),OK"
+            echo "$arm,$k,$i,$(g groups),$(g total),$(g open),$(g source),$(g join1),$(g join2),$(g agg),$(g operators),$(g rows),$(g grp_cap),$(g grp_grow_at),$(g grp_occupied),$(g grp_load_factor),$(g grp_bytes),$(g grp_entry_bytes),$(g grp_inserts),$(g grp_hits),$(g grp_probes),$(g grp_probes_per_lookup),$(g grp_max_probe_lifetime),$(g grp_growths),$(g grp_rehashes),OK"
         done
     done
 done

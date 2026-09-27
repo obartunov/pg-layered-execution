@@ -181,7 +181,7 @@ done
 
 echo
 echo "############ timings: 1 warm-up + $RUNS measured runs ############"
-echo "# tbl,arm,k,run,groups,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,rehash_ms,agg_minus_rehash_ms,operators_ms,rows,initial_cap,capacity,grow_at,occupied,load_factor,bytes,bytes_peak,cxt_bytes,inserts,hits,probes,probes_per_lookup,max_probe,growths,rehash_groups,rehash_probes,status"
+echo "# tbl,arm,k,run,groups,total_ms,open_ms,source_ms,join1_ms,join2_ms,agg_ms,rehash_ms,agg_minus_rehash_ms,operators_ms,rows,initial_cap,capacity,grow_at,occupied,load_factor,bytes,bytes_peak,cxt_bytes,inserts,hits,probes,probes_per_lookup,max_probe_current,max_probe_lifetime,growths,rehash_groups,rehash_probes,status"
 
 measure() {   # measure <tbl> <arm> <k> <setter>
     local tbl="$1" arm="$2" k="$3" setter="$4" i line
@@ -192,13 +192,13 @@ measure() {   # measure <tbl> <arm> <k> <setter>
                | grep -v '^WARNING' || true)
         if grep -q '^ERROR' <<<"$line"; then
             [ "$i" -eq 0 ] && continue
-            echo "$tbl,$arm,$k,$i,,,,,,,,,,,,,,,,,,,,,,,,,,,,ERROR"
+            echo "$tbl,$arm,$k,$i,,,,,,,,,,,,,,,,,,,,,,,,,,,,,ERROR"
             continue
         fi
         line=$(sed -n 's/^NOTICE:  v2_register_report //p' <<<"$line")
         [ "$i" -eq 0 ] && continue
         g() { sed -n "s/.*[ =]$1=\([0-9.]*\).*/\1/p" <<<"$line"; }
-        echo "$tbl,$arm,$k,$i,$(g groups),$(g total),$(g open),$(g source),$(g join1),$(g join2),$(g agg),$(g grp_rehash_ms),$(g grp_agg_minus_rehash_ms),$(g operators),$(g rows),$(g grp_initial_cap),$(g grp_cap),$(g grp_grow_at),$(g grp_occupied),$(g grp_load_factor),$(g grp_bytes),$(g grp_bytes_peak),$(g grp_cxt_bytes),$(g grp_inserts),$(g grp_hits),$(g grp_probes),$(g grp_probes_per_lookup),$(g grp_max_probe),$(g grp_growths),$(g grp_rehash_groups),$(g grp_rehash_probes),OK"
+        echo "$tbl,$arm,$k,$i,$(g groups),$(g total),$(g open),$(g source),$(g join1),$(g join2),$(g agg),$(g grp_rehash_ms),$(g grp_agg_minus_rehash_ms),$(g operators),$(g rows),$(g grp_initial_cap),$(g grp_cap),$(g grp_grow_at),$(g grp_occupied),$(g grp_load_factor),$(g grp_bytes),$(g grp_bytes_peak),$(g grp_cxt_bytes),$(g grp_inserts),$(g grp_hits),$(g grp_probes),$(g grp_probes_per_lookup),$(g grp_max_probe_current),$(g grp_max_probe_lifetime),$(g grp_growths),$(g grp_rehash_groups),$(g grp_rehash_probes),OK"
     done
 }
 
