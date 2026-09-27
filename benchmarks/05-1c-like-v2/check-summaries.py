@@ -121,7 +121,7 @@ if len(ctrl) == 2:
         print(f'  {arm:9s} n={len(v)} groups={v[0][2]} cap={v[0][3]} growths={v[0][4]} '
               f'agg med={med(agg):.1f} min={min(agg):.1f} max={max(agg):.1f} '
               f'rehash med={med([float(r[6]) for r in v]):.2f} '
-              f'probe cur/life={v[0][7]}/{v[0][8]}')
+              f'probe cur/life={v[0][8]}/{v[0][9]}')
     nat = [float(r[5]) for r in ctrl['natural']]
     pre = [float(r[5]) for r in ctrl['presized']]
     diff = [a - b for a, b in zip(nat, pre)]
@@ -132,9 +132,21 @@ if len(ctrl) == 2:
     print(f'  reported rehash_ms (natural): {med([float(r[6]) for r in ctrl["natural"]]):.2f}')
     if ctrl['natural'][0][3] != ctrl['presized'][0][3]:
         problems.append('rehash control: the two arms did not end at the same capacity')
-    if ctrl['natural'][0][7] != ctrl['presized'][0][7]:
+    if ctrl['natural'][0][8] != ctrl['presized'][0][8]:
         problems.append('rehash control: the two arms did not end with the same '
                         'current probe mark, so the final tables differ')
+    # The write-up quotes the pre-sized arm's probe rate as the answering
+    # table's figure, so it has to be re-derivable from here.
+    pre_plk = med([float(r[7]) for r in ctrl['presized']])
+    nat_plk = med([float(r[7]) for r in ctrl['natural']])
+    print(f'  probes_per_lookup: pre-sized {pre_plk:.4f} (README quotes 1.205), '
+          f'natural {nat_plk:.4f}')
+    if abs(pre_plk - 1.205) > 0.001:
+        problems.append(f'rehash control: pre-sized probes_per_lookup {pre_plk:.4f} '
+                        f'is not the 1.205 the README quotes')
+    if not pre_plk < nat_plk:
+        problems.append('rehash control: the pre-sized arm should probe less per '
+                        'lookup than the arm that grew into the same table')
 else:
     problems.append('rehash control file does not hold exactly two arms')
 

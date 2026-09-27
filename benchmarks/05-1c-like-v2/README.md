@@ -1417,8 +1417,10 @@ measured points, probe cost is flat from 10 240 to 147 456 groups, and the
 last successful cardinality is **147 456 groups — 12x the old ceiling**, which
 is where the *dimension* hashes run out, not the group table.
 
-The part that still grows is the rehash: at 147 456 groups it is 26.2 ms of a
-77.2 ms aggregate, and a paired control confirms it.
+The part that still grows is the rehash: at 147 456 groups the ladder reports
+26.2 ms of a 77.2 ms aggregate, and a paired control run separately confirms
+the accounting (18.3 ms reported against a measured 16.4 ms difference on a
+faster hour of the same day).
 
 ## What changed, and what deliberately did not
 
@@ -1593,9 +1595,10 @@ reset, reported as though it described the grown table.
 capacities before each growth. It is therefore a figure about the *policy*, not
 about the table that answered the query. The final-table figure comes from the
 pre-sized control below, which does all its lookups at capacity 524 288:
-1.2048 against the grown table's pooled 1.2842. Splitting the counter is the
-obvious follow-up and was not done here, since the control already gives the
-number.
+**1.2048** against the grown table's pooled **1.2842**. Both are recorded in
+`raw/hash-growth/2026-09-27-rehash-control.txt` and asserted by
+`check-summaries.py`. Splitting the counter itself is the obvious follow-up and
+was not done here, since the control already measures the number.
 
 So the story is better than the single number allowed:
 
@@ -1642,14 +1645,24 @@ so both arms end with the **identical** final table — same capacity, same
 only in whether they got there by doubling. The arms alternate inside one
 connection, 10 pairs:
 
-| arm | growths | aggregate ms | reported rehash_ms |
-|---|---|---|---|
-| natural, 16 384 → 524 288 | 5 | 82.0 | 26.96 |
-| pre-sized to 524 288 | 0 | 54.4 | 0.00 |
+| arm | growths | aggregate ms | reported rehash_ms | probes/lookup |
+|---|---|---|---|---|
+| natural, 16 384 → 524 288 | 5 | 47.7 | 18.26 | 1.2842 |
+| pre-sized to 524 288 | 0 | 32.1 | 0.00 | 1.2048 |
 
-Paired difference **+23.1 ms, 95% CI [+16.9, +29.4]**, natural slower in 10/10
-pairs. The counter says 27.0 ms; the control measures 23.1 ms with a CI that
+Paired difference **+16.4 ms, 95% CI [+9.8, +23.0]**, natural slower in 9/10
+pairs. The counter says 18.3 ms; the control measures 16.4 ms with a CI that
 contains it. **The rehash accounting is independently confirmed.**
+
+Two cautions about this table. The control was run separately from the ladder,
+and this host moves even within a day: the ladder's 147 456-group cell reports
+26.21 ms of rehash where the control's natural arm reports 18.26 ms for the
+same configuration. So the comparison is the control's own two arms against
+each other, paired inside one connection — not the control against the ladder.
+And the difference is everything about starting at 16 384, which is the rehash
+plus five allocate-and-zero passes, not rehash in isolation; that errs
+conservative, since the natural arm also gets a cache-locality advantage while
+the table is small, so it cannot inflate `rehash_ms`.
 
 Pre-sizing is not a proposal — section 27 forbids sizing from a known
 cardinality precisely because it hides what is being measured. It is used here
@@ -1726,8 +1739,9 @@ The old answer was "12 288 groups, because `#define`". The measured answer is:
 > In-memory aggregation now scales to 147 456 groups at 16 MB with probe cost
 > flat and load bounded at 0.5. The first genuine boundary is no longer the
 > group table — it is the dimension hashes, at 192 and 768 keys. The first
-> genuine *cost* is rehash, now independently measured at 23 ms of an 82 ms
-> aggregate at the top of the range.
+> genuine *cost* is rehash, which the ladder puts at a third of aggregate time
+> at the top of the range and which a paired control independently confirms
+> rather than leaving to a counter.
 
 The evidence points at **A and C together, in that order**:
 

@@ -41,7 +41,7 @@ GUC="SET work_mem='64MB'; SET enable_hashjoin=on; SET jit=off;
 "${PSQL[@]}" -c "SELECT xpe_set_cardinality_wide(768)" >/dev/null
 "${PSQL[@]}" -c "SELECT zlfs_build_zone('reg2_card2','1,2,3,4,5',1,12)" >/dev/null 2>&1 || true
 
-echo "# arm,pair,groups,capacity,growths,agg_ms,rehash_ms,max_probe_current,max_probe_lifetime"
+echo "# arm,pair,groups,capacity,growths,agg_ms,rehash_ms,probes_per_lookup,max_probe_current,max_probe_lifetime"
 
 one() {   # one <policy_sql> <arm> <pair>
     local line
@@ -49,7 +49,10 @@ one() {   # one <policy_sql> <arm> <pair>
              SELECT count(*) FROM xpb_v2_register_report(1,12,'card2-zlfs')" 2>&1 \
            | grep -v '^WARNING' | sed -n 's/^NOTICE:  v2_register_report //p')
     g() { sed -n "s/.*[ =]$1=\([0-9.]*\).*/\1/p" <<<"$line"; }
-    echo "$2,$3,$(g groups),$(g grp_cap),$(g grp_growths),$(g agg),$(g grp_rehash_ms),$(g grp_max_probe_current),$(g grp_max_probe_lifetime)"
+    # probes_per_lookup is emitted because the write-up quotes the pre-sized
+    # arm's rate as the answering table's figure: a number the README states
+    # has to be re-derivable from an artefact, not just observed once.
+    echo "$2,$3,$(g groups),$(g grp_cap),$(g grp_growths),$(g agg),$(g grp_rehash_ms),$(g grp_probes_per_lookup),$(g grp_max_probe_current),$(g grp_max_probe_lifetime)"
 }
 
 # warm-up pair, discarded
