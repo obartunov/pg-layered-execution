@@ -21,10 +21,16 @@
   `xpb_v2_report.c`: the group hash and both dimension hashes grow at load 0.5
   by doubling. `V2_GRP_CAP`, `V2_DIM1_CAP` and `V2_DIM2_CAP` are initial
   capacities, not ceilings; the remaining ceiling is `MaxAllocSize`. Every
-  other table, including the dimension hashes in `xpb_batch_hashjoin.c`,
-  `xpb_batch_partition.c` and `xpb_typed_pipeline.c`, is still fixed and
-  errors at 3/4. Nothing spills anywhere. See
-  `docs/TYPED_BATCH_CONTRACT.md` for the per-table table.
+  other table is still fixed, most of them erroring at 3/4 load before the
+  insert -- including the dimension hashes in `xpb_batch_hashjoin.c`,
+  `xpb_batch_partition.c` and `xpb_typed_pipeline.c`. Nothing spills anywhere.
+  See `docs/TYPED_BATCH_CONTRACT.md` for the per-table list; three rows there
+  do not follow the 3/4 rule and are called out separately
+- `xpb_groupagg2.c`'s group hash takes its capacity from the planner
+  (`custom_private[6]`, default 16384), not a `#define`, and has no pre-insert
+  guard; a single post-scan check errors above 0.95 load. Sound against row
+  loss -- a full table reports load 1.0 -- but coarser than every other table,
+  and the only one reachable through a planner hook
 - Two fixed tables have no capacity guard at all and silently drop rows when
   full (`xpb_projection.c` `AGG_CAP`, `xpb_columnar_pipeline.c` `WHASH_CAP`) --
   a wrong answer rather than an error. Reachability unproven; tracked in

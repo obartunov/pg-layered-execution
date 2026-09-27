@@ -278,6 +278,7 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   | `xpb_projection.c` aggregate | `AGG_CAP` 16384 | fixed, **no guard -- drops rows when full** |
   | `xpb_columnar_pipeline.c` window | `WHASH_CAP` 131072 | fixed, **no guard -- drops rows when full** |
   | `xpb_zlfs.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
+  | `xpb_groupagg2.c` group | `hash_cap_used`, planner-supplied, default 16384 | fixed, **no pre-insert guard**; post-scan `ERROR` above 0.95 load |
 
   The three growing tables are all reached through `xpb_v2_register_report`. So
   "aggregation scales to 147 456 groups", and the dimension cardinalities
@@ -287,6 +288,15 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
 
   The growing tables raise `ERROR` only at a real allocation boundary
   (`MaxAllocSize`, or a slot count that would overflow), not at a load factor.
+
+  `xpb_groupagg2.c` is the one row whose capacity is not a `#define` at all:
+  it arrives from `custom_private[6]`, so a planner underestimate is what fills
+  the table. Its insert loops carry no load check; the protection is a single
+  post-scan test, and it works only because a lost row cannot raise `ngroups`
+  past `hash_cap` — a full table reports load 1.0 and errors. That is a coarser
+  guarantee than every other row here, and it is the only one reachable through
+  a planner hook (`set_rel_pathlist_hook` / `create_upper_paths_hook`, GUC
+  `xpb_groupagg2_enabled`) rather than an explicit benchmark function.
 
   The two rows marked **no guard** are not merely capped: `agg_insert()` in
   `xpb_projection.c` and the window-hash insert in `xpb_columnar_pipeline.c`

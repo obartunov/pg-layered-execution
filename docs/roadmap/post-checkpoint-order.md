@@ -6,7 +6,10 @@ architectural). Captured as an incremental git bundle over `origin/main`
 (`3eb21db`); `origin` itself is untouched at the time of writing.
 
 ```
-Dimension Hash Growth v1        housekeeping, removes a confound
+Dimension Hash Growth v1        DONE, ccb897c -- housekeeping, removed a confound
+        |
+Fixed Hash Silent-Drop          correctness gate, short
+Reachability
         |
 05-F Heap Block-Range Pruning   research milestone
         |
@@ -15,15 +18,37 @@ Skew
 10M scale
 ```
 
+Revised by @obe after the Dimension Hash Growth review: the reachability
+question now precedes 05-F, because a potential silent wrong answer outranks
+the next benchmark.
+
 ## Why this order
 
-**Dimension Hash Growth v1 comes first, and it is not a research milestone.**
-`reg2_card2` reaches 147 456 groups only by holding both dimension hashes at
+**Dimension Hash Growth v1 came first, and it was not a research milestone.**
+`reg2_card2` reached 147 456 groups only by holding both dimension hashes at
 their 3/4 load limit — 192 of 256 slots and 768 of 1024. Skew attacks load
 factor. Run skew against saturated dimension tables and a regression cannot be
-attributed: group hash and dimension hash degrade together. The fix is the same
+attributed: group hash and dimension hash degrade together. The fix was the same
 single-variable change already made for the group hash, applied to the
-structure that is now binding. Same policy, same hash, same probing, no spill.
+structure that had become binding. Same policy, same hash, same probing, no
+spill. Done: both tables now grow at load 0.5 by doubling, measured to 4x the
+old limit with join cost showing no resolved change.
+
+**Fixed Hash Silent-Drop Reachability comes next, and it is a correctness gate,
+not a benchmark.** `docs/roadmap/fixed-hash-silent-drop.md` has the detail. The
+single question it must answer:
+
+> can any benchmark or shipped path in this repository fill
+> `xpb_projection.c`'s `AGG_CAP` or `xpb_columnar_pipeline.c`'s `WHASH_CAP` to
+> capacity?
+
+Reproducer and reachability first, not a fix. If reachable, fix and revisit the
+affected published benchmark results — the count of shipped `reg_buh` shapes has
+to happen before the fix, because afterwards the old behaviour is unobservable.
+If unreachable on current shapes, document the boundary so the next person to
+relax a type gate or grow a dataset sees it. `xpb_groupagg2.c` is carried in the
+same task as a third, weaker case: no pre-insert guard, a post-scan check at
+0.95, and a capacity that comes from a planner estimate rather than a constant.
 
 **05-F Heap Block-Range Pruning is the research milestone, and it comes before
 skew.** The series produced two pruning granularities and left the middle one
@@ -48,13 +73,13 @@ is the strongest one the series has raised:
 1 / 5 / 9). Block pruning and tuple rejection depend on it differently, and
 05-D's 1.4–1.8x is its best case, with the predicate at physical attnum 1.
 
-**Skew after that**, because every probe figure in the series rests on a
+**Skew after 05-F**, because every probe figure in the series rests on a
 uniform distribution, and probe stability is exactly what a hot key attacks.
 Two hash populations will be in scope by then, both with bounded load, which is
 what makes the result attributable.
 
-**10M scale last.** It needs the dimension caps raised first, which is step 1
-anyway.
+**10M scale last.** It needed the dimension caps raised first, which step 1
+did.
 
 ## Carried separately, not folded into any of the above
 

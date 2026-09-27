@@ -16,9 +16,12 @@
 # source_ms is ~0 and what remains is operator behaviour. The heap fixed-offset
 # arm is carried alongside as the same aggregate under a real source.
 #
-# The aggregation hash table is static: 16384 slots, 3/4 load limit, linear
-# probing, no growth. The ladder therefore ends in a clean ERROR, and that
-# boundary is a result, not a failure of the run.
+# When 05-E was measured the aggregation hash table was static: 16384 slots,
+# 3/4 load limit, linear probing, no growth, so the ladder ended in a clean
+# ERROR and that boundary was the result. Hash Aggregate Growth v1 removed it
+# -- the table now starts at 16384 and doubles at half full -- so this runner
+# no longer searches for a failure. The published 05-E numbers above were taken
+# against the static table and are not reproducible on the current build.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

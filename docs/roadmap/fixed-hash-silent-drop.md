@@ -22,17 +22,28 @@ xpb_projection.c:51-65        agg_insert(), AGG_CAP 16384, key (k1,k2)
     }
     /* falls through -- row silently discarded */
 
-xpb_columnar_pipeline.c:105-120   window hash, WHASH_CAP 131072, key (k1,k2,k3)
+xpb_columnar_pipeline.c:107-121   window hash, WHASH_CAP 131072, key (k1,k2,k3)
     same shape; on fall-through ngroups is not incremented either
 ```
 
 This is the same defect class that was found and fixed in `xpb_v2_report.c`'s
 dimension hashes: not an error, not a partial result flagged as partial, but a
-sum that is quietly too small. The other seven fixed tables in the extension
+sum that is quietly too small. Ten of the extension's other fixed tables
 (`xpb_typed_pipeline.c`, `xpb_batch_groupagg.c`, `xpb_batch_hashjoin.c`,
-`xpb_batch_partition.c`, `xpb_zlfs.c`) all raise at 3/4 load before the probe
-loop, which both prevents the drop and guarantees the loop terminates on a free
-slot. These two have no such guard.
+`xpb_batch_partition.c`, `xpb_zlfs.c`) raise at 3/4 load before the probe loop,
+which both prevents the drop and guarantees the loop terminates on a free slot.
+These two have no such guard.
+
+`xpb_groupagg2.c` is a third case and belongs in the same task, but it is not
+the same defect. Its insert loops have no load check either, yet a single
+post-scan test errors above 0.95 load, and that is sound against row loss: a
+lost row cannot raise `ngroups` past `hash_cap`, so a full table reports load
+1.0 and raises. What makes it worth carrying here is that its capacity comes
+from the planner (`custom_private[6]`, default 16384) rather than a constant,
+so the question "can this table fill" has a different shape -- it is a question
+about estimates, not about dataset cardinality -- and it is the only one of the
+three reachable through a planner hook rather than an explicit benchmark
+function.
 
 Because linear probing here scans all slots, a drop requires the table to be
 **completely** full, i.e. 16384 or 131072 distinct keys respectively -- not
