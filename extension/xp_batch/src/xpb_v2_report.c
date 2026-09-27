@@ -27,8 +27,15 @@
  * therefore leave nothing to compare across paths, which is the whole point
  * of the exercise.  The numeric columns stay in the row -- they are what puts
  * the heap arm on the deform path -- and are measured separately on heap
- * alone.  int8 sums here are exact, so sum(debit) - sum(credit) equals
- * sum(debit - credit) group by group, which the gate checks.
+ * alone.
+ *
+ * The int8 turnover sums are accumulated with overflow checks and raise
+ * "bigint out of range" exactly as PostgreSQL's own int8 arithmetic does.
+ * Note what the benchmark gate can and cannot see: sum(debit) - sum(credit)
+ * = sum(debit - credit) is a useful invariant, but it is NOT an overflow
+ * detector -- under two's-complement wraparound both sides wrap identically
+ * and the identity still holds.  It held on a wrapped result before these
+ * checks existed, which is why the gate never noticed.
  */
 #include "postgres.h"
 #include "fmgr.h"
@@ -37,6 +44,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
+#include "common/int.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -329,8 +337,20 @@ v2_grp_upsert(V2GroupTable *t, int32 g1, int32 g2, int32 ck,
             if (g->company_group == g1 && g->account_group == g2 &&
                 g->company_key == ck)
             {
-                g->debit += dt;
-                g->credit += kt;
+                /*
+                 * Checked, not wrapped.  An unchecked += here returned a
+                 * silently negative turnover on inputs PostgreSQL refuses,
+                 * and signed overflow is undefined behaviour besides.  The
+                 * message matches PostgreSQL's own int8 arithmetic so a
+                 * caller cannot tell the two apart.
+                 */
+                if (pg_add_s64_overflow(g->debit, dt, &g->debit) ||
+                    pg_add_s64_overflow(g->credit, kt, &g->credit))
+                    ereport(ERROR,
+                            (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                             errmsg("bigint out of range"),
+                             errdetail("Group (%d, %d, %d) overflowed an int8 turnover sum.",
+                                       g1, g2, ck)));
                 t->hits++;
                 t->probes += probe + 1;
                 if (probe + 1 > t->max_probe)
@@ -940,9 +960,26 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             vals[2] = Int32GetDatum(grp.slots[i].company_key);
             vals[3] = Int64GetDatum(grp.slots[i].debit);
             vals[4] = Int64GetDatum(grp.slots[i].credit);
-            /* net is derived at emit time from two exact int64 sums, not by a
-             * second pass over the data */
-            vals[5] = Int64GetDatum(grp.slots[i].debit - grp.slots[i].credit);
+            /*
+             * net is derived at emit time from the two accumulated sums
+             * rather than by a second pass over the data.  Checked for the
+             * same reason they are: debit and credit can each be in range
+             * while their difference is not.
+             */
+            {
+                int64   net;
+
+                if (pg_sub_s64_overflow(grp.slots[i].debit,
+                                        grp.slots[i].credit, &net))
+                    ereport(ERROR,
+                            (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                             errmsg("bigint out of range"),
+                             errdetail("Group (%d, %d, %d) overflowed sum(debit) - sum(credit).",
+                                       grp.slots[i].company_group,
+                                       grp.slots[i].account_group,
+                                       grp.slots[i].company_key)));
+                vals[5] = Int64GetDatum(net);
+            }
             vals[6] = Float8GetDatum(total_ms);
             tuplestore_putvalues(store, rsi->setDesc, vals, nulls);
         }

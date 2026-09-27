@@ -978,6 +978,58 @@ SQL
         fail=1
     fi
 
+    # ---- int8 turnover overflow ----------------------------------------
+    # The accumulator used to wrap: on inputs PostgreSQL refuses outright it
+    # returned a negative turnover with no error at all. Three things are
+    # asserted together, because the contract is "indistinguishable from
+    # PostgreSQL's own int8 arithmetic":
+    #
+    #   PostgreSQL sum(int8)      -> exact numeric, a correct large value
+    #   explicit cast to int8     -> bigint out of range
+    #   xp_batch accumulator      -> bigint out of range, never a wrapped value
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE ovf_reg (period int4 NOT NULL, company_key int4 NOT NULL,
+    account_key int8 NOT NULL, debit_cents int8 NOT NULL, credit_cents int8 NOT NULL,
+    quantity int8, debit numeric(18,2), credit numeric(18,2) NOT NULL, comment text);
+INSERT INTO ovf_reg SELECT 1, 1, 1, 4000000000000000000, 1, NULL, NULL, 1.00, NULL
+FROM generate_series(1, 4) g;
+SQL
+    pg_exact=$("${PSQL[@]}" -c "SELECT sum(debit_cents) FROM ovf_reg")
+    pg_cast=$("${PSQL[@]}" -c "SELECT sum(debit_cents)::int8 FROM ovf_reg" 2>&1)
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+ALTER TABLE reg2_card RENAME TO reg2_card_keep;
+ALTER TABLE ovf_reg RENAME TO reg2_card;
+SQL
+    xp_out=$("${PSQL[@]}" -c "$GUCS SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1)
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+ALTER TABLE reg2_card RENAME TO ovf_reg;
+ALTER TABLE reg2_card_keep RENAME TO reg2_card;
+SQL
+    if [ "$pg_exact" = "16000000000000000000" ] &&
+       grep -q "bigint out of range" <<<"$pg_cast" &&
+       grep -q "bigint out of range" <<<"$xp_out" &&
+       ! grep -q -- "-2446744073709551616" <<<"$xp_out"; then
+        echo "  PASS  int8 turnover overflow raises like PostgreSQL, never wraps"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  overflow: pg_exact=$pg_exact pg_cast=${pg_cast:0:40} xp=$(tr '\n' ' ' <<<"$xp_out" | cut -c1-70)"
+        fail=1
+    fi
+
+    # The net identity is an invariant, NOT an overflow detector, and this is
+    # the regression that keeps that from being forgotten again. These are the
+    # exact values the unchecked accumulator produced for the rows above: both
+    # sides of the identity wrapped identically, so the benchmark gate passed
+    # a wrong answer. Any future gate must not rely on it to catch overflow.
+    idh=$("${PSQL[@]}" -c "SELECT (-2446744073709551616::int8) - 4::int8 = -2446744073709551620::int8")
+    if [ "$idh" = "t" ]; then
+        echo "  PASS  net identity holds on wrapped values, so it cannot detect overflow"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  the wraparound identity regression no longer demonstrates its point ($idh)"
+        fail=1
+    fi
+
     # A dimension larger than its hash must be REFUSED, not silently truncated.
     # Before this milestone the probe loop ran off the end of a full dimension
     # table and dropped the row, after which every fact row referencing that
