@@ -1850,3 +1850,235 @@ Not B: memory is 16 MB at 147K groups against PostgreSQL's 86 MB for two
 thirds as many. Not D: probe behaviour did not degrade. Not E (10M rows) yet —
 the dimension caps would have to be raised first, which is the same
 conversation as C.
+
+---
+
+# Dimension Hash Growth v1
+
+Hash Aggregate Growth v1 ended by naming its own successor boundary: 147 456
+groups was reached only by holding both dimension hashes at their 3/4 load
+limit — 192 of 256 slots and 768 of 1024. Skew attacks load factor. Run skew
+against saturated dimension tables and a regression is not attributable,
+because the group hash and the dimension hashes would degrade together.
+
+> Give both dimension hashes the same controlled growth the group hash has, and
+> measure that the saturation regime is gone.
+
+**This is housekeeping, not a research milestone.** It removes a confound. The
+policy is the same one already preregistered for the group hash — grow when the
+table is half full, double, rehash, no spill — reused deliberately rather than
+chosen again, so that nothing in this milestone is a new tuning decision.
+
+## Read the timings within this section only
+
+Every timing here was taken on 2026-09-27, in the same session as the Hash
+Aggregate Growth numbers above. 05-A through 05-E were taken on 2026-09-24 and
+are not comparable. The host's drift is documented above: 1.6x on unchanged
+code between those two dates.
+
+The two comparisons that carry weight are both internal to this section: the
+ladder, where only dimension cardinality varies, and the paired pre-sized
+control, where both arms alternate inside one connection.
+
+## Answer
+
+**Outcome A — the boundary moved, and nothing downstream noticed.**
+
+Dimension cardinality reaches **4x the old fixed limit** (192 → 768 companies,
+768 → 3072 accounts) with load never above 0.5, join probe cost flat across a
+12x change in dimension size, and rehash below a quarter of a millisecond at the
+widest point. The old ceiling was a `#define`, not a resource, exactly as 05-E
+found for the group table.
+
+## What changed, and what deliberately did not
+
+| | |
+|---|---|
+| dim1 capacity | 256 fixed → 256 **initial**, doubling |
+| dim2 capacity | 1024 fixed → 1024 **initial**, doubling |
+| limit | `ERROR` at 3/4 load → grow at 1/2 load |
+| remaining limit | `MaxAllocSize`, or a slot count that would overflow int |
+| hash function | unchanged, `(uint32) key * 2654435761u` |
+| probing | unchanged, open-addressed linear |
+| slot layout | unchanged (`V2Dim1` 12 bytes, `V2Dim2` 24 bytes) |
+| join semantics | unchanged |
+| group hash | unchanged — already grown in the previous milestone |
+| everything else | unchanged; no spill, no planner change, no new GUC |
+
+Three tables in `xpb_v2_report.c` now grow and nothing else in the extension
+does. `docs/TYPED_BATCH_CONTRACT.md` carries the per-table list, including two
+fixed tables found during this update that have no capacity guard at all.
+
+## Correctness
+
+A rehash that lost a dimension entry would not raise an error. Every fact row
+referencing that key would simply fail the join and vanish — a **wrong answer**,
+not a failure. So the gate is per-group equality against PostgreSQL at every
+ladder point, not grand totals:
+
+```
+point 1  batch  <md5>  groups=12288      point 1  sql  <md5>  groups=12288
+...
+NOTICE:  dim growth gate PASS: batch and PostgreSQL agree per group at every
+         dimension cardinality
+```
+
+The rehash reinserts with the **new** mask rather than copying to the same slot
+index; a slot index is a function of capacity, so a `memcpy` would leave entries
+where the probe sequence for their key can no longer reach them. That is the
+specific bug the per-group gate is built to catch.
+
+`extension/xp_batch/test/contract_tests.sh` carries 15 further cases (105
+total), including the one that matters most here: **a collision case**. The
+ladder below uses sequential keys, which this hash maps collision-free at any
+load, so the ladder cannot exercise collision behaviour at all — see the
+limitation below. The contract test uses keys of stride 256 so that keys
+differing by a multiple of the capacity collide exactly, and asserts that the
+high-water probe mark resets on growth.
+
+## Results (section 34)
+
+Group cardinality pinned at 12 288, input rows 1 032 192, fixed-offset heap
+source, every key present at every point. 5 passes x 5 runs = 25 measurements
+per point; medians.
+
+| comp | acct | groups | d1 cap | d1 ent | d1 load | d1 grow | d2 cap | d2 ent | d2 load | d2 grow |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 256 | 12 288 | 256 | 64 | 0.2500 | 0 | 1024 | 256 | 0.2500 | 0 |
+| 128 | 512 | 12 288 | 256 | 128 | 0.5000 | 0 | 1024 | 512 | 0.5000 | 0 |
+| 129 | 513 | 12 255 | 512 | 129 | 0.2520 | 1 | 2048 | 513 | 0.2505 | 1 |
+| 192 | 768 | 12 288 | 512 | 192 | 0.3750 | 1 | 2048 | 768 | 0.3750 | 1 |
+| 384 | 1536 | 12 288 | 1024 | 384 | 0.3750 | 2 | 4096 | 1536 | 0.3750 | 2 |
+| 768 | 3072 | 12 288 | 2048 | 768 | 0.3750 | 3 | 8192 | 3072 | 0.3750 | 3 |
+
+Point 2 is the threshold itself: 128 of 256 and 512 of 1024, load exactly
+0.5000, still no growth. Point 3 is one key past it and each table has grown
+once. The 12 255 groups at point 3 is arithmetic, not loss: 129 x 95 = 12 255,
+the closest the shape gets to 12 288 with 129 companies.
+
+Timings, same points, milliseconds:
+
+| comp | acct | total | source | d1 build | d2 build | join1 | join2 | aggregate | d1 rehash | d2 rehash |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 256 | 62.8 | 40.9 | 0.150 | 0.032 | 3.4 | 3.5 | 13.4 | 0.000 | 0.000 |
+| 128 | 512 | 60.3 | 39.1 | 0.151 | 0.046 | 3.2 | 3.4 | 13.1 | 0.000 | 0.000 |
+| 129 | 513 | 60.7 | 38.9 | 0.153 | 0.072 | 3.3 | 3.4 | 13.5 | 0.004 | 0.023 |
+| 192 | 768 | 64.3 | 41.0 | 0.162 | 0.098 | 3.3 | 3.6 | 14.4 | 0.004 | 0.025 |
+| 384 | 1536 | 63.2 | 40.1 | 0.177 | 0.181 | 3.3 | 3.5 | 14.7 | 0.010 | 0.070 |
+| 768 | 3072 | 61.5 | 38.7 | 0.242 | 0.396 | 3.3 | 3.6 | 14.0 | 0.023 | 0.175 |
+
+What the timings say, and do not say:
+
+* **Join cost is flat.** join1 3.2–3.4 ms and join2 3.4–3.6 ms across a 12x
+  change in dimension cardinality and a 8x change in dimension table bytes.
+  The spread is smaller than the 4.5–8.3% measurement spikes documented for
+  this host, so the honest reading is "no effect resolved", not "a small cost".
+* **Rehash is negligible here**, unlike in the group hash. 0.023 ms and
+  0.175 ms at the widest point, against a 61.5 ms total: the dimension tables
+  hold thousands of entries where the group table held a hundred thousand.
+* **The total does not move.** 60.3–64.3 ms with no trend against dimension
+  cardinality. Total is dominated by the 38.7–41.0 ms source phase, which this
+  milestone does not touch.
+* **Nothing here is a speed claim.** No arm was made faster. The result is that
+  a boundary moved without a cost appearing.
+
+## Proof that growth is what happened (section 35)
+
+Four independent lines, none of which relies on the growth counter alone.
+
+**1. The capacities are the doubling sequence from the declared initial
+capacity.** Halving each final capacity once per recorded growth returns 256 and
+1024 — `V2_DIM1_CAP` and `V2_DIM2_CAP` — at every point. Checked mechanically by
+`check-summaries.py`, so a growth that was not a doubling would fail the build.
+
+**2. The load bound holds, by construction and in the data.** An entry is only
+added to a table strictly less than half full, so occupancy reaches at most
+`capacity/2`. Measured maximum load is 0.5000, never above. The growth decision
+reads only `entries` and `capacity`, never a probe count, so it is independent
+of probe order and of the key distribution.
+
+**3. The byte accounting closes, and no predecessor table survives.** Reported
+bytes equal `capacity x sizeof(slot)` at every point, and peak equals
+`current + current/2` at every growth — the two tables being briefly live
+together during a rehash. Independent leak evidence comes from
+`MemoryContextMemAllocated` on each table's own context, with AllocSet's
+behaviour accounted for: an allocation above the 8192-byte chunk limit gets a
+block of its own that *is* returned to malloc on `pfree`, so a surviving
+predecessor of that size would show up. At the four points where the predecessor
+was above that limit, a leak would have been caught and was not. At dim1's two
+sub-limit points it could not have been — AllocSet keeps those chunks on a
+freelist by design and the block stays — and there the per-group checksum gate is
+the evidence instead. `check-summaries.py` encodes exactly this and its blind
+spot; every assertion in it was mutation-tested to confirm it fires.
+
+**4. A paired pre-sized control, 50 pairs alternating in one connection.** The
+test hook pre-sizes the tables to 2048 and 8192 so that both arms end with the
+same entries, the same final capacities and the same result, differing only in
+whether they doubled their way there.
+
+```
+                              natural      pre-sized     delta
+dim1 + dim2 build (median)     0.319 ms      0.176 ms    +0.143 ms
+reported rehash, natural arm   0.136 ms            --
+growths                        3 + 3         0 + 0
+final capacities               2048 / 8192   2048 / 8192
+```
+
+Per pair, the extra build time in the natural arm is +0.130 ms median and the
+rehash it reports is 0.136 ms median, leaving **−0.003 ms unaccounted** (range
+−0.190 to +0.256, straddling zero). So the reported rehash counter fully
+explains the cost of having grown; there is no additional steady-state penalty
+at build-phase granularity.
+
+The end-to-end total cannot resolve it and is not used to: the paired total
+delta is +0.15 ms median, −1.13 ms mean, spread −23.9 to +22.1 ms, positive in
+27 of 50 pairs. A 0.14 ms effect is two orders of magnitude below that spread.
+The rehash cost is stated at the granularity that resolves it and at no other.
+
+## Limitations
+
+* **This ladder measures load factor and growth, not collision behaviour.**
+  Keys are sequential from 1, and an odd multiplicative hash maps sequential
+  keys to distinct slots at any load, so `max_probe` is 1 at every point in the
+  table above and probes-per-lookup is exactly 1.0000. That is a property of the
+  dataset, not a result. Collision behaviour is exercised only in
+  `contract_tests.sh`, with stride-256 keys, and is the subject of the skew
+  milestone.
+* **The fact table is regenerated per point.** Unlike 05-E, which varied a
+  dimension payload and left the fact table byte-identical, varying the number
+  of distinct dimension *keys* requires the fact rows to reference them or they
+  drop out of the join. Row count (1 032 192), group count (12 288), period
+  range and fact table layout are all held constant instead; the reasoning is in
+  the header of `schema-dim-cardinality.sql`.
+* **4x is where the ladder stopped, not where the mechanism stops.** 3072
+  accounts is 8192 slots and 196 608 bytes. Nothing was measured beyond it and
+  no claim is made about it.
+* **Pre-sizing is diagnostic only.** `xpb_dim_test_policy` exists for the
+  control and the contract tests; the production path always starts at the
+  declared initial capacity. Being process-local statics, they must be set in
+  the same connection as the report.
+* **Still no spill.** `MaxAllocSize` is now the boundary for all three tables.
+  A workload past it gets an `ERROR`, which is a development guard and not a
+  final production policy.
+* **Dimension hashes elsewhere are untouched.** `xpb_batch_hashjoin.c`,
+  `xpb_batch_partition.c` and `xpb_typed_pipeline.c` still have fixed dimension
+  tables that error at 3/4 load. This milestone changed the measured report path
+  only.
+
+## The decision after this milestone
+
+The confound is gone, which was the whole point:
+
+> Both dimension hashes and the group hash now grow under one preregistered
+> policy with load bounded at 0.5. A skew result can now be attributed to the
+> distribution rather than to whichever table happened to be saturated.
+
+Next is **05-F Heap Block-Range Pruning**, the research milestone this series
+left a hole in — 05-D concluded the residual gap to pgColumnar was scan
+granularity and then every milestone since went downstream instead. Skew follows
+it, and 10M scale last. The reasoning is in
+`docs/roadmap/post-checkpoint-order.md`.
+
+Two correctness questions are carried separately and must not be folded into
+either: `docs/roadmap/groupagg2-int64-overflow.md` and
+`docs/roadmap/fixed-hash-silent-drop.md`.

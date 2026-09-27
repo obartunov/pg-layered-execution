@@ -191,6 +191,179 @@ for (arm, g), v in sorted(e.items(), key=lambda x: (x[0][0], int(x[0][1] or 0)))
           f'maxprobe={(v["max_probe_lifetime"] or v["max_probe"]):>3s} '
           f'ns/group={v["agg_ns_per_group"]:>8s}')
 
+# ------------------------------------------------- dimension growth --------
+# Slot sizes and initial capacities as declared in xpb_v2_report.c
+# (sizeof(V2Dim1)=12, sizeof(V2Dim2)=24, V2_DIM1_CAP=256, V2_DIM2_CAP=1024).
+DIM_ELEM = {'dim1': 12, 'dim2': 24}
+DIM_INIT_CAP = {'dim1': 256, 'dim2': 1024}
+
+print('\n=== Dimension Hash Growth v1 (from raw/dim-growth/) ===')
+drows = raw_rows('raw/dim-growth/2026-09-27-dimgrowth-pass*.txt', 39,
+                 {str(n) for n in (64, 128, 129, 192, 384, 768)})
+if not drows:
+    problems.append('no dimension-growth pass files found')
+else:
+    print(f'passes={len({p for p, _ in drows})}')
+    dd = collections.defaultdict(list)
+    for _, f in drows:
+        dd[(int(f[0]), int(f[1]), int(f[2]))].append(f)
+    print(f'  {"comp":>5s}{"acct":>6s}{"groups":>8s}{"d1cap":>7s}{"d1e":>6s}{"d1ld":>8s}'
+          f'{"d1g":>4s}{"d2cap":>7s}{"d2e":>6s}{"d2ld":>8s}{"d2g":>4s}'
+          f'{"join1":>7s}{"join2":>7s}{"n":>4s}')
+    for k in sorted(dd):
+        v = dd[k]
+        u = lambda i: v[0][i]
+        for col, name in ((14, 'dim1_cap'), (15, 'dim1_entries'), (16, 'dim1_load'),
+                          (17, 'dim1_growths'), (26, 'dim2_cap'), (27, 'dim2_entries'),
+                          (28, 'dim2_load'), (29, 'dim2_growths'), (4, 'groups')):
+            if len({r[col] for r in v}) != 1:
+                problems.append(f'dim point {k}: {name} varies across runs')
+        print(f'  {k[0]:>5d}{k[1]:>6d}{u(4):>8s}{u(14):>7s}{u(15):>6s}{float(u(16)):8.4f}'
+              f'{u(17):>4s}{u(26):>7s}{u(27):>6s}{float(u(28)):8.4f}{u(29):>4s}'
+              f'{med([float(r[10]) for r in v]):7.1f}{med([float(r[11]) for r in v]):7.1f}'
+              f'{len(v):>4d}')
+        # the policy invariant, and the arithmetic that must close
+        for cap, ent, load, gro, bts, pk, cxt, what in (
+                (14, 15, 16, 17, 23, 24, 25, 'dim1'), (26, 27, 28, 29, 35, 36, 37, 'dim2')):
+            c, e = int(u(cap)), int(u(ent))
+            if e > c // 2:
+                problems.append(f'dim point {k}: {what} holds {e} entries in {c} slots, '
+                                f'above the 0.5 growth policy')
+            if abs(float(u(load)) - e / c) > 5e-4:
+                problems.append(f'dim point {k}: {what} load {u(load)} != {e}/{c}')
+            # sizeof(V2Dim1) = {bool, int32, int32}       -> 12 on LP64
+            # sizeof(V2Dim2) = {bool, int64, int32}       -> 24 on LP64
+            # These are the struct layouts in xpb_v2_report.c, not fitted to the
+            # measurement: the reported byte count has to equal capacity times
+            # the slot size or one of the two is wrong.
+            elem = DIM_ELEM[what]
+            if int(u(bts)) != c * elem:
+                problems.append(f'dim point {k}: {what} bytes {u(bts)} != capacity*{elem}')
+            if int(u(gro)) and int(u(pk)) != int(u(bts)) + int(u(bts)) // 2:
+                problems.append(f'dim point {k}: {what} peak {u(pk)} != current+current/2')
+
+            # Independent leak evidence, with AllocSet's freelist accounted for.
+            #
+            # MemoryContextMemAllocated counts malloc'd blocks, not live chunks.
+            # An allocation ABOVE aset.c's ALLOC_CHUNK_LIMIT (8192) gets a block
+            # of its own and that block is returned to malloc on pfree, so a
+            # surviving predecessor of that size would show up here. An
+            # allocation AT OR BELOW the limit is served from a shared block and
+            # pfree only puts the chunk on a freelist -- the block stays. So the
+            # context legitimately exceeds the live table by the blocks holding
+            # every sub-limit generation this table passed through.
+            #
+            # That residue is bounded without reference to the measurement: the
+            # generations are the doubling sequence from the initial capacity,
+            # only those at or below 8192 bytes are retained, and each occupies
+            # at most twice its own size once block rounding is allowed for.
+            # Plus one keeper block of initBlockSize (ALLOCSET_DEFAULT_SIZES).
+            # Halving the final capacity once per recorded growth must land back
+            # on the declared initial capacity -- that is the "doubled every
+            # time" half of the policy, checked against a constant.
+            gen = int(u(cap)) >> int(u(gro))
+            if gen != DIM_INIT_CAP[what]:
+                problems.append(f'dim point {k}: {what} final cap {u(cap)} after '
+                                f'{u(gro)} growths implies initial {gen}, not '
+                                f'{DIM_INIT_CAP[what]} -- growth was not a pure doubling')
+            residue = 8192
+            while gen * elem <= 8192:
+                residue += 2 * gen * elem
+                gen *= 2
+            live = int(u(bts)) + (48 if int(u(bts)) > 8192 else 0)
+            if int(u(cxt)) > live + residue:
+                problems.append(f'dim point {k}: {what} context holds {u(cxt)} for a '
+                                f'{u(bts)} byte table, above {live + residue} '
+                                f'(live + retained sub-chunk-limit generations) '
+                                f'-- a predecessor may have survived')
+
+    # --- the timings the README section quotes, and the flatness claim -------
+    print(f'  {"comp":>5s}{"total":>8s}{"source":>8s}{"d1build":>9s}{"d2build":>9s}'
+          f'{"join1":>7s}{"join2":>7s}{"agg":>7s}{"d1reh":>8s}{"d2reh":>8s}')
+    j1s, j2s, tots = [], [], []
+    for k in sorted(dd):
+        v = dd[k]
+        q = lambda i: med([float(r[i]) for r in v])
+        j1s.append(q(10)); j2s.append(q(11)); tots.append(q(6))
+        print(f'  {k[0]:>5d}{q(6):8.1f}{q(7):8.1f}{q(8):9.3f}{q(9):9.3f}'
+              f'{q(10):7.1f}{q(11):7.1f}{q(12):7.1f}{q(19):8.3f}{q(31):8.3f}')
+    # "join probe cost flat across a 12x change": the spread has to be inside
+    # the 8.3% measurement-spike band documented for this host, or the word
+    # "flat" is not earned.
+    for name, xs in (('join1', j1s), ('join2', j2s)):
+        spread = (max(xs) - min(xs)) / med(xs)
+        print(f'  {name} spread across the ladder: {spread * 100:.1f}% of median')
+        if spread > 0.083:
+            problems.append(f'dim ladder: {name} varies by {spread * 100:.1f}% across the '
+                            f'ladder, beyond this host\'s 8.3% spike band -- '
+                            f'"flat" is not supported')
+    # "4x the old fixed limit": the old limit was 3/4 of 256 and of 1024.
+    top = dd[max(dd)]
+    for ent, old_limit, what in ((15, 256 * 3 // 4, 'dim1'), (27, 1024 * 3 // 4, 'dim2')):
+        got = int(top[0][ent])
+        if got != 4 * old_limit:
+            problems.append(f'dim ladder: {what} top point holds {got} entries, not 4x the '
+                            f'old {old_limit}-key limit -- the README\'s "4x" is wrong')
+
+    # ----------------------------- paired pre-sized control -----------------
+    print('\n=== dimension pre-sized control (paired, one connection) ===')
+    cpairs = collections.defaultdict(dict)
+    for path in sorted(glob.glob('raw/dim-growth/2026-09-27-dimgrowth-pass*.txt')):
+        after = False
+        for line in open(path):
+            if 'paired pre-sized control' in line:
+                after = True
+                continue
+            if not after:
+                continue
+            f = line.strip().split(',')
+            if len(f) == 13 and f[0] in ('natural', 'presized'):
+                cpairs[(path, f[1])][f[0]] = f
+    full = [v for v in cpairs.values() if len(v) == 2]
+    if not full:
+        problems.append('no dimension pre-sized control pairs found')
+    else:
+        bld = lambda r: float(r[6]) + float(r[7])
+        reh = lambda r: float(r[8]) + float(r[9])
+        nat_b = med([bld(v['natural']) for v in full])
+        pre_b = med([bld(v['presized']) for v in full])
+        nat_r = med([reh(v['natural']) for v in full])
+        extra = [bld(v['natural']) - bld(v['presized']) for v in full]
+        unacc = [bld(v['natural']) - bld(v['presized']) - reh(v['natural']) for v in full]
+        tot = [float(v['natural'][10]) - float(v['presized'][10]) for v in full]
+        print(f'  pairs={len(full)}')
+        print(f'  build d1+d2: natural={nat_b:.3f} presized={pre_b:.3f} '
+              f'delta={nat_b - pre_b:+.3f} ms')
+        print(f'  reported rehash (natural): {nat_r:.3f} ms')
+        print(f'  per-pair extra build: med={med(extra):+.3f} '
+              f'[{min(extra):+.3f}..{max(extra):+.3f}]')
+        print(f'  per-pair unaccounted:  med={med(unacc):+.3f} '
+              f'[{min(unacc):+.3f}..{max(unacc):+.3f}]')
+        print(f'  per-pair total delta:  med={med(tot):+.2f} mean={statistics.mean(tot):+.2f} '
+              f'[{min(tot):+.1f}..{max(tot):+.1f}] natural slower in '
+              f'{sum(1 for x in tot if x > 0)}/{len(tot)}')
+        # the control is only paired if both arms really ended identically
+        for fld, name in ((2, 'dim1 capacity'), (3, 'dim2 capacity')):
+            if len({v[a][fld] for v in full for a in ('natural', 'presized')}) != 1:
+                problems.append(f'dim control: the arms did not all end at the same {name}')
+        if not all(int(v['presized'][4]) == 0 and int(v['presized'][5]) == 0 for v in full):
+            problems.append('dim control: the pre-sized arm grew, so it is not a control')
+        if not all(int(v['natural'][4]) > 0 and int(v['natural'][5]) > 0 for v in full):
+            problems.append('dim control: the natural arm did not grow both tables')
+        # The README states the rehash counter fully explains the extra build
+        # cost, and states it ONLY at build granularity because the total
+        # cannot resolve it. Both halves have to hold.
+        if abs(med(unacc)) > 0.05:
+            problems.append(f'dim control: {med(unacc):+.3f} ms of the extra build time is '
+                            f'not explained by the reported rehash -- the README claims '
+                            f'the counter accounts for it')
+        if not (min(unacc) < 0 < max(unacc)):
+            problems.append('dim control: the unaccounted residual does not straddle zero, '
+                            'so it is a real effect and not noise as the README says')
+        if abs(med(tot)) > 2.0:
+            problems.append(f'dim control: paired total delta median {med(tot):+.2f} ms is '
+                            f'large enough to quote -- the README says it cannot be resolved')
+
 print()
 if problems:
     print(f'FAIL: {len(problems)} consistency problem(s)')

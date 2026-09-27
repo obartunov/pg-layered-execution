@@ -17,9 +17,18 @@
 - Zone files must be rebuilt after DML or the query must fall back to heap
 
 ## Execution
-- Static-capacity hash tables everywhere except the benchmark report's group
-  hash, which grows at load 0.5 (V2_DIM1_CAP=256, V2_DIM2_CAP=1024 are now the
-  binding ceiling, at 192 and 768 keys); nothing spills
+- Static-capacity hash tables everywhere except three, all in
+  `xpb_v2_report.c`: the group hash and both dimension hashes grow at load 0.5
+  by doubling. `V2_GRP_CAP`, `V2_DIM1_CAP` and `V2_DIM2_CAP` are initial
+  capacities, not ceilings; the remaining ceiling is `MaxAllocSize`. Every
+  other table, including the dimension hashes in `xpb_batch_hashjoin.c`,
+  `xpb_batch_partition.c` and `xpb_typed_pipeline.c`, is still fixed and
+  errors at 3/4. Nothing spills anywhere. See
+  `docs/TYPED_BATCH_CONTRACT.md` for the per-table table.
+- Two fixed tables have no capacity guard at all and silently drop rows when
+  full (`xpb_projection.c` `AGG_CAP`, `xpb_columnar_pipeline.c` `WHASH_CAP`) --
+  a wrong answer rather than an error. Reachability unproven; tracked in
+  `docs/roadmap/fixed-hash-silent-drop.md`
 - No spill-to-disk for large aggregates or joins
 - Small dimension tables only (must fit in memory)
 - No parallel execution

@@ -257,21 +257,46 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   and errors on a NULL in a requested column rather than carrying it into the
   batch. The bitmap convention already matches, so this is wiring, not
   design.
-* **Fixed-capacity hash tables, with one exception.** Benchmark 05-E measured
-  where that boundary sat -- 12 288 groups, a `#define`, not a resource -- and
-  Hash Aggregate Growth v1 then replaced it **in one place only**:
+* **Fixed-capacity hash tables, with three exceptions, all in one file.**
+  Benchmark 05-E measured where the group boundary sat -- 12 288 groups, a
+  `#define`, not a resource. Hash Aggregate Growth v1 then replaced the group
+  hash and Dimension Hash Growth v1 the two dimension hashes, in
+  `xpb_v2_report.c` and nowhere else:
 
-  | table | behaviour |
-  |---|---|
-  | `xpb_v2_report.c` group hash | grows at load 0.5, doubling, no spill |
-  | `xpb_typed_pipeline.c` (`TP_GRP_CAP`) | fixed, errors |
-  | `xpb_batch_groupagg.c` | fixed, errors |
-  | `xpb_batch_hashjoin.c` | fixed, errors |
-  | every dimension hash | fixed, errors |
+  | table | `#define` | behaviour |
+  |---|---|---|
+  | `xpb_v2_report.c` group hash | `V2_GRP_CAP` 16384 | grows at load 0.5, doubling, no spill |
+  | `xpb_v2_report.c` dim1 (company) | `V2_DIM1_CAP` 256 | grows at load 0.5, doubling, no spill |
+  | `xpb_v2_report.c` dim2 (account) | `V2_DIM2_CAP` 1024 | grows at load 0.5, doubling, no spill |
+  | `xpb_typed_pipeline.c` group | `TP_GRP_CAP` 16384 | fixed, errors at 3/4 |
+  | `xpb_typed_pipeline.c` dimension | `TP_DIM_CAP` 4096 | fixed, errors at 3/4 |
+  | `xpb_batch_groupagg.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
+  | `xpb_batch_hashjoin.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
+  | `xpb_batch_hashjoin.c` dim1 / dim2 | `DIM_CAP` 256 / `DIM2_CAP` 512 | fixed, errors at 3/4 |
+  | `xpb_batch_partition.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
+  | `xpb_batch_partition.c` dim1 / dim2 | `DIM_CAP` 256 / `DIM2_CAP` 512 | fixed, errors at 3/4 |
+  | `xpb_projection.c` aggregate | `AGG_CAP` 16384 | fixed, **no guard -- drops rows when full** |
+  | `xpb_columnar_pipeline.c` window | `WHASH_CAP` 131072 | fixed, **no guard -- drops rows when full** |
+  | `xpb_zlfs.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
 
-  So "aggregation scales to 147 456 groups" is a statement about the benchmark
-  report function, not about the pipeline. The other aggregators are unchanged
-  and still carry the 0.5 knee and the hard ceiling. Nothing spills anywhere.
+  The three growing tables are all reached through `xpb_v2_register_report`. So
+  "aggregation scales to 147 456 groups", and the dimension cardinalities
+  measured in Dimension Hash Growth v1, are statements about the benchmark
+  report function, not about the pipeline. Every other table is unchanged and
+  still carries its fixed ceiling. Nothing spills anywhere.
+
+  The growing tables raise `ERROR` only at a real allocation boundary
+  (`MaxAllocSize`, or a slot count that would overflow), not at a load factor.
+
+  The two rows marked **no guard** are not merely capped: `agg_insert()` in
+  `xpb_projection.c` and the window-hash insert in `xpb_columnar_pipeline.c`
+  probe every slot and then fall off the end of the loop, discarding the row
+  without an error -- a wrong answer rather than a failure, the same defect
+  class that was fixed in `xpb_v2_report.c`'s dimension hashes. Both are
+  pre-existing and on paths outside the measured pipeline; reachability is
+  unproven and is recorded as its own task in
+  `docs/roadmap/fixed-hash-silent-drop.md`. It is not folded into a benchmark
+  milestone, for the same reason the `xpb_groupagg2.c` overflow is not.
 
 * **`sum(int8)` has three different behaviours, on purpose so far but not by
   design.** `xpb_typed_pipeline.c` accumulates in INT128 and returns numeric,

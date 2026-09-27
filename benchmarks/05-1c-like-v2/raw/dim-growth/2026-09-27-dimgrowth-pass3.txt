@@ -1,0 +1,112 @@
+############ Dimension Hash Growth v1 ############
+
+=== policy in force (production, never the test hook) ===
+  dim1_initial_cap=256 dim2_initial_cap=1024, grow at half, double
+
+############ correctness gate ############
+Per-group equality against PostgreSQL at every point. A rehash that lost a
+dimension entry would drop every fact row referencing that key -- a wrong
+join result, not an error -- so grand totals are not accepted.
+
+rows=1032192 dim1_entries=64 dim2_entries=256 groups=12288
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=60.0 ms  build=0.2 ms  open=0.0 ms  source=40.4 ms  join1=3.1 ms  join2=3.8 ms  agg=12.4 ms  operators=19.3 ms  rows=1032192  batches=16  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12288 grp_load_factor=0.3750 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12288 grp_hits=1019904 grp_lookups=1032192 grp_probes=1272518 grp_probes_per_lookup=1.2328 grp_max_probe_current=12 grp_max_probe_lifetime=22 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9602 grp_rehash_ms=0.289 grp_agg_minus_rehash_ms=12.103 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=256 dim1_grow_at=128 dim1_entries=64 dim1_load_factor=0.2500 dim1_bytes=3072 dim1_bytes_peak=3072 dim1_cxt_bytes=8192 dim1_lookups=1032192 dim1_insertions=64 dim1_probes=1032256 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=0 dim1_rehashes=0 dim1_rehash_entries=0 dim1_rehash_ms=0.000  dim2_initial_cap=1024 dim2_cap=1024 dim2_grow_at=512 dim2_entries=256 dim2_load_factor=0.2500 dim2_bytes=24576 dim2_bytes_peak=24576 dim2_cxt_bytes=32816 dim2_lookups=1032192 dim2_insertions=256 dim2_probes=1032448 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=0 dim2_rehashes=0 dim2_rehash_entries=0 dim2_rehash_ms=0.000  dim1_build_ms=0.044 dim2_build_ms=0.100
+rows=1032192 dim1_entries=128 dim2_entries=512 groups=12288
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=60.1 ms  build=0.3 ms  open=0.0 ms  source=40.5 ms  join1=3.0 ms  join2=3.3 ms  agg=13.0 ms  operators=19.3 ms  rows=1032192  batches=16  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12288 grp_load_factor=0.3750 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12288 grp_hits=1019904 grp_lookups=1032192 grp_probes=1302617 grp_probes_per_lookup=1.2620 grp_max_probe_current=17 grp_max_probe_lifetime=37 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9375 grp_rehash_ms=0.237 grp_agg_minus_rehash_ms=12.745 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=256 dim1_grow_at=128 dim1_entries=128 dim1_load_factor=0.5000 dim1_bytes=3072 dim1_bytes_peak=3072 dim1_cxt_bytes=8192 dim1_lookups=1032192 dim1_insertions=128 dim1_probes=1032320 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=0 dim1_rehashes=0 dim1_rehash_entries=0 dim1_rehash_ms=0.000  dim2_initial_cap=1024 dim2_cap=1024 dim2_grow_at=512 dim2_entries=512 dim2_load_factor=0.5000 dim2_bytes=24576 dim2_bytes_peak=24576 dim2_cxt_bytes=32816 dim2_lookups=1032192 dim2_insertions=512 dim2_probes=1032704 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=0 dim2_rehashes=0 dim2_rehash_entries=0 dim2_rehash_ms=0.000  dim1_build_ms=0.061 dim2_build_ms=0.198
+rows=1032192 dim1_entries=129 dim2_entries=513 groups=12255
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=61.2 ms  build=0.2 ms  open=0.0 ms  source=42.1 ms  join1=3.2 ms  join2=3.5 ms  agg=12.2 ms  operators=18.8 ms  rows=1032192  batches=16  groups=12255  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12255 grp_load_factor=0.3740 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12255 grp_hits=1019937 grp_lookups=1032192 grp_probes=1302697 grp_probes_per_lookup=1.2621 grp_max_probe_current=17 grp_max_probe_lifetime=38 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9397 grp_rehash_ms=0.196 grp_agg_minus_rehash_ms=11.975 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=512 dim1_grow_at=256 dim1_entries=129 dim1_load_factor=0.2520 dim1_bytes=6144 dim1_bytes_peak=9216 dim1_cxt_bytes=24576 dim1_lookups=1032192 dim1_insertions=129 dim1_probes=1032321 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=1 dim1_rehashes=1 dim1_rehash_entries=128 dim1_rehash_ms=0.001  dim2_initial_cap=1024 dim2_cap=2048 dim2_grow_at=1024 dim2_entries=513 dim2_load_factor=0.2505 dim2_bytes=49152 dim2_bytes_peak=73728 dim2_cxt_bytes=57392 dim2_lookups=1032192 dim2_insertions=513 dim2_probes=1032705 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=1 dim2_rehashes=1 dim2_rehash_entries=512 dim2_rehash_ms=0.005  dim1_build_ms=0.055 dim2_build_ms=0.126
+rows=1032192 dim1_entries=192 dim2_entries=768 groups=12288
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=59.5 ms  build=0.3 ms  open=0.0 ms  source=39.9 ms  join1=2.9 ms  join2=3.2 ms  agg=13.3 ms  operators=19.3 ms  rows=1032192  batches=16  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12288 grp_load_factor=0.3750 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12288 grp_hits=1019904 grp_lookups=1032192 grp_probes=1361475 grp_probes_per_lookup=1.3190 grp_max_probe_current=16 grp_max_probe_lifetime=32 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9619 grp_rehash_ms=0.191 grp_agg_minus_rehash_ms=13.103 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=512 dim1_grow_at=256 dim1_entries=192 dim1_load_factor=0.3750 dim1_bytes=6144 dim1_bytes_peak=9216 dim1_cxt_bytes=24576 dim1_lookups=1032192 dim1_insertions=192 dim1_probes=1032384 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=1 dim1_rehashes=1 dim1_rehash_entries=128 dim1_rehash_ms=0.001  dim2_initial_cap=1024 dim2_cap=2048 dim2_grow_at=1024 dim2_entries=768 dim2_load_factor=0.3750 dim2_bytes=49152 dim2_bytes_peak=73728 dim2_cxt_bytes=57392 dim2_lookups=1032192 dim2_insertions=768 dim2_probes=1032960 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=1 dim2_rehashes=1 dim2_rehash_entries=512 dim2_rehash_ms=0.005  dim1_build_ms=0.054 dim2_build_ms=0.183
+rows=1032192 dim1_entries=384 dim2_entries=1536 groups=12288
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=58.3 ms  build=0.3 ms  open=0.0 ms  source=39.1 ms  join1=3.0 ms  join2=3.2 ms  agg=12.7 ms  operators=18.8 ms  rows=1032192  batches=16  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12288 grp_load_factor=0.3750 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12288 grp_hits=1019904 grp_lookups=1032192 grp_probes=1400076 grp_probes_per_lookup=1.3564 grp_max_probe_current=18 grp_max_probe_lifetime=26 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9839 grp_rehash_ms=0.205 grp_agg_minus_rehash_ms=12.447 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=1024 dim1_grow_at=512 dim1_entries=384 dim1_load_factor=0.3750 dim1_bytes=12288 dim1_bytes_peak=18432 dim1_cxt_bytes=36912 dim1_lookups=1032192 dim1_insertions=384 dim1_probes=1032576 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=2 dim1_rehashes=2 dim1_rehash_entries=384 dim1_rehash_ms=0.004  dim2_initial_cap=1024 dim2_cap=4096 dim2_grow_at=2048 dim2_entries=1536 dim2_load_factor=0.3750 dim2_bytes=98304 dim2_bytes_peak=147456 dim2_cxt_bytes=106544 dim2_lookups=1032192 dim2_insertions=1536 dim2_probes=1033728 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=2 dim2_rehashes=2 dim2_rehash_entries=1536 dim2_rehash_ms=0.014  dim1_build_ms=0.135 dim2_build_ms=0.160
+rows=1032192 dim1_entries=768 dim2_entries=3072 groups=12288
+NOTICE:  v2_register_report [1..12] mode=dimgrow: total=61.3 ms  build=0.6 ms  open=0.0 ms  source=39.9 ms  join1=3.1 ms  join2=3.5 ms  agg=14.1 ms  operators=20.7 ms  rows=1032192  batches=16  groups=12288  heap_path=fixed  tuples_deformed=0 attrs_deformed=0 tuples_scanned=0 attrs_walked=0 attrs_materialized=0 tuples_accepted=0 tuples_rejected_early=0 walked_acc=0 walked_rej=0 mat_acc=0 mat_rej=0 attrs_requested=5  grp_initial_cap=16384 grp_cap=32768 grp_grow_at=16384 grp_occupied=12288 grp_load_factor=0.3750 grp_bytes=1048576 grp_bytes_peak=1572864 grp_entry_bytes=32 grp_inserts=12288 grp_hits=1019904 grp_lookups=1032192 grp_probes=1380223 grp_probes_per_lookup=1.3372 grp_max_probe_current=13 grp_max_probe_lifetime=20 grp_growths=1 grp_rehashes=1 grp_rehash_groups=8192 grp_rehash_probes=9712 grp_rehash_ms=0.247 grp_agg_minus_rehash_ms=13.882 grp_cxt_bytes=1056816  dim1_initial_cap=256 dim1_cap=2048 dim1_grow_at=1024 dim1_entries=768 dim1_load_factor=0.3750 dim1_bytes=24576 dim1_bytes_peak=36864 dim1_cxt_bytes=49200 dim1_lookups=1032192 dim1_insertions=768 dim1_probes=1032960 dim1_probes_per_lookup_lifetime=1.0000 dim1_max_probe_current=1 dim1_max_probe_lifetime=1 dim1_growths=3 dim1_rehashes=3 dim1_rehash_entries=896 dim1_rehash_ms=0.007  dim2_initial_cap=1024 dim2_cap=8192 dim2_grow_at=4096 dim2_entries=3072 dim2_load_factor=0.3750 dim2_bytes=196608 dim2_bytes_peak=294912 dim2_cxt_bytes=204848 dim2_lookups=1032192 dim2_insertions=3072 dim2_probes=1035264 dim2_probes_per_lookup_lifetime=1.0000 dim2_max_probe_current=1 dim2_max_probe_lifetime=1 dim2_growths=3 dim2_rehashes=3 dim2_rehash_entries=3584 dim2_rehash_ms=0.044  dim1_build_ms=0.227 dim2_build_ms=0.285
+point 1  batch a46d524daffbbc83f08f88d64215492d  groups=12288
+point 1  sql   a46d524daffbbc83f08f88d64215492d  groups=12288
+point 2  batch ab496893fe497c647fd6c2b6bf421a5f  groups=12288
+point 2  sql   ab496893fe497c647fd6c2b6bf421a5f  groups=12288
+point 3  batch c00014716f7a7cf665c43c318d66f198  groups=12255
+point 3  sql   c00014716f7a7cf665c43c318d66f198  groups=12255
+point 4  batch e67f1da49a8f331709d82182c33f9320  groups=12288
+point 4  sql   e67f1da49a8f331709d82182c33f9320  groups=12288
+point 5  batch c72518c914e977529c42bd5bdc7a15fc  groups=12288
+point 5  sql   c72518c914e977529c42bd5bdc7a15fc  groups=12288
+point 6  batch 1680d9c72592468936da9fd8f6c5239c  groups=12288
+point 6  sql   1680d9c72592468936da9fd8f6c5239c  groups=12288
+NOTICE:  dim growth gate PASS: batch and PostgreSQL agree per group at every dimension cardinality
+
+############ cardinality verification, per point ############
+-- n_comp=64 n_acct=256 n_grp=192 --
+   rows=1032192 dim1_entries=64 dim2_entries=256 groups=12288
+-- n_comp=128 n_acct=512 n_grp=96 --
+   rows=1032192 dim1_entries=128 dim2_entries=512 groups=12288
+-- n_comp=129 n_acct=513 n_grp=95 --
+   rows=1032192 dim1_entries=129 dim2_entries=513 groups=12255
+-- n_comp=192 n_acct=768 n_grp=64 --
+   rows=1032192 dim1_entries=192 dim2_entries=768 groups=12288
+-- n_comp=384 n_acct=1536 n_grp=32 --
+   rows=1032192 dim1_entries=384 dim2_entries=1536 groups=12288
+-- n_comp=768 n_acct=3072 n_grp=16 --
+   rows=1032192 dim1_entries=768 dim2_entries=3072 groups=12288
+
+############ timings: 1 warm-up + 5 measured runs ############
+# n_comp,n_acct,n_grp,run,groups,rows,total_ms,source_ms,dim1_build_ms,dim2_build_ms,join1_ms,join2_ms,agg_ms,operators_ms,d1_cap,d1_entries,d1_load,d1_growths,d1_rehash_entries,d1_rehash_ms,d1_probes_per_lookup,d1_probe_current,d1_probe_lifetime,d1_bytes,d1_bytes_peak,d1_cxt_bytes,d2_cap,d2_entries,d2_load,d2_growths,d2_rehash_entries,d2_rehash_ms,d2_probes_per_lookup,d2_probe_current,d2_probe_lifetime,d2_bytes,d2_bytes_peak,d2_cxt_bytes,status
+64,256,192,1,12288,1032192,70.1,45.2,0.148,0.032,3.5,3.5,14.7,21.7,256,64,0.2500,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,256,0.2500,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+64,256,192,2,12288,1032192,62.4,40.6,0.154,0.031,3.4,3.3,13.3,19.9,256,64,0.2500,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,256,0.2500,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+64,256,192,3,12288,1032192,60.1,39.2,0.147,0.029,3.0,3.5,12.7,19.2,256,64,0.2500,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,256,0.2500,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+64,256,192,4,12288,1032192,60.8,39.0,0.196,0.038,3.3,3.7,13.0,19.9,256,64,0.2500,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,256,0.2500,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+64,256,192,5,12288,1032192,78.1,50.6,0.197,0.033,4.1,4.6,16.6,25.2,256,64,0.2500,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,256,0.2500,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+128,512,96,1,12288,1032192,64.6,41.9,0.146,0.046,3.3,3.5,14.0,20.8,256,128,0.5000,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,512,0.5000,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+128,512,96,2,12288,1032192,59.5,38.2,0.187,0.050,3.3,3.2,13.0,19.5,256,128,0.5000,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,512,0.5000,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+128,512,96,3,12288,1032192,57.4,37.1,0.158,0.046,3.1,3.1,12.4,18.6,256,128,0.5000,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,512,0.5000,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+128,512,96,4,12288,1032192,59.7,38.6,0.152,0.047,3.1,3.3,12.6,19.0,256,128,0.5000,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,512,0.5000,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+128,512,96,5,12288,1032192,77.8,49.4,0.149,0.046,4.5,4.7,16.8,26.0,256,128,0.5000,0,0,0.000,1.0000,1,1,3072,3072,8192,1024,512,0.5000,0,0,0.000,1.0000,1,1,24576,24576,32816,OK
+129,513,95,1,12255,1032192,58.1,37.7,0.144,0.110,3.1,3.2,12.4,18.6,512,129,0.2520,1,128,0.004,1.0000,1,1,6144,9216,24576,2048,513,0.2505,1,512,0.063,1.0000,1,1,49152,73728,57392,OK
+129,513,95,2,12255,1032192,62.2,41.2,0.152,0.069,3.2,3.3,12.8,19.2,512,129,0.2520,1,128,0.004,1.0000,1,1,6144,9216,24576,2048,513,0.2505,1,512,0.023,1.0000,1,1,49152,73728,57392,OK
+129,513,95,3,12255,1032192,60.6,38.7,0.147,0.067,3.3,3.7,13.0,20.1,512,129,0.2520,1,128,0.006,1.0000,1,1,6144,9216,24576,2048,513,0.2505,1,512,0.020,1.0000,1,1,49152,73728,57392,OK
+129,513,95,4,12255,1032192,75.4,49.9,0.181,0.147,4.2,4.4,14.8,23.3,512,129,0.2520,1,128,0.005,1.0000,1,1,6144,9216,24576,2048,513,0.2505,1,512,0.031,1.0000,1,1,49152,73728,57392,OK
+129,513,95,5,12255,1032192,83.0,53.2,0.204,0.117,4.8,5.0,17.2,27.0,512,129,0.2520,1,128,0.005,1.0000,1,1,6144,9216,24576,2048,513,0.2505,1,512,0.030,1.0000,1,1,49152,73728,57392,OK
+192,768,64,1,12288,1032192,59.1,38.0,0.187,0.105,3.0,3.2,13.1,19.3,512,192,0.3750,1,128,0.004,1.0000,1,1,6144,9216,24576,2048,768,0.3750,1,512,0.024,1.0000,1,1,49152,73728,57392,OK
+192,768,64,2,12288,1032192,71.8,45.8,0.263,0.147,3.9,4.2,15.6,23.7,512,192,0.3750,1,128,0.006,1.0000,1,1,6144,9216,24576,2048,768,0.3750,1,512,0.033,1.0000,1,1,49152,73728,57392,OK
+192,768,64,3,12288,1032192,96.7,60.6,0.212,0.236,5.9,6.0,21.1,33.0,512,192,0.3750,1,128,0.006,1.0000,1,1,6144,9216,24576,2048,768,0.3750,1,512,0.054,1.0000,1,1,49152,73728,57392,OK
+192,768,64,4,12288,1032192,63.0,39.9,0.304,0.259,3.5,3.5,13.6,20.6,512,192,0.3750,1,128,0.006,1.0000,1,1,6144,9216,24576,2048,768,0.3750,1,512,0.055,1.0000,1,1,49152,73728,57392,OK
+192,768,64,5,12288,1032192,67.6,43.2,0.155,0.085,3.4,3.8,15.2,22.4,512,192,0.3750,1,128,0.004,1.0000,1,1,6144,9216,24576,2048,768,0.3750,1,512,0.023,1.0000,1,1,49152,73728,57392,OK
+384,1536,32,1,12288,1032192,70.0,42.8,0.166,0.153,3.4,3.6,17.6,24.6,1024,384,0.3750,2,384,0.010,1.0000,1,1,12288,18432,36912,4096,1536,0.3750,2,1536,0.066,1.0000,1,1,98304,147456,106544,OK
+384,1536,32,2,12288,1032192,61.9,38.2,0.272,0.202,3.3,3.7,14.5,21.5,1024,384,0.3750,2,384,0.012,1.0000,1,1,12288,18432,36912,4096,1536,0.3750,2,1536,0.103,1.0000,1,1,98304,147456,106544,OK
+384,1536,32,3,12288,1032192,63.2,40.1,0.179,0.216,3.3,3.3,14.4,21.1,1024,384,0.3750,2,384,0.010,1.0000,1,1,12288,18432,36912,4096,1536,0.3750,2,1536,0.069,1.0000,1,1,98304,147456,106544,OK
+384,1536,32,4,12288,1032192,60.4,38.5,0.170,0.160,3.3,3.2,13.4,20.0,1024,384,0.3750,2,384,0.009,1.0000,1,1,12288,18432,36912,4096,1536,0.3750,2,1536,0.067,1.0000,1,1,98304,147456,106544,OK
+384,1536,32,5,12288,1032192,62.5,39.4,0.214,0.164,3.1,3.5,14.7,21.2,1024,384,0.3750,2,384,0.011,1.0000,1,1,12288,18432,36912,4096,1536,0.3750,2,1536,0.068,1.0000,1,1,98304,147456,106544,OK
+768,3072,16,1,12288,1032192,60.7,38.7,0.247,0.397,3.0,3.4,13.4,19.9,2048,768,0.3750,3,896,0.026,1.0000,1,1,24576,36864,49200,8192,3072,0.3750,3,3584,0.167,1.0000,1,1,196608,294912,204848,OK
+768,3072,16,2,12288,1032192,69.5,44.0,0.206,0.368,3.5,3.8,15.9,23.2,2048,768,0.3750,3,896,0.025,1.0000,1,1,24576,36864,49200,8192,3072,0.3750,3,3584,0.175,1.0000,1,1,196608,294912,204848,OK
+768,3072,16,3,12288,1032192,67.8,42.6,0.255,0.435,3.5,5.1,14.1,22.7,2048,768,0.3750,3,896,0.021,1.0000,1,1,24576,36864,49200,8192,3072,0.3750,3,3584,0.188,1.0000,1,1,196608,294912,204848,OK
+768,3072,16,4,12288,1032192,61.0,38.1,0.243,0.341,3.4,3.8,13.3,20.6,2048,768,0.3750,3,896,0.022,1.0000,1,1,24576,36864,49200,8192,3072,0.3750,3,3584,0.165,1.0000,1,1,196608,294912,204848,OK
+768,3072,16,5,12288,1032192,65.4,41.0,0.209,0.347,3.5,3.5,15.1,22.1,2048,768,0.3750,3,896,0.022,1.0000,1,1,24576,36864,49200,8192,3072,0.3750,3,3584,0.167,1.0000,1,1,196608,294912,204848,OK
+
+############ paired pre-sized control ############
+Widest point, 768 x 3072. Both arms end with the same entries, the same
+final capacities and the same result, and differ only in whether they
+doubled their way there. Alternating inside one connection, so the
+comparison is paired rather than across sessions.
+
+# arm,pair,d1_cap,d2_cap,d1_growths,d2_growths,dim1_build_ms,dim2_build_ms,d1_rehash_ms,d2_rehash_ms,total_ms,d1_probe_current,d1_probe_lifetime
+natural,1,2048,8192,3,3,0.061,0.220,0.007,0.108,43.7,1,1
+presized,1,2048,8192,0,0,0.046,0.116,0.000,0.000,66.2,1,1
+natural,2,2048,8192,3,3,0.058,0.236,0.008,0.122,45.3,1,1
+presized,2,2048,8192,0,0,0.046,0.117,0.000,0.000,62.5,1,1
+natural,3,2048,8192,3,3,0.063,0.400,0.010,0.218,45.9,1,1
+presized,3,2048,8192,0,0,0.053,0.114,0.000,0.000,47.0,1,1
+natural,4,2048,8192,3,3,0.059,0.260,0.008,0.144,57.8,1,1
+presized,4,2048,8192,0,0,0.050,0.116,0.000,0.000,46.5,1,1
+natural,5,2048,8192,3,3,0.063,0.813,0.010,0.398,50.1,1,1
+presized,5,2048,8192,0,0,0.054,0.158,0.000,0.000,50.3,1,1
+natural,6,2048,8192,3,3,0.068,0.324,0.008,0.150,53.2,1,1
+presized,6,2048,8192,0,0,0.050,0.124,0.000,0.000,51.5,1,1
+natural,7,2048,8192,3,3,0.056,0.242,0.009,0.124,48.9,1,1
+presized,7,2048,8192,0,0,0.051,0.118,0.000,0.000,47.7,1,1
+natural,8,2048,8192,3,3,0.058,0.267,0.009,0.125,47.3,1,1
+presized,8,2048,8192,0,0,0.048,0.162,0.000,0.000,53.3,1,1
+natural,9,2048,8192,3,3,0.059,0.247,0.008,0.121,44.9,1,1
+presized,9,2048,8192,0,0,0.047,0.158,0.000,0.000,43.5,1,1
+natural,10,2048,8192,3,3,0.055,0.235,0.008,0.116,44.8,1,1
+presized,10,2048,8192,0,0,0.048,0.118,0.000,0.000,43.4,1,1
+
+############ done ############

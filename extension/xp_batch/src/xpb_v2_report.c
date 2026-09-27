@@ -65,8 +65,13 @@ extern void xpcn_source_pruning(XpBatchSource *src, int64 *groups_read,
 
 PG_FUNCTION_INFO_V1(xpb_v2_register_report);
 
-#define V2_DIM1_CAP  256        /* 50 companies   */
-#define V2_DIM2_CAP  1024       /* 200 accounts   */
+/*
+ * Dimension hash INITIAL capacities; both tables grow from here under the same
+ * preregistered policy as the group hash below (grow at half full, double).
+ * They were hard ceilings with a 3/4 load limit until Dimension Hash Growth v1.
+ */
+#define V2_DIM1_CAP  256
+#define V2_DIM2_CAP  1024
 /*
  * Group hash table.
  *
