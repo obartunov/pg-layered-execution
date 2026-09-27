@@ -158,16 +158,34 @@ for arm in card-zlfs card; do
 done
 
 echo
-echo "############ exact failure boundary ############"
-echo "Last success and first failure, with the error text as raised."
-"${PSQL[@]}" -c "SELECT xpe_set_cardinality(96)" >/dev/null
-echo "-- k=96, 12288 groups:"
-"${PSQL[@]}" -c "$GUC SELECT count(*) FROM xpb_v2_register_report(1,12,'card-zlfs')" 2>&1 \
-    | grep -v '^WARNING' | sed -n 's/^NOTICE:  v2_register_report /   OK  /p' | cut -c1-120
-"${PSQL[@]}" -c "SELECT xpe_set_cardinality(97)" >/dev/null
-echo "-- k=97, 12416 groups:"
-{ "${PSQL[@]}" -c "$GUC SELECT count(*) FROM xpb_v2_register_report(1,12,'card-zlfs')" 2>&1 || true; } \
-    | grep -E '^(ERROR|DETAIL|HINT)' | sed 's/^/   /'
+echo "############ the former failure boundary ############"
+echo "k=96 / k=97 was 05-E's boundary: 12 288 groups was the last cardinality a"
+echo "fixed 16 384-slot table with a 3/4 load limit would accept, and 12 416"
+echo "raised an error. Hash Aggregate Growth v1 removed that boundary, so this"
+echo "section no longer searches for a failure -- it asserts that the two points"
+echo "05-E separated are now both served, and that the second one grew."
+for k in 96 97; do
+    "${PSQL[@]}" -c "SELECT xpe_set_cardinality($k)" >/dev/null
+    echo "-- k=$k, $((128 * k)) groups:"
+    line=$({ "${PSQL[@]}" -c "$GUC
+               SELECT count(*) FROM xpb_v2_register_report(1,12,'card-zlfs')" 2>&1 || true; } \
+           | grep -v '^WARNING')
+    if grep -q '^ERROR' <<<"$line"; then
+        echo "   FAIL  a cardinality the growing table must serve was refused:"
+        grep -E '^(ERROR|DETAIL|HINT)' <<<"$line" | sed 's/^/     /'
+        exit 1
+    fi
+    sed -n 's/^NOTICE:  v2_register_report /   OK  /p' <<<"$line" | cut -c1-120
+    cap=$(sed -n 's/.*[ =]grp_cap=\([0-9]*\).*/\1/p' <<<"$line")
+    gro=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
+    echo "         grp_cap=$cap grp_growths=$gro"
+    # 12 416 groups cannot fit 16 384 slots under a 0.5 policy, so the table
+    # must have grown at least once to have served it at all.
+    if [ "$k" = 97 ] && { [ -z "$gro" ] || [ "$gro" -lt 1 ]; }; then
+        echo "   FAIL  k=97 was served without a growth, which the 0.5 policy forbids"
+        exit 1
+    fi
+done
 
 echo
 echo "############ PostgreSQL baseline, single core (section 19) ############"
