@@ -18,6 +18,7 @@ import collections
 import csv
 import glob
 import os
+import re
 import statistics
 import sys
 
@@ -255,9 +256,19 @@ else:
             #
             # That residue is bounded without reference to the measurement: the
             # generations are the doubling sequence from the initial capacity,
-            # only those at or below 8192 bytes are retained, and each occupies
-            # at most twice its own size once block rounding is allowed for.
-            # Plus one keeper block of initBlockSize (ALLOCSET_DEFAULT_SIZES).
+            # and only those at or below 8192 bytes are retained. The factor of
+            # two per retained generation is a slack allowance, NOT aset.c's
+            # rule -- a sub-limit chunk lands in a block of nextBlockSize, a
+            # doubling sequence from initBlockSize that is not a function of the
+            # chunk size, so the block holding it can be larger or smaller than
+            # twice the chunk. The bound is therefore generous rather than
+            # derived, and a violation means a leak large enough to clear a
+            # generous bound. Plus one keeper block of initBlockSize
+            # (ALLOCSET_DEFAULT_SIZES = 8192, allocated at context creation).
+            #
+            # dim2 never has a sub-limit generation, so its bound reduces to
+            # keeper + live + header and is exact at every point; only dim1's
+            # residue term carries the slack.
             # Halving the final capacity once per recorded growth must land back
             # on the declared initial capacity -- that is the "doubled every
             # time" half of the policy, checked against a constant.
@@ -287,16 +298,22 @@ else:
         j1s.append(q(10)); j2s.append(q(11)); tots.append(q(6))
         print(f'  {k[0]:>5d}{q(6):8.1f}{q(7):8.1f}{q(8):9.3f}{q(9):9.3f}'
               f'{q(10):7.1f}{q(11):7.1f}{q(12):7.1f}{q(19):8.3f}{q(31):8.3f}')
-    # "join probe cost flat across a 12x change": the spread has to be inside
-    # the 8.3% measurement-spike band documented for this host, or the word
-    # "flat" is not earned.
-    for name, xs in (('join1', j1s), ('join2', j2s)):
-        spread = (max(xs) - min(xs)) / med(xs)
-        print(f'  {name} spread across the ladder: {spread * 100:.1f}% of median')
-        if spread > 0.083:
-            problems.append(f'dim ladder: {name} varies by {spread * 100:.1f}% across the '
-                            f'ladder, beyond this host\'s 8.3% spike band -- '
-                            f'"flat" is not supported')
+    # "join probe cost flat across a 12x change" needs a baseline, and the only
+    # honest one is this dataset's own noise: if the variation ACROSS
+    # cardinalities is no larger than the variation WITHIN a single
+    # cardinality, the ladder has not resolved an effect. No external
+    # threshold, so nothing here can be tuned to the answer.
+    for name, col, xs in (('join1', 10, j1s), ('join2', 11, j2s)):
+        across = (max(xs) - min(xs)) / med(xs)
+        within = max((max(c) - min(c)) / med(c)
+                     for c in ([float(r[col]) for r in dd[k]] for k in dd))
+        print(f'  {name}: across-ladder spread of medians {across * 100:.1f}%, '
+              f'widest within-cardinality spread {within * 100:.0f}%')
+        if across >= within:
+            problems.append(f'dim ladder: {name} varies more across the ladder '
+                            f'({across * 100:.1f}%) than within a single cardinality '
+                            f'({within * 100:.0f}%) -- an effect may be resolved and '
+                            f'"no effect resolved" is not supported')
     # "4x the old fixed limit": the old limit was 3/4 of 256 and of 1024.
     top = dd[max(dd)]
     for ent, old_limit, what in ((15, 256 * 3 // 4, 'dim1'), (27, 1024 * 3 // 4, 'dim2')):
@@ -363,6 +380,57 @@ else:
         if abs(med(tot)) > 2.0:
             problems.append(f'dim control: paired total delta median {med(tot):+.2f} ms is '
                             f'large enough to quote -- the README says it cannot be resolved')
+
+    # The README says both arms produce the same result. Capacities and growth
+    # counts do not show that: the two arms reach the same capacity by different
+    # insert orders, so their slot contents differ. Only a per-group comparison
+    # rules out one arm having lost an entry, and it lives in its own artifact
+    # so that it does not perturb the five published measurement passes.
+    arm = glob.glob('raw/dim-growth/*-dimgrowth-armcheck.txt')
+    if not arm:
+        problems.append('no dim arm-equivalence artifact found, but the README claims '
+                        'both control arms produce the same result')
+    else:
+        txt = open(arm[0]).read()
+        cks = set(re.findall(r'^\s+(?:presized|natural)\s+([0-9a-f]{32})\s', txt, re.M))
+        if 'arm equivalence PASS' not in txt or len(cks) != 1:
+            problems.append(f'dim arm equivalence not established: {len(cks)} distinct '
+                            f'checksum(s), gate line '
+                            f'{"present" if "arm equivalence PASS" in txt else "absent"}')
+        else:
+            print(f'  arm equivalence: both arms -> {cks.pop()[:12]}... (one checksum)')
+
+# ------------------------------------- committed CSV must not drift from raw --
+# results-dim-growth.csv is published alongside the raw passes. Nothing else
+# reads it, which is exactly how a hand-assembled summary drifts, so its every
+# cell is checked against the medians re-derived from raw/ above.
+if drows:
+    csvp = 'results-dim-growth.csv'
+    with open(csvp) as fh:
+        crows = {(int(r['n_comp']), int(r['n_acct'])): r for r in csv.DictReader(fh)}
+    if set(crows) != {(k[0], k[1]) for k in dd}:
+        problems.append(f'{csvp}: point set differs from raw/')
+    else:
+        COLS = {'groups': 4, 'rows': 5, 'total_median_ms': 6, 'source_median_ms': 7,
+                'dim1_build_median_ms': 8, 'dim2_build_median_ms': 9,
+                'join1_median_ms': 10, 'join2_median_ms': 11,
+                'aggregate_median_ms': 12, 'operators_median_ms': 13,
+                'dim1_capacity': 14, 'dim1_entries': 15, 'dim1_load': 16,
+                'dim1_growths': 17, 'dim1_rehash_entries': 18,
+                'dim1_rehash_median_ms': 19, 'dim2_capacity': 26,
+                'dim2_entries': 27, 'dim2_load': 28, 'dim2_growths': 29,
+                'dim2_rehash_entries': 30, 'dim2_rehash_median_ms': 31}
+        bad = 0
+        for k in sorted(dd):
+            v, r = dd[k], crows[(k[0], k[1])]
+            for name, col in COLS.items():
+                want = med([float(x[col]) for x in v])
+                got = float(r[name])
+                if abs(got - want) > 5e-4 + abs(want) * 1e-9:
+                    problems.append(f'{csvp} {k[0]}/{k[1]}: {name}={got} but raw/ gives {want}')
+                    bad += 1
+        if not bad:
+            print(f'  {csvp}: all {len(crows) * len(COLS)} published cells match raw/')
 
 print()
 if problems:

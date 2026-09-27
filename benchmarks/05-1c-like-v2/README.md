@@ -1433,19 +1433,22 @@ high end of 05-E's ladder, and none of those sections was re-run there.
 
 ## What this baseline does not establish
 
-* **Growth is one code path.** Only the benchmark report function's group hash
-  grows. `xpb_typed_pipeline.c`, `xpb_batch_groupagg.c` and
-  `xpb_batch_hashjoin.c` still carry the fixed ceiling and the 0.5 knee.
-  Nothing spills anywhere.
+* **Growth is one code path.** At this milestone, only the benchmark report
+  function's group hash grew. `xpb_typed_pipeline.c`, `xpb_batch_groupagg.c`
+  and `xpb_batch_hashjoin.c` still carry the fixed ceiling and the 0.5 knee.
+  Nothing spills anywhere. *(Superseded in part: Dimension Hash Growth v1,
+  below, made it three code paths — the same file's two dimension hashes.)*
 * **Uniform distribution only.** Every probe figure rests on it, and probe
   stability is exactly what a hot key attacks.
 * **One query shape, hand-wired, no planner, no MVCC, warm cache, single
   core.** Two comparisons against PostgreSQL appear here; both carry the
   plan-shape difference and neither supports a claim of the form "N times
   faster than PostgreSQL".
-* **The binding boundary is now the dimension hashes**, `V2_DIM1_CAP` = 256 and
-  `V2_DIM2_CAP` = 1024, at 192 and 768 keys — the same class of compile-time
-  constant the growth milestone removed from the group table.
+* **The binding boundary was then the dimension hashes**, `V2_DIM1_CAP` = 256
+  and `V2_DIM2_CAP` = 1024, at 192 and 768 keys — the same class of
+  compile-time constant the growth milestone removed from the group table.
+  *(Removed in turn by Dimension Hash Growth v1, below; both are now initial
+  capacities.)*
 * **05-D's predicate-position experiment was never run.** Its 1.4–1.8x is the
   best case, with the predicate at physical attnum 1. That is the one
   unmeasured premise under "decode is done".
@@ -1801,11 +1804,12 @@ comparable with each other. Nothing here supports a statement of the form
 
 ## Limitations
 
-* **The last successful cardinality is limited by the dimensions, not the
+* **The last successful cardinality was limited by the dimensions, not the
   group table.** 147 456 groups is 192 companies x 768 accounts, exactly what
-  `V2_DIM1_CAP` (256) and `V2_DIM2_CAP` (1024) hold at their 3/4 load limits —
+  `V2_DIM1_CAP` (256) and `V2_DIM2_CAP` (1024) held at their 3/4 load limits —
   the same kind of compile-time constant this milestone removed from the group
-  hash, and now the binding one. The group table's own next boundary is
+  hash, and the binding one as of this milestone. *(Dimension Hash Growth v1,
+  below, removed that limit too.)* The group table's own next boundary is
   `MaxAllocSize`, around 16.8M groups, untested.
 * **The steady-state cost of dynamic capacity is not quantified.**
   Cross-session measurements were not stable enough to separate it from
@@ -1836,6 +1840,10 @@ The old answer was "12 288 groups, because `#define`". The measured answer is:
 > at the top of the range and which a paired control independently confirms
 > rather than leaving to a counter.
 
+*(That conclusion stood at this milestone. Dimension Hash Growth v1, below,
+removed the dimension boundary it names; the 147 456 figure and everything
+above it are unaffected, having been measured before either table grew.)*
+
 The evidence points at **A and C together, in that order**:
 
 1. **A — growth solved the boundary, so skew is the honest next test.** Every
@@ -1848,8 +1856,8 @@ The evidence points at **A and C together, in that order**:
 
 Not B: memory is 16 MB at 147K groups against PostgreSQL's 86 MB for two
 thirds as many. Not D: probe behaviour did not degrade. Not E (10M rows) yet —
-the dimension caps would have to be raised first, which is the same
-conversation as C.
+the dimension caps had to be raised first, which is the same conversation as C,
+and is what Dimension Hash Growth v1 below did.
 
 ---
 
@@ -1970,9 +1978,16 @@ Timings, same points, milliseconds:
 What the timings say, and do not say:
 
 * **Join cost is flat.** join1 3.2–3.4 ms and join2 3.4–3.6 ms across a 12x
-  change in dimension cardinality and a 8x change in dimension table bytes.
-  The spread is smaller than the 4.5–8.3% measurement spikes documented for
-  this host, so the honest reading is "no effect resolved", not "a small cost".
+  change in dimension cardinality and a 8x change in dimension table bytes:
+  6.1% and 5.7% between the extreme medians. The baseline for calling that
+  flat is this dataset's own noise, not an external band — within a *single*
+  cardinality the 25 measurements span 42% to 94% of their own median, an
+  order of magnitude more than the variation across the whole ladder. The
+  per-pass medians also show no ordering by cardinality: the narrowest point
+  gives 3.30/3.30/3.40/3.40/3.60 and the widest 3.30/3.20/3.50/3.30/3.20.
+  So the honest reading is "no effect resolved", not "a small cost measured".
+  `check-summaries.py` enforces exactly this comparison — across-ladder
+  spread must stay below within-cardinality spread — rather than a constant.
 * **Rehash is negligible here**, unlike in the group hash. 0.023 ms and
   0.175 ms at the widest point, against a 61.5 ms total: the dimension tables
   hold thousands of entries where the group table held a hundred thousand.
@@ -2004,17 +2019,30 @@ together during a rehash. Independent leak evidence comes from
 `MemoryContextMemAllocated` on each table's own context, with AllocSet's
 behaviour accounted for: an allocation above the 8192-byte chunk limit gets a
 block of its own that *is* returned to malloc on `pfree`, so a surviving
-predecessor of that size would show up. At the four points where the predecessor
-was above that limit, a leak would have been caught and was not. At dim1's two
-sub-limit points it could not have been — AllocSet keeps those chunks on a
-freelist by design and the block stays — and there the per-group checksum gate is
-the evidence instead. `check-summaries.py` encodes exactly this and its blind
+predecessor of that size would show up. At the four freed *generations* whose
+predecessor was above that limit — dim1's 12 288-byte table and all three of
+dim2's — a leak would have been caught and was not. At dim1's two sub-limit
+generations (3 072 and 6 144 bytes) it could not have been: AllocSet keeps those
+chunks on a freelist by design and the block stays. There the per-group checksum
+gate is the evidence instead. These counts are generations of a table, not ladder
+points. `check-summaries.py` encodes exactly this and its blind
 spot; every assertion in it was mutation-tested to confirm it fires.
 
 **4. A paired pre-sized control, 50 pairs alternating in one connection.** The
 test hook pre-sizes the tables to 2048 and 8192 so that both arms end with the
-same entries, the same final capacities and the same result, differing only in
-whether they doubled their way there.
+same entries and the same final capacities, differing only in whether they
+doubled their way there.
+
+That the two arms also produce the same *answer* is a separate check, because
+capacities and growth counts cannot show it: a pre-sized table and a naturally
+grown one reach 2048 slots by different insert orders, so their slot contents
+differ, and only a per-group comparison rules out one of them having lost an
+entry. Both arms return md5 `1680d9c7…` on 12 288 groups — the same checksum the
+ladder's gate already matched against PostgreSQL at this point — so the pre-sized
+arm agrees with the grown arm and with PostgreSQL. The runner asserts it
+(`arm equivalence PASS`) and keeps it in its own artifact,
+`raw/dim-growth/2026-09-27-dimgrowth-armcheck.txt`, so that it does not perturb
+the five published measurement passes.
 
 ```
                               natural      pre-sized     delta
@@ -2054,7 +2082,8 @@ The rehash cost is stated at the granularity that resolves it and at no other.
   accounts is 8192 slots and 196 608 bytes. Nothing was measured beyond it and
   no claim is made about it.
 * **Pre-sizing is diagnostic only.** `xpb_dim_test_policy` exists for the
-  control and the contract tests; the production path always starts at the
+  control only — `contract_tests.sh` does not use it, forcing growth with real
+  key counts instead. The production path always starts at the
   declared initial capacity. Being process-local statics, they must be set in
   the same connection as the report.
 * **Still no spill.** `MaxAllocSize` is now the boundary for all three tables.

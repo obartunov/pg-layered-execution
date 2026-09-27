@@ -135,8 +135,37 @@ echo "final capacities and the same result, and differ only in whether they"
 echo "doubled their way there. Alternating inside one connection, so the"
 echo "comparison is paired rather than across sessions."
 echo
-echo "# arm,pair,d1_cap,d2_cap,d1_growths,d2_growths,dim1_build_ms,dim2_build_ms,d1_rehash_ms,d2_rehash_ms,total_ms,d1_probe_current,d1_probe_lifetime"
 "${PSQL[@]}" -c "SELECT xpe_set_dim_cardinality(768,3072,16)" >/dev/null
+
+# The timing control compares capacities and growth counts, which does not show
+# that the two arms AGREE. A pre-sized table and a naturally grown one reach the
+# same capacity by different insert orders, so their slot contents differ; only a
+# per-group comparison rules out one of them having lost an entry. The ladder's
+# gate covers the naturally grown arm against PostgreSQL, so establishing that
+# the pre-sized arm matches it closes the pair.
+{
+echo "$GUC"
+echo "CREATE TEMP TABLE armck(arm text, ck text, groups bigint);"
+echo "SELECT xpb_dim_test_policy(0,0);"
+echo "INSERT INTO armck SELECT 'natural', $CK, count(*) FROM xpb_v2_register_report(1,12,'dimgrow');"
+echo "SELECT xpb_dim_test_policy(2048,8192);"
+echo "INSERT INTO armck SELECT 'presized', $CK, count(*) FROM xpb_v2_register_report(1,12,'dimgrow');"
+echo "SELECT xpb_dim_test_policy(0,0);"
+cat <<'SQL'
+SELECT '  ' || rpad(arm,9) || ck || '  groups=' || groups FROM armck ORDER BY arm DESC;
+DO $$
+BEGIN
+    IF (SELECT count(DISTINCT ck) FROM armck) <> 1
+    OR (SELECT count(DISTINCT groups) FROM armck) <> 1 THEN
+        RAISE EXCEPTION 'ARM MISMATCH: pre-sized and naturally grown tables disagree';
+    END IF;
+    RAISE NOTICE 'arm equivalence PASS: both arms produce the same per-group result';
+END $$;
+SQL
+} | "${PSQL[@]}" 2>&1 | grep -vE '^WARNING|^NOTICE:  v2_register_report'
+
+echo
+echo "# arm,pair,d1_cap,d2_cap,d1_growths,d2_growths,dim1_build_ms,dim2_build_ms,d1_rehash_ms,d2_rehash_ms,total_ms,d1_probe_current,d1_probe_lifetime"
 # Pre-sizing uses the test hook. It is diagnostic only: the real path always
 # grows from its normal initial capacity (section 26).
 {
