@@ -129,6 +129,16 @@ typedef struct V2Dim2 { bool occupied; int64 key; int32 payload; } V2Dim2;
  */
 #define V2_DIM_GROW_AT(cap)  ((cap) / 2)
 
+/*
+ * Test-only initial capacities for the two dimension tables.  Zero means the
+ * production policy.  They exist so the paired control can pre-size a table to
+ * the capacity natural growth would have reached, measuring what doubling cost,
+ * and so growth can be forced in tests without a huge dimension.  Diagnostic
+ * only: the real path always grows from its normal initial capacity.
+ */
+static int  v2_dim1_test_init_cap = 0;
+static int  v2_dim2_test_init_cap = 0;
+
 /* Per-table observation.  Never pooled across the two dimensions. */
 typedef struct V2DimStats
 {
@@ -545,9 +555,9 @@ v2_dim1_init(V2Dim1Table *t)
     t->cxt = AllocSetContextCreate(CurrentMemoryContext,
                                    "xpb v2 dim1 hash",
                                    ALLOCSET_DEFAULT_SIZES);
-    t->st.capacity = V2_DIM1_CAP;
-    t->st.initial_capacity = V2_DIM1_CAP;
-    t->st.bytes_current = (size_t) V2_DIM1_CAP * sizeof(V2Dim1);
+    t->st.capacity = v2_dim1_test_init_cap > 0 ? v2_dim1_test_init_cap : V2_DIM1_CAP;
+    t->st.initial_capacity = t->st.capacity;
+    t->st.bytes_current = (size_t) t->st.capacity * sizeof(V2Dim1);
     t->st.bytes_peak = t->st.bytes_current;
     t->slots = MemoryContextAllocZero(t->cxt, t->st.bytes_current);
 }
@@ -696,9 +706,9 @@ v2_dim2_init(V2Dim2Table *t)
     t->cxt = AllocSetContextCreate(CurrentMemoryContext,
                                    "xpb v2 dim2 hash",
                                    ALLOCSET_DEFAULT_SIZES);
-    t->st.capacity = V2_DIM2_CAP;
-    t->st.initial_capacity = V2_DIM2_CAP;
-    t->st.bytes_current = (size_t) V2_DIM2_CAP * sizeof(V2Dim2);
+    t->st.capacity = v2_dim2_test_init_cap > 0 ? v2_dim2_test_init_cap : V2_DIM2_CAP;
+    t->st.initial_capacity = t->st.capacity;
+    t->st.bytes_current = (size_t) t->st.capacity * sizeof(V2Dim2);
     t->st.bytes_peak = t->st.bytes_current;
     t->slots = MemoryContextAllocZero(t->cxt, t->st.bytes_current);
 }
@@ -907,6 +917,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     bool            is_heap = false;
     bool            is_card;
     bool            is_card2;
+    bool            is_dim;
     const char     *heap_path_used = "n/a";
     /*
      * Benchmark 05-E: observation of the aggregation hash table.  Counted in
@@ -916,7 +927,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * absence is itself part of the 05-E result and is reported explicitly
      * rather than left to be inferred.
      */
-    instr_time      t0, t1, tp, tn;
+    instr_time      t0, t1, tp, tn, td0, td1, td2;
+    double          dim1_build_ms = 0, dim2_build_ms = 0;
     double          build_ms = 0, open_ms = 0, source_ms = 0,
                     j1_ms = 0, j2_ms = 0, agg_ms = 0;
 
@@ -938,6 +950,12 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * cardinality ladder that reg2_card cannot express.
      */
     is_card2 = (strncmp(mode, "card2", 5) == 0);
+    /*
+     * Dimension Hash Growth v1 varies dimension cardinality while holding
+     * group cardinality at 12 288, so it needs its own fact table and its own
+     * pair of dimensions.
+     */
+    is_dim = (strncmp(mode, "dimgrow", 7) == 0);
 
     if (is_pgcn)
         fact_relid = RelnameGetRelid("reg2_col");
@@ -945,6 +963,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         fact_relid = RelnameGetRelid("reg2_bad");
     else if (strncmp(mode, "fixedlayout", 11) == 0)
         fact_relid = RelnameGetRelid("reg2_fixed");
+    else if (is_dim)
+        fact_relid = RelnameGetRelid("reg2_dim");
     else if (is_card2)
         fact_relid = RelnameGetRelid("reg2_card2");
     else if (is_card)
@@ -952,7 +972,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     else
         fact_relid = RelnameGetRelid("reg2");
 
-    attnos = (strncmp(mode, "fixedlayout", 11) == 0 || is_card)
+    attnos = (strncmp(mode, "fixedlayout", 11) == 0 || is_card || is_dim)
              ? attnos_fixed : attnos_bad;
 
     /*
@@ -960,9 +980,11 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * that the fact table -- and therefore source cost, join shape and both
      * dimension hash occupancies -- stays identical across the whole ladder.
      */
-    dim1_relid = RelnameGetRelid(is_card2 ? "dim_company_c2"
+    dim1_relid = RelnameGetRelid(is_dim ? "dim_company_d"
+                                 : is_card2 ? "dim_company_c2"
                                  : is_card ? "dim_company_c" : "dim_company");
-    dim2_relid = RelnameGetRelid(is_card2 ? "dim_account_c2"
+    dim2_relid = RelnameGetRelid(is_dim ? "dim_account_d"
+                                 : is_card2 ? "dim_account_c2"
                                  : is_card ? "dim_account_c" : "dim_account2");
     if (!OidIsValid(fact_relid) || !OidIsValid(dim1_relid) || !OidIsValid(dim2_relid))
         ereport(ERROR,
@@ -990,8 +1012,17 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     INSTR_TIME_SET_CURRENT(tp);
     v2_dim1_init(&dim1);
     v2_dim2_init(&dim2);
+    /*
+     * Timed separately: the two tables have different capacities and different
+     * key widths, so one combined build figure could not be attributed.
+     */
+    INSTR_TIME_SET_CURRENT(td0);
     v2_dim1_build(&dim1, dim1_relid);
+    INSTR_TIME_SET_CURRENT(td1);
     v2_dim2_build(&dim2, dim2_relid);
+    INSTR_TIME_SET_CURRENT(td2);
+    dim1_build_ms = INSTR_TIME_GET_MILLISEC(td1) - INSTR_TIME_GET_MILLISEC(td0);
+    dim2_build_ms = INSTR_TIME_GET_MILLISEC(td2) - INSTR_TIME_GET_MILLISEC(td1);
     v2_grp_init(&grp);
     INSTR_TIME_SET_CURRENT(tn);
     build_ms = INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
@@ -1091,7 +1122,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_v2_register_report: unknown source mode \"%s\"",
                                 mode),
-                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout, card or card2; or pgcolumnar, zlfs, card-zlfs or card2-zlfs.")));
+                         errhint("<table>[-deform|-fixed|-projected|-early], where table is heap, bad, fixedlayout, card, card2 or dimgrow; or pgcolumnar, zlfs, card-zlfs or card2-zlfs.")));
         }
 
         heap_path_used = (want == XPB_HEAP_FIXED) ? "fixed"
@@ -1291,6 +1322,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
          */
         v2_dim_report(&extra, "dim1", &dim1.st, dim1.cxt);
         v2_dim_report(&extra, "dim2", &dim2.st, dim2.cxt);
+        appendStringInfo(&extra, "  dim1_build_ms=%.3f dim2_build_ms=%.3f",
+                         dim1_build_ms, dim2_build_ms);
 
         elog(NOTICE,
              "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
@@ -1397,4 +1430,34 @@ xpb_grp_test_policy(PG_FUNCTION_ARGS)
         "initial_capacity=%d max_capacity=%d",
         init > 0 ? init : V2_GRP_CAP,
         maxc)));
+}
+
+/*
+ * xpb_dim_test_policy(dim1_initial int, dim2_initial int) -> text
+ *
+ * Test-only, and diagnostic only.  Pre-sizes the dimension tables so the
+ * paired control can measure what doubling cost against an otherwise identical
+ * table.  0 restores the production policy.  Process-local, so it must be set
+ * in the same connection as the report it governs.
+ */
+PG_FUNCTION_INFO_V1(xpb_dim_test_policy);
+
+Datum
+xpb_dim_test_policy(PG_FUNCTION_ARGS)
+{
+    int     d1 = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
+    int     d2 = PG_ARGISNULL(1) ? 0 : PG_GETARG_INT32(1);
+
+    /* the slot index is a mask, so a non-power-of-two would address part of it */
+    if (d1 < 0 || (d1 > 0 && (d1 < 2 || (d1 & (d1 - 1)) != 0)) ||
+        d2 < 0 || (d2 > 0 && (d2 < 2 || (d2 & (d2 - 1)) != 0)))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xpb_dim_test_policy: capacities must be 0 or powers of two >= 2, got %d and %d",
+                        d1, d2)));
+    v2_dim1_test_init_cap = d1;
+    v2_dim2_test_init_cap = d2;
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf("dim1=%d dim2=%d",
+                                              d1 > 0 ? d1 : V2_DIM1_CAP,
+                                              d2 > 0 ? d2 : V2_DIM2_CAP)));
 }

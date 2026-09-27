@@ -99,6 +99,14 @@ RETURNS text
 LANGUAGE C
 AS '$libdir/xp_batch', 'xpb_grp_test_policy';
 
+-- Test-only and diagnostic-only: pre-size the two dimension hash tables so the
+-- paired control can measure what doubling cost against an otherwise identical
+-- table. 0 restores the production policy.
+CREATE OR REPLACE FUNCTION xpb_dim_test_policy(dim1_initial int, dim2_initial int)
+RETURNS text
+LANGUAGE C
+AS '$libdir/xp_batch', 'xpb_dim_test_policy';
+
 -- Typed pipeline: join + GROUP BY + SUM over the typed batch contract, with
 -- PostgreSQL NULL semantics (join: NULL matches nothing; GROUP BY: NULLs are
 -- one group; SUM: skips NULLs, all-NULL group sums to NULL). Separate from
