@@ -1029,9 +1029,12 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
  * and an artificial ceiling so that a refused growth can be tested without
  * inducing a real OOM.  Passing 0 restores the production policy.
  *
- * The benchmark never calls this.  run-hash-growth.sh prints grp_initial_cap
- * before measuring so that a stray hook is visible in the output -- which is
- * a check a reader can make, not one the runner enforces.
+ * The cardinality ladder never calls this, and run-hash-growth.sh prints
+ * grp_initial_cap before measuring so that a stray hook is visible in the
+ * output -- a check a reader can make, not one the runner enforces.  One
+ * benchmark does call it deliberately: run-rehash-control.sh pre-sizes the
+ * table to the final capacity so that the cost of doubling can be measured
+ * against an otherwise identical table.
  */
 PG_FUNCTION_INFO_V1(xpb_grp_test_policy);
 

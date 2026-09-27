@@ -1583,9 +1583,19 @@ reset, reported as though it described the grown table.
 
 | | 05-E fixed at its ceiling | growing, 10K–147K groups |
 |---|---|---|
-| probes/lookup | 2.707 | **1.20 – 1.32** |
+| probes/lookup, all lookups | 2.707 | **1.20 – 1.32** |
+| probes/lookup, final table only | 2.707 | **1.205** |
 | longest chain in the answering table | 91 | **10 – 17** |
 | longest chain ever walked | 91 | 32 – 37 |
+
+`probes_per_lookup` was **not** split the way the probe marks were, so the
+1.20–1.32 column pools every lookup, including those made at smaller
+capacities before each growth. It is therefore a figure about the *policy*, not
+about the table that answered the query. The final-table figure comes from the
+pre-sized control below, which does all its lookups at capacity 524 288:
+1.2048 against the grown table's pooled 1.2842. Splitting the counter is the
+obvious follow-up and was not done here, since the control already gives the
+number.
 
 So the story is better than the single number allowed:
 
@@ -1645,9 +1655,12 @@ Pre-sizing is not a proposal — section 27 forbids sizing from a known
 cardinality precisely because it hides what is being measured. It is used here
 only as the control that measures it.
 
-The important shape is next to the table: **`agg−rehash` grows far more slowly
-than `agg`**. Steady-state aggregation is not what is driving the top of the
-range; rehash is.
+The important shape is next to the table: **`agg−rehash` grows more slowly
+than `agg`, but not dramatically so** — 34.15 to 50.99 ms from 98 304 to
+147 456 groups is close to linear in the group count. Rehash is what makes the
+difference between the two curves, and it is the part that can be changed by
+policy; steady-state aggregation scaling roughly with the number of groups is
+not in itself a problem.
 
 ## PostgreSQL context (sections 24, 20)
 
