@@ -152,7 +152,15 @@ typedef struct V2DimStats
     int         entries;
     int64       lookups;
     int64       insertions;
-    int64       probes;             /* slots examined, build + lookup     */
+    /*
+     * Slots examined, build + lookup.  Excludes the aborted pass that precedes
+     * a growth: that pass breaks out to grow before reaching the counter.  The
+     * undercount is bounded by one partial probe sequence per growth, which is
+     * noise at the cardinalities measured so far but is not negligible if a
+     * skewed load ever makes those sequences long -- fix the accounting before
+     * publishing probes-per-lookup on a colliding distribution.
+     */
+    int64       probes;
     int         max_probe_current;  /* since the most recent resize       */
     int         max_probe_lifetime; /* never reset                        */
     int         growths;

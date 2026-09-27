@@ -1301,13 +1301,25 @@ SQL
     fi
 
     # Load must never exceed 0.5 on either table once it has grown.
+    #
+    # This needs its OWN report on a table that actually grew. Reusing $line
+    # from the rescan case above measured 10 entries in 256 slots and 16 in
+    # 1024 -- neither had grown, so no growth-policy defect could have made
+    # either assertion fail. Each case below therefore asserts the growth
+    # count as well, so it cannot quietly become vacuous again.
+    dim_fill 700 2600 1 1
+    line=$("${PSQL[@]}" -c "$GUCS
+            SELECT count(*) FROM xpb_v2_register_report(1,12,'card');" 2>&1 \
+           | sed -n 's/^NOTICE:  v2_register_report //p' | tail -1)
     for d in dim1 dim2; do
         lf=$(sed -n "s/.*${d}_load_factor=\([0-9.]*\).*/\1/p" <<<"$line")
-        if [ -n "$lf" ] && awk "BEGIN{exit !($lf <= 0.5)}"; then
-            echo "  PASS  $d load factor stays at or below 0.5 ($lf)"
+        gw=$(sed -n "s/.*${d}_growths=\([0-9]*\).*/\1/p" <<<"$line")
+        if [ -n "$lf" ] && [ -n "$gw" ] && [ "$gw" -ge 1 ] \
+           && awk "BEGIN{exit !($lf <= 0.5)}"; then
+            echo "  PASS  $d load factor stays at or below 0.5 ($lf) after $gw growth(s)"
             pass_count=$((pass_count + 1))
         else
-            echo "  FAIL  $d load factor $lf exceeds the 0.5 policy"
+            echo "  FAIL  $d load=$lf growths=$gw (want load <= 0.5 on a table that grew)"
             fail=1
         fi
     done
