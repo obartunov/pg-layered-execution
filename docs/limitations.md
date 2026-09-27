@@ -26,11 +26,19 @@
   `xpb_batch_partition.c` and `xpb_typed_pipeline.c`. Nothing spills anywhere.
   See `docs/TYPED_BATCH_CONTRACT.md` for the per-table list; three rows there
   do not follow the 3/4 rule and are called out separately
-- `xpb_groupagg2.c`'s group hash takes its capacity from the planner
+- `xpb_groupagg2.c`'s global group hash takes its capacity from the planner
   (`custom_private[6]`, default 16384), not a `#define`, and has no pre-insert
-  guard; a single post-scan check errors above 0.95 load. Sound against row
-  loss -- a full table reports load 1.0 -- but coarser than every other table,
-  and the only one reachable through a planner hook
+  guard; a single post-scan check errors above 0.95 load. Sound against row loss
+  **for that table** -- a full table reports load 1.0 -- but coarser than every
+  other table, and the only one reachable through a planner hook
+- The same file's per-batch local hash (`local_ht`) is NOT covered by that
+  check. With `xp_batch.groupagg2_local_partial` on (a `PGC_USERSET` boolean,
+  default off), it is a fixed `xp_batch.groupagg2_local_hash_cap` table
+  (default 2048) with no guard, `memset` per batch, so the threshold is 2048
+  distinct keys within a single batch of up to 65 536 rows. A row dropped there
+  never reaches the global hash, so the post-scan check cannot see it -- a
+  quietly short sum, reachable by setting one GUC. Fourth site in
+  `docs/roadmap/fixed-hash-silent-drop.md`
 - Two fixed tables have no capacity guard at all and silently drop rows when
   full (`xpb_projection.c` `AGG_CAP`, `xpb_columnar_pipeline.c` `WHASH_CAP`) --
   a wrong answer rather than an error. Reachability unproven; tracked in

@@ -278,7 +278,8 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   | `xpb_projection.c` aggregate | `AGG_CAP` 16384 | fixed, **no guard -- drops rows when full** |
   | `xpb_columnar_pipeline.c` window | `WHASH_CAP` 131072 | fixed, **no guard -- drops rows when full** |
   | `xpb_zlfs.c` group | `GRP_CAP` 16384 | fixed, errors at 3/4 |
-  | `xpb_groupagg2.c` group | `hash_cap_used`, planner-supplied, default 16384 | fixed, **no pre-insert guard**; post-scan `ERROR` above 0.95 load |
+  | `xpb_groupagg2.c` global group | `hash_cap_used`, planner-supplied, default 16384 | fixed, **no pre-insert guard**; post-scan `ERROR` above 0.95 load |
+  | `xpb_groupagg2.c` per-batch local (`local_ht`) | `xp_batch.groupagg2_local_hash_cap`, GUC, default 2048 | fixed, **no guard -- drops rows when full**, invisible to the post-scan check |
 
   The three growing tables are all reached through `xpb_v2_register_report`. So
   "aggregation scales to 147 456 groups", and the dimension cardinalities
@@ -289,14 +290,28 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   The growing tables raise `ERROR` only at a real allocation boundary
   (`MaxAllocSize`, or a slot count that would overflow), not at a load factor.
 
-  `xpb_groupagg2.c` is the one row whose capacity is not a `#define` at all:
-  it arrives from `custom_private[6]`, so a planner underestimate is what fills
-  the table. Its insert loops carry no load check; the protection is a single
-  post-scan test, and it works only because a lost row cannot raise `ngroups`
-  past `hash_cap` — a full table reports load 1.0 and errors. That is a coarser
-  guarantee than every other row here, and it is the only one reachable through
-  a planner hook (`set_rel_pathlist_hook` / `create_upper_paths_hook`, GUC
+  `xpb_groupagg2.c` holds two tables, and only the first is protected. Its
+  **global** hash is the one row whose capacity is not a `#define` at all: it
+  arrives from `custom_private[6]`, so a planner underestimate is what fills it.
+  Its insert loops carry no load check; the protection is a single post-scan
+  test, and for that table it suffices — `ngroups` counts occupied slots and
+  nothing is removed, so a row can only be lost once every slot is occupied,
+  which reports load 1.0 and errors. That is still a coarser guarantee than
+  every other row here, and it is the only one reachable through a planner hook
+  (`set_rel_pathlist_hook` / `create_upper_paths_hook`, GUC
   `xpb_groupagg2_enabled`) rather than an explicit benchmark function.
+
+  Its **per-batch local** hash is not covered by that argument at all. With
+  `xp_batch.groupagg2_local_partial` on — a `PGC_USERSET` boolean, so any
+  session can set it — `local_ht` is a fixed table of
+  `xp_batch.groupagg2_local_hash_cap` slots (default 2048, minimum 256) whose
+  two insert loops have the same fall-off-the-end shape as `AGG_CAP` and
+  `WHASH_CAP`. `local_ngroups` is never compared to `local_cap`; it feeds only
+  statistics. The table is `memset` per batch, so the fill threshold is 2048
+  distinct `(k1, k2)` pairs **within one batch** of up to 65 536 rows, not
+  across the query. A row dropped there never reaches the merge into the global
+  hash, so `ngroups` never sees it and the post-scan check cannot fire: this is
+  the one path where the global table's guarantee does not hold.
 
   The two rows marked **no guard** are not merely capped: `agg_insert()` in
   `xpb_projection.c` and the window-hash insert in `xpb_columnar_pipeline.c`
