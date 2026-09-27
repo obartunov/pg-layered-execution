@@ -257,10 +257,30 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   and errors on a NULL in a requested column rather than carrying it into the
   batch. The bitmap convention already matches, so this is wiring, not
   design.
-* **Fixed-capacity hash tables.** The join and group-by tables have a fixed
-  size and raise an error rather than growing or spilling. Deliberately left
-  as is: where that boundary sits is a measurement benchmark 05 is meant to
-  take, not something to tune away first.
+* **Fixed-capacity hash tables, with one exception.** Benchmark 05-E measured
+  where that boundary sat -- 12 288 groups, a `#define`, not a resource -- and
+  Hash Aggregate Growth v1 then replaced it **in one place only**:
+
+  | table | behaviour |
+  |---|---|
+  | `xpb_v2_report.c` group hash | grows at load 0.5, doubling, no spill |
+  | `xpb_typed_pipeline.c` (`TP_GRP_CAP`) | fixed, errors |
+  | `xpb_batch_groupagg.c` | fixed, errors |
+  | `xpb_batch_hashjoin.c` | fixed, errors |
+  | every dimension hash | fixed, errors |
+
+  So "aggregation scales to 147 456 groups" is a statement about the benchmark
+  report function, not about the pipeline. The other aggregators are unchanged
+  and still carry the 0.5 knee and the hard ceiling. Nothing spills anywhere.
+
+* **`sum(int8)` has three different behaviours, on purpose so far but not by
+  design.** `xpb_typed_pipeline.c` accumulates in INT128 and returns numeric,
+  which is what this document describes. `xpb_v2_report.c` accumulates in a
+  checked int64 and raises `bigint out of range` where PostgreSQL's
+  `sum(bigint)` would have answered in numeric. `xpb_groupagg2.c` accumulates
+  unchecked and can convert a wrapped int64 with `int8_numeric()` -- an open
+  question recorded in `docs/roadmap/groupagg2-int64-overflow.md`, reachability
+  unproven. A single contract needs one answer here.
 * **No planner integration**, no automatic pipeline selection, no expression
   evaluation, no MVCC under concurrent writers.
 * **`make installcheck` is a no-op** — there is no `REGRESS` target. The real

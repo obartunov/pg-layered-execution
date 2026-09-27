@@ -1,9 +1,11 @@
 # Known limitations
 
 ## Data types
-- Only fixed-width NOT NULL columns supported
-- Benchmark uses int32 exclusively
-- No varlena, nullable, or composite types
+- Fixed-offset heap source needs a fixed-width NOT NULL prefix; the deform,
+  projected and early-predicate sources carry varlena, NULL and numeric
+- Typed batch contract carries int4, int8, numeric and varlena (05-A onward);
+  benchmark 04 and earlier were int32 only
+- No composite types; varlena is carried but never aggregated
 
 ## ZLFS zones and cold layer
 - Current ZLFS is one read-only zone, not yet a segmented cold provider
@@ -15,7 +17,9 @@
 - Zone files must be rebuilt after DML or the query must fall back to heap
 
 ## Execution
-- Static-capacity hash tables (GRP_CAP=16384, DIM_CAP=256/512)
+- Static-capacity hash tables everywhere except the benchmark report's group
+  hash, which grows at load 0.5 (V2_DIM1_CAP=256, V2_DIM2_CAP=1024 are now the
+  binding ceiling, at 192 and 768 keys); nothing spills
 - No spill-to-disk for large aggregates or joins
 - Small dimension tables only (must fit in memory)
 - No parallel execution

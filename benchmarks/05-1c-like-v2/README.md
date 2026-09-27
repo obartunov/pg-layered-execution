@@ -13,6 +13,11 @@ with `1c-like-v1`; benchmark 04's data, scripts and checksum are untouched.
 > At what predicate selectivity does `pgColumnar + xp_batch` recover the cost
 > of columnar decode through row-group pruning, relative to `heap + xp_batch`?
 
+> **Partly superseded by 05-B, below.** This section's answer is true of the
+> heap arm *as 05-A measured it*, which ran on the generic deform path. 05-B
+> puts the same row shape on fixed offsets and the ordering reverses at full
+> scan. Read the two together.
+
 **Answer, on this workload: it never has to.** pgColumnar + xp_batch is faster
 than heap + xp_batch at all four measured points, and its margin *narrows* as
 the predicate widens — the opposite direction from a crossover. See
@@ -28,6 +33,15 @@ contradict benchmark 04.
 | pgColumnar | `5b20ae8` (1.0-alpha5) + `patches/pgcolumnar-alpha5/0001-export-fold-reader-api.patch` |
 | `xp_batch.so` | md5 `c82d4b7da6e8793316f30cb2bd5a6d21` |
 | `pgcolumnar.so` | md5 `8ace119c0e5246b716eac5c8dc7dd1cd` |
+
+> **That `xp_batch.so` no longer exists in this tree, and re-running
+> `run-selectivity.sh` at HEAD will not reproduce the table below.** Five later
+> milestones added instrumentation to the same measured path — deform and
+> projected counters, group-hash counters, and two overflow-checked adds per
+> aggregated row. The correctness gate still passes unchanged, and the
+> *ordering* of the arms has held at every re-run, but the absolute
+> milliseconds are those of the pinned build. Later sections state their own
+> build conditions; none of them is comparable with this one.
 
 The required executor batch API patch was previously checked against stock
 PostgreSQL on the same base commit and showed no measurable effect on the
@@ -1372,6 +1386,76 @@ constant.
 
 ---
 
+# What benchmark 05 established, end to end
+
+Six milestones, one pipeline, one dataset family. The chain is meant to be read
+as an argument, and each step's conclusion is the next step's *tested* premise
+rather than an assumption:
+
+1. **Operator cost is source-independent and scales with rows emitted.** Not
+   assumed — 05-E holds the fact table byte-identical across a 48x change in
+   group count and both join phases stay flat, and the heap arm's aggregate
+   column tracks the ZLFS arm's at every ladder point. This is the bridge that
+   lets a source experiment and an aggregate experiment on different tables add
+   up.
+2. **So the cost is in acquiring the representation**, and it is dominated by
+   generic tuple deformation: 2.2–2.5x fixed-offset extraction on one physical
+   table (05-B), with the excess going to materializing attributes nobody asked
+   for and to the per-attribute loop itself (05-C).
+3. **Decode has a floor, and it has been reached.** Projecting recovers about a
+   third; rejecting early recovers another 1.4–1.8x and costs nothing when it
+   cannot prune (05-C, 05-D). What remains is 1.7x behind fixed offsets and
+   4.5x behind pgColumnar at 1/12 — and that residue is **scan granularity**,
+   not decode. No further decode work closes it.
+4. **Downstream, the next limit was not aggregation — it was a `#define`.**
+   05-E found the group hash erroring at 12 288 groups while holding 393 kB,
+   against PostgreSQL's 17 MB for four times as many, with the cost curve
+   breaking at half full. Growing at load 0.5 removed it: probe cost flat
+   across 14x cardinality, ceiling 12x higher, and the only remaining growing
+   cost is rehash — a policy parameter.
+
+Net: acquisition cost is floored by scan granularity, operators are cheap and
+linear in rows, and the apparent scaling limits were compile-time constants.
+That is the three-cost decomposition `docs/architecture.md` already assumed,
+now measured.
+
+## The condition on step 1, and what it costs
+
+05-A through 05-D all ran at **200 groups** — entirely inside the flat
+aggregate regime that 05-E only later bounded. At 147 456 groups the aggregate
+is 77 ms against a 33–49 ms source: the phase those four milestones treated as
+negligible is now the larger one.
+
+So step 1 holds *as measured*, at low cardinality, and the composite reading
+"source dominates, operators are cheap" is **conditional on group count**.
+Nothing in 05-A..05-D is wrong; the synthesis simply does not extend to the
+high end of 05-E's ladder, and none of those sections was re-run there.
+
+## What this baseline does not establish
+
+* **Growth is one code path.** Only the benchmark report function's group hash
+  grows. `xpb_typed_pipeline.c`, `xpb_batch_groupagg.c` and
+  `xpb_batch_hashjoin.c` still carry the fixed ceiling and the 0.5 knee.
+  Nothing spills anywhere.
+* **Uniform distribution only.** Every probe figure rests on it, and probe
+  stability is exactly what a hot key attacks.
+* **One query shape, hand-wired, no planner, no MVCC, warm cache, single
+  core.** Two comparisons against PostgreSQL appear here; both carry the
+  plan-shape difference and neither supports a claim of the form "N times
+  faster than PostgreSQL".
+* **The binding boundary is now the dimension hashes**, `V2_DIM1_CAP` = 256 and
+  `V2_DIM2_CAP` = 1024, at 192 and 768 keys — the same class of compile-time
+  constant the growth milestone removed from the group table.
+* **05-D's predicate-position experiment was never run.** Its 1.4–1.8x is the
+  best case, with the predicate at physical attnum 1. That is the one
+  unmeasured premise under "decode is done".
+
+Timings are comparable only within a section. This host drifts between
+sessions, and in one case within a day, by more than several of the effects
+measured here; every section states the build and the day it was taken on.
+
+---
+
 # Hash Aggregate Growth v1
 
 05-E established that the aggregation ceiling was artificial: a static
@@ -1418,9 +1502,8 @@ last successful cardinality is **147 456 groups — 12x the old ceiling**, which
 is where the *dimension* hashes run out, not the group table.
 
 The part that still grows is the rehash: at 147 456 groups the ladder reports
-26.2 ms of a 77.2 ms aggregate, and a paired control run separately confirms
-the accounting (18.3 ms reported against a measured 16.4 ms difference on a
-faster hour of the same day).
+26.2 ms of a 77.2 ms aggregate — about a third — and a paired control run
+separately confirms the accounting is sound and slightly conservative.
 
 ## What changed, and what deliberately did not
 
@@ -1647,12 +1730,22 @@ connection, 10 pairs:
 
 | arm | growths | aggregate ms | reported rehash_ms | probes/lookup |
 |---|---|---|---|---|
-| natural, 16 384 → 524 288 | 5 | 47.7 | 18.26 | 1.2842 |
-| pre-sized to 524 288 | 0 | 32.1 | 0.00 | 1.2048 |
+| natural, 16 384 → 524 288 | 5 | 40.1 | 17.34 | 1.2842 |
+| pre-sized to 524 288 | 0 | 26.2 | 0.00 | 1.2048 |
 
-Paired difference **+16.4 ms, 95% CI [+9.8, +23.0]**, natural slower in 9/10
-pairs. The counter says 18.3 ms; the control measures 16.4 ms with a CI that
-contains it. **The rehash accounting is independently confirmed.**
+Paired difference **+14.3 ms, 95% CI [+11.8, +16.8]**, natural slower in 10/10
+pairs, two warm-up pairs discarded.
+
+**The counter reads slightly high.** `rehash_ms` says 17.3 ms; the end-to-end
+marginal cost of having doubled is 14.3, and the interval does not reach it.
+The counter is therefore an upper bound on what doubling costs, not an estimate
+of it: it times the whole grow function, including touching memory the pre-sized
+arm pays for elsewhere when it first fills its table. So the accounting is
+confirmed as *sound and conservative* — a 3 ms overstatement at the top of the
+range — rather than exact. An earlier version of this control, with one warm-up
+pair instead of two, gave +16.4 [9.8, 23.0] and did contain the counter; that
+interval was carried by a single first-pair outlier and is not the one
+published.
 
 Two cautions about this table. The control was run separately from the ladder,
 and this host moves even within a day: the ladder's 147 456-group cell reports

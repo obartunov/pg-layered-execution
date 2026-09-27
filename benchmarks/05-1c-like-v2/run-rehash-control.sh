@@ -55,9 +55,13 @@ one() {   # one <policy_sql> <arm> <pair>
     echo "$2,$3,$(g groups),$(g grp_cap),$(g grp_growths),$(g agg),$(g grp_rehash_ms),$(g grp_probes_per_lookup),$(g grp_max_probe_current),$(g grp_max_probe_lifetime)"
 }
 
-# warm-up pair, discarded
-one "SELECT xpb_grp_test_policy(0, 0);"      natural  0 >/dev/null
-one "SELECT xpb_grp_test_policy(524288, 0);" presized 0 >/dev/null
+# Two warm-up pairs, discarded. One is not enough: the first measured pair used
+# to land far outside the rest of the spread and carried more of the paired mean
+# than any single observation should.
+for w in 0 -1; do
+    one "SELECT xpb_grp_test_policy(0, 0);"      natural  "$w" >/dev/null
+    one "SELECT xpb_grp_test_policy(524288, 0);" presized "$w" >/dev/null
+done
 
 for i in $(seq 1 $PAIRS); do
     one "SELECT xpb_grp_test_policy(0, 0);"      natural  "$i"
