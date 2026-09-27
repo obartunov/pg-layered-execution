@@ -791,40 +791,6 @@ SQL
              FROM generate_series(0, 511) g;" >/dev/null
     }
 
-    # Every growth count must still agree with PostgreSQL, per group, not just
-    # on a grand total: a rehash that lost or duplicated a group would keep the
-    # row count right while splitting one group's sums across two slots.
-    grow_case() {   # grow_case <label> <k> <want_growths>
-        local label="$1" k="$2" want="$3" line g b p
-        card_k "$k"
-        line=$("${PSQL[@]}" -c "SET jit=off; SET max_parallel_workers_per_gather=0;
-                SELECT count(*) FROM xpb_v2_register_report(1,12,'card')" 2>&1 \
-               | sed -n 's/^NOTICE:  v2_register_report //p')
-        g=$(sed -n 's/.*[ =]grp_growths=\([0-9]*\).*/\1/p' <<<"$line")
-        b=$("${PSQL[@]}" -c "SET jit=off; SET max_parallel_workers_per_gather=0;
-             SELECT md5(string_agg(company_group||','||account_group||','||company_key
-                        ||','||debit_turnover||','||credit_turnover||','||net_turnover,
-                        '|' ORDER BY company_group, account_group, company_key))
-             FROM xpb_v2_register_report(1,12,'card')" 2>/dev/null | tail -1)
-        p=$("${PSQL[@]}" -c "SELECT md5(string_agg(cg||','||ag||','||ck||','||d||','||c||','||n,
-                    '|' ORDER BY cg, ag, ck)) FROM (
-                 SELECT c.company_group cg, a.account_group ag, r.company_key ck,
-                        sum(r.debit_cents)::bigint d, sum(r.credit_cents)::bigint c,
-                        sum(r.debit_cents - r.credit_cents)::bigint n
-                 FROM reg2_card r
-                 JOIN dim_company_c c ON c.company_key = r.company_key
-                 JOIN dim_account_c a ON a.account_key = r.account_key
-                 WHERE r.period BETWEEN 1 AND 12
-                 GROUP BY 1,2,3) s" 2>/dev/null | tail -1)
-        if [ "$g" = "$want" ] && [ -n "$b" ] && [ "$b" = "$p" ]; then
-            echo "  PASS  $label: $g growth(s), per-group result matches PostgreSQL"
-            pass_count=$((pass_count + 1))
-        else
-            echo "  FAIL  $label: growths=$g (want $want) batch=${b:0:12} sql=${p:0:12}"
-            fail=1
-        fi
-    }
-
     # The policy hook is a process-local static and every psql invocation is a
     # new backend, so it has to be set in the SAME connection as the report it
     # governs. POL does that; forgetting it silently measures the production
@@ -832,6 +798,9 @@ SQL
     POL="SELECT xpb_grp_test_policy(64, 0);"
     GUCS="SET jit=off; SET max_parallel_workers_per_gather=0;"
 
+    # Every growth count must still agree with PostgreSQL, per group, not just
+    # on a grand total: a rehash that lost or duplicated a group would keep the
+    # row count right while splitting one group's sums across two slots.
     grow_case() {   # grow_case <label> <k> <want_growths>
         local label="$1" k="$2" want="$3" line g b p
         card_k "$k"

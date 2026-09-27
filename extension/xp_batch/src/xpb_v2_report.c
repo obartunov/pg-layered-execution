@@ -905,15 +905,15 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         }
 
         /*
-         * Aggregation hash table (benchmark 05-E).  agg_bytes is the actual
-         * allocation, which is sizeof(V2Group) * V2_GRP_CAP whatever the
-         * group count turns out to be: the table is sized once, before a
-         * single row is read.  It is reported as the allocation it is rather
-         * than divided by the group count to manufacture a per-group figure.
+         * Aggregation hash table.  grp_bytes is the live allocation, which is
+         * sizeof(V2Group) * the CURRENT capacity; grp_bytes_peak additionally
+         * covers the moment during a rehash when the old and new tables are
+         * both live.  Reported as allocations rather than divided by the group
+         * count to manufacture a per-group figure.
          *
-         * grp_growths and grp_rehashes are constants here.  They are printed
-         * anyway so that "this implementation never grows" is a recorded
-         * measurement rather than something a reader has to take on trust.
+         * This block described a fixed-capacity table until Hash Aggregate
+         * Growth v1 and said growths and rehashes were constants.  They are
+         * not; the table doubles at half full.
          */
         appendStringInfo(&extra,
                          "  grp_initial_cap=%d grp_cap=%d grp_grow_at=%d"
@@ -1029,8 +1029,9 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
  * and an artificial ceiling so that a refused growth can be tested without
  * inducing a real OOM.  Passing 0 restores the production policy.
  *
- * The benchmark never calls this; run-hash-growth.sh asserts the production
- * policy is in force before it measures anything.
+ * The benchmark never calls this.  run-hash-growth.sh prints grp_initial_cap
+ * before measuring so that a stray hook is visible in the output -- which is
+ * a check a reader can make, not one the runner enforces.
  */
 PG_FUNCTION_INFO_V1(xpb_grp_test_policy);
 
