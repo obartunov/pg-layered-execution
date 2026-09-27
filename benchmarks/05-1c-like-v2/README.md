@@ -1979,15 +1979,26 @@ What the timings say, and do not say:
 
 * **Join cost is flat.** join1 3.2–3.4 ms and join2 3.4–3.6 ms across a 12x
   change in dimension cardinality and a 8x change in dimension table bytes:
-  6.1% and 5.7% between the extreme medians. The baseline for calling that
-  flat is this dataset's own noise, not an external band — within a *single*
-  cardinality the 25 measurements span 42% to 94% of their own median, an
-  order of magnitude more than the variation across the whole ladder. The
-  per-pass medians also show no ordering by cardinality: the narrowest point
-  gives 3.30/3.30/3.40/3.40/3.60 and the widest 3.30/3.20/3.50/3.30/3.20.
-  So the honest reading is "no effect resolved", not "a small cost measured".
-  `check-summaries.py` enforces exactly this comparison — across-ladder
-  spread must stay below within-cardinality spread — rather than a constant.
+  6.1% and 5.7% between the extreme medians. The baseline for calling that flat
+  is this dataset's own noise, not an external band, and the two sides have to
+  be the same statistic to be comparable. Within a *single* cardinality the five
+  per-pass medians span 9.4% and 14.3% — 1.5x and 2.5x the variation across the
+  whole ladder. The per-pass medians also show no ordering by cardinality: the
+  narrowest point gives 3.30/3.30/3.40/3.40/3.60 and the widest
+  3.30/3.20/3.50/3.30/3.20. So the honest reading is "no effect resolved", not
+  "a small cost measured".
+
+  `check-summaries.py` enforces that comparison — the across-ladder spread of
+  medians must stay below the within-cardinality spread of per-pass medians —
+  rather than a constant. Measured sensitivity, by scaling join1 at the widest
+  point in both the raw passes and the CSV: it passes at 1.05x and fails from
+  1.08x, so the 8% class of regression this claim rests on is caught.
+
+  Secondary observation, not the baseline: the 25 *raw* runs inside one
+  cardinality span 42% to 94% of their own median. That is an extreme value set
+  by a single spike per cell, which is why it is not what the gate compares
+  against — paired with an already-smoothed median it left roughly 15x headroom
+  and would have passed a 60% regression.
 * **Rehash is negligible here**, unlike in the group hash. 0.023 ms and
   0.175 ms at the widest point, against a 61.5 ms total: the dimension tables
   hold thousands of entries where the group table held a hundred thousand.

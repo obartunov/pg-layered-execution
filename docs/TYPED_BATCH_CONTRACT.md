@@ -313,15 +313,18 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   hash, so `ngroups` never sees it and the post-scan check cannot fire: this is
   the one path where the global table's guarantee does not hold.
 
-  The two rows marked **no guard** are not merely capped: `agg_insert()` in
-  `xpb_projection.c` and the window-hash insert in `xpb_columnar_pipeline.c`
-  probe every slot and then fall off the end of the loop, discarding the row
-  without an error -- a wrong answer rather than a failure, the same defect
-  class that was fixed in `xpb_v2_report.c`'s dimension hashes. Both are
-  pre-existing and on paths outside the measured pipeline; reachability is
-  unproven and is recorded as its own task in
-  `docs/roadmap/fixed-hash-silent-drop.md`. It is not folded into a benchmark
-  milestone, for the same reason the `xpb_groupagg2.c` overflow is not.
+  The three rows marked **no guard** are not merely capped: `agg_insert()` in
+  `xpb_projection.c`, the window-hash insert in `xpb_columnar_pipeline.c`, and
+  both `local_ht` inserts in `xpb_groupagg2.c` probe every slot and then fall
+  off the end of the loop, discarding the row without an error -- a wrong answer
+  rather than a failure, the same defect class that was fixed in
+  `xpb_v2_report.c`'s dimension hashes. All three are pre-existing and on paths
+  outside the measured pipeline; reachability is unproven and is recorded as
+  their own task in `docs/roadmap/fixed-hash-silent-drop.md`. `local_ht` is the
+  most reachable of them, because it is cleared per batch: its threshold is
+  2048 distinct keys inside one batch of at most 65 536 rows, not across the
+  query. None of this is folded into a benchmark milestone, for the same reason
+  the `xpb_groupagg2.c` overflow is not.
 
 * **`sum(int8)` has three different behaviours, on purpose so far but not by
   design.** `xpb_typed_pipeline.c` accumulates in INT128 and returns numeric,

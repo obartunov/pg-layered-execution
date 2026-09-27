@@ -24,7 +24,7 @@
   other table is still fixed, most of them erroring at 3/4 load before the
   insert -- including the dimension hashes in `xpb_batch_hashjoin.c`,
   `xpb_batch_partition.c` and `xpb_typed_pipeline.c`. Nothing spills anywhere.
-  See `docs/TYPED_BATCH_CONTRACT.md` for the per-table list; three rows there
+  See `docs/TYPED_BATCH_CONTRACT.md` for the per-table list; four rows there
   do not follow the 3/4 rule and are called out separately
 - `xpb_groupagg2.c`'s global group hash takes its capacity from the planner
   (`custom_private[6]`, default 16384), not a `#define`, and has no pre-insert
@@ -39,9 +39,11 @@
   never reaches the global hash, so the post-scan check cannot see it -- a
   quietly short sum, reachable by setting one GUC. Fourth site in
   `docs/roadmap/fixed-hash-silent-drop.md`
-- Two fixed tables have no capacity guard at all and silently drop rows when
-  full (`xpb_projection.c` `AGG_CAP`, `xpb_columnar_pipeline.c` `WHASH_CAP`) --
-  a wrong answer rather than an error. Reachability unproven; tracked in
+- Three fixed tables have no capacity guard at all and silently drop rows when
+  full -- a wrong answer rather than an error: `xpb_projection.c` `AGG_CAP`
+  (16384, per query), `xpb_columnar_pipeline.c` `WHASH_CAP` (131072, per query),
+  and `xpb_groupagg2.c` `local_ht` (the GUC above, 2048 default, **per batch**).
+  Reachability unproven; all three tracked in
   `docs/roadmap/fixed-hash-silent-drop.md`
 - No spill-to-disk for large aggregates or joins
 - Small dimension tables only (must fit in memory)

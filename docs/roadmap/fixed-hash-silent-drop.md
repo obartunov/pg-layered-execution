@@ -4,13 +4,19 @@ Status: **open, reachability unproven. Starts with a reproducer, not a fix.**
 
 Found while updating `docs/TYPED_BATCH_CONTRACT.md` for Dimension Hash Growth
 v1. The milestone's own tables were the ones being changed; auditing the table
-of *every* fixed-capacity hash in the extension turned up three that are not
-merely capped but unguarded, and a fourth whose guard is sound only for part of
-what it appears to cover. Two were found in the first pass; `xpb_groupagg2.c`'s
-pair was found when review (@Teodor) rejected the first version of that table
-for asserting a guarantee the file's second hash does not have. Deliberately kept out of that milestone: this is a
-correctness question on paths outside the measured pipeline, and it deserves its
-own answer, like `docs/roadmap/groupagg2-int64-overflow.md`.
+of *every* fixed-capacity hash in the extension turned up **three unguarded
+tables**, plus a fourth whose guard is sound for itself but does not cover the
+third. Two were found in the first pass; `xpb_groupagg2.c`'s pair was found when
+review (@Teodor) rejected the first version of that table for asserting a
+guarantee the file's second hash does not have.
+
+That is the ordinal scheme used throughout this note: three sites drop rows,
+and the fourth table is carried alongside them because its guard is what made
+the third one easy to miss.
+
+Deliberately kept out of that milestone: this is a correctness question on paths
+outside the measured pipeline, and it deserves its own answer, like
+`docs/roadmap/groupagg2-int64-overflow.md`.
 
 ## The shape of it
 
@@ -27,6 +33,11 @@ xpb_projection.c:51-65        agg_insert(), AGG_CAP 16384, key (k1,k2)
 
 xpb_columnar_pipeline.c:107-121   window hash, WHASH_CAP 131072, key (k1,k2,k3)
     same shape; on fall-through ngroups is not incremented either
+
+xpb_groupagg2.c:636-650, :745-759   local_ht, per-batch, key (k1,k2)
+    same shape; capacity is xp_batch.groupagg2_local_hash_cap, a GUC
+    (PGC_USERSET, default 2048, min 256), alloc at :450,
+    memset(local_ht, 0, ...) per batch at :627 and :738
 ```
 
 This is the same defect class that was found and fixed in `xpb_v2_report.c`'s
@@ -35,10 +46,12 @@ sum that is quietly too small. Ten of the extension's other fixed tables
 (`xpb_typed_pipeline.c`, `xpb_batch_groupagg.c`, `xpb_batch_hashjoin.c`,
 `xpb_batch_partition.c`, `xpb_zlfs.c`) raise at 3/4 load before the probe loop,
 which both prevents the drop and guarantees the loop terminates on a free slot.
-These two have no such guard.
+These three have no such guard.
 
-`xpb_groupagg2.c` holds a third and a fourth table, and they are not the same
-case as each other.
+### The fourth table: a guard that covers only itself
+
+`xpb_groupagg2.c` holds a second hash besides `local_ht`, and it is the reason
+the third site was easy to miss.
 
 Its **global** hash has no pre-insert load check either, but a single post-scan
 test above 0.95 load is sound against row loss *for that table*: `ngroups`
@@ -50,17 +63,7 @@ fill" is a question about estimates rather than about dataset cardinality, and
 it is the only one reachable through a planner hook rather than an explicit
 benchmark function.
 
-Its **per-batch local** hash is a genuine fourth unguarded site, and the most
-reachable of the four:
-
-```
-xpb_groupagg2.c:450        local_ht = palloc0(local_cap * sizeof(CGroupEntry))
-                           local_cap = xp_batch.groupagg2_local_hash_cap
-                                       GUC, PGC_USERSET, default 2048, min 256
-xpb_groupagg2.c:636-650    insert loop, same fall-off-the-end shape
-xpb_groupagg2.c:745-759    second insert loop, same shape
-xpb_groupagg2.c:627,738    memset(local_ht, 0, ...) per batch
-```
+### Why the third site is the most reachable of the three
 
 `local_ngroups` is never compared to `local_cap` — it feeds only
 `lp_partials_emitted` and `lp_max_groups_in_batch`. Because the table is cleared
@@ -81,9 +84,20 @@ One useful consequence for the reproducer: `lp_max_groups_in_batch` pins at
 and nothing currently checks it. That is the cheapest available signal for step
 1 on this site.
 
-Because linear probing here scans all slots, a drop requires the table to be
-**completely** full, i.e. 16384 or 131072 distinct keys respectively -- not
-merely heavily loaded.
+Because linear probing scans all slots, a drop requires the table to be
+**completely** full -- not merely heavily loaded. What "full" costs differs by
+an order of magnitude between the three:
+
+```
+xpb_projection.c       AGG_CAP     16384 distinct (k1,k2)      per query
+xpb_columnar_pipeline  WHASH_CAP  131072 distinct (k1,k2,k3)   per query
+xpb_groupagg2 local_ht local_cap    2048 distinct (k1,k2)      PER BATCH
+                                     256 at the GUC minimum
+```
+
+The per-batch scope is what makes the third one different in kind rather than
+in degree: a batch holds at most 65 536 rows, so 2048 distinct keys inside one
+is an ordinary shape, and 256 is close to unavoidable.
 
 ## Why it is not being fixed yet
 
