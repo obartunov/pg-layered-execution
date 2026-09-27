@@ -104,6 +104,154 @@ PG_FUNCTION_INFO_V1(xpb_v2_register_report);
 typedef struct V2Dim1 { bool occupied; int32 key; int32 payload; } V2Dim1;
 typedef struct V2Dim2 { bool occupied; int64 key; int32 payload; } V2Dim2;
 
+/*
+ * Dimension hash tables (Dimension Hash Growth v1).
+ *
+ * These were fixed arrays with a 3/4 load limit that raised an error, which is
+ * what made the group-hash result in benchmark 05-E possible to state but also
+ * what capped the whole harness once the group table could grow: reg2_card2
+ * only reaches 147 456 groups by holding BOTH of these at their limit -- 192
+ * of 256 slots and 768 of 1024. Skew attacks load factor, so measuring skew
+ * against saturated dimension tables would make a regression impossible to
+ * attribute to one hash or the other.
+ *
+ * Same preregistered policy as the group hash, and nothing else changes: grow
+ * when the table is half full, double, rehash, same hash function, same key
+ * equality, same linear probing, same payload, same NULL handling, same
+ * duplicate-key behaviour. No spill.
+ *
+ * The two tables are deliberately NOT unified. dim1 keys are int32 and dim2
+ * keys are int64, and both hash with (uint32) key * 2654435761u -- so dim2
+ * truncates its key to 32 bits before hashing. That is existing behaviour and
+ * is preserved exactly here; it is recorded rather than fixed because changing
+ * it would change which keys collide, which is a different experiment. A
+ * single generic table would have to hide that asymmetry to look tidy.
+ */
+#define V2_DIM_GROW_AT(cap)  ((cap) / 2)
+
+/* Per-table observation.  Never pooled across the two dimensions. */
+typedef struct V2DimStats
+{
+    int         initial_capacity;
+    int         capacity;
+    int         entries;
+    int64       lookups;
+    int64       insertions;
+    int64       probes;             /* slots examined, build + lookup     */
+    int         max_probe_current;  /* since the most recent resize       */
+    int         max_probe_lifetime; /* never reset                        */
+    int         growths;
+    int64       rehash_entries;
+    double      rehash_ms;
+    size_t      bytes_current;
+    size_t      bytes_peak;         /* old + new while both are live      */
+} V2DimStats;
+
+typedef struct V2Dim1Table
+{
+    V2Dim1         *slots;
+    MemoryContext   cxt;
+    V2DimStats      st;
+} V2Dim1Table;
+
+typedef struct V2Dim2Table
+{
+    V2Dim2         *slots;
+    MemoryContext   cxt;
+    V2DimStats      st;
+} V2Dim2Table;
+
+static void
+v2_dim_report(StringInfo out, const char *what, const V2DimStats *st,
+              MemoryContext cxt)
+{
+    appendStringInfo(out,
+                     "  %s_initial_cap=%d %s_cap=%d %s_grow_at=%d"
+                     " %s_entries=%d %s_load_factor=%.4f"
+                     " %s_bytes=%zu %s_bytes_peak=%zu %s_cxt_bytes=%zu"
+                     " %s_lookups=" INT64_FORMAT " %s_insertions=" INT64_FORMAT
+                     " %s_probes=" INT64_FORMAT
+                     " %s_probes_per_lookup_lifetime=%.4f"
+                     " %s_max_probe_current=%d %s_max_probe_lifetime=%d"
+                     " %s_growths=%d %s_rehashes=%d"
+                     " %s_rehash_entries=" INT64_FORMAT " %s_rehash_ms=%.3f",
+                     what, st->initial_capacity, what, st->capacity,
+                     what, V2_DIM_GROW_AT(st->capacity),
+                     what, st->entries,
+                     what, (double) st->entries / st->capacity,
+                     what, st->bytes_current, what, st->bytes_peak,
+                     /*
+                      * Measured by the memory system rather than by this
+                      * file's arithmetic: if a growth ever failed to release
+                      * its predecessor this would exceed _bytes.
+                      */
+                     what, MemoryContextMemAllocated(cxt, false),
+                     what, st->lookups, what, st->insertions,
+                     what, st->probes,
+                     /*
+                      * Named _lifetime because it pools every probe made at
+                      * every capacity, build and lookup alike.  It is a figure
+                      * about the whole execution, not about the final table --
+                      * the group hash's unqualified equivalent had to be
+                      * relabelled after review for exactly that reason.
+                      */
+                     what,
+                     (st->lookups + st->insertions) > 0
+                         ? (double) st->probes / (double) (st->lookups + st->insertions)
+                         : 0.0,
+                     what, st->max_probe_current,
+                     what, st->max_probe_lifetime,
+                     /* one rehash per growth by construction, both printed */
+                     what, st->growths, what, st->growths,
+                     what, st->rehash_entries, what, st->rehash_ms);
+}
+
+static inline void
+v2_dim_note_probe(V2DimStats *st, int len)
+{
+    st->probes += len;
+    if (len > st->max_probe_current)
+        st->max_probe_current = len;
+    if (len > st->max_probe_lifetime)
+        st->max_probe_lifetime = len;
+}
+
+/*
+ * Capacity arithmetic, shared because it is the part that has nothing to do
+ * with the key type: doubling is checked for overflow in the slot count and in
+ * the byte size before anything is allocated, and the caller's table is left
+ * untouched if either cannot be represented.  Returns the new byte size.
+ */
+static size_t
+v2_dim_next_bytes(const char *what, int oldcap, size_t elemsize, int *newcap)
+{
+    size_t  bytes;
+
+    if (oldcap > INT_MAX / 2)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: %s hash cannot grow past %d slots",
+                        what, oldcap),
+                 errdetail("Doubling would overflow the slot count.")));
+    *newcap = oldcap * 2;
+
+    if ((size_t) *newcap > SIZE_MAX / elemsize)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: %s hash cannot grow past %d slots",
+                        what, oldcap),
+                 errdetail("Doubling would overflow the allocation size.")));
+    bytes = (size_t) *newcap * elemsize;
+
+    if (bytes > MaxAllocSize)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("v2_register_report: %s hash would need %zu bytes, over the %zu byte allocation limit",
+                        what, bytes, (size_t) MaxAllocSize),
+                 errdetail("No spill is implemented; this is a hard boundary.")));
+    return bytes;
+}
+
 typedef struct V2Group
 {
     bool    occupied;
@@ -391,16 +539,131 @@ v2_grp_upsert(V2GroupTable *t, int32 g1, int32 g2, int32 ck,
  * storing it could only ever produce a wrong match.
  */
 static void
-v2_dim1_build(V2Dim1 *d, Oid relid)
+v2_dim1_init(V2Dim1Table *t)
+{
+    memset(t, 0, sizeof(*t));
+    t->cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                   "xpb v2 dim1 hash",
+                                   ALLOCSET_DEFAULT_SIZES);
+    t->st.capacity = V2_DIM1_CAP;
+    t->st.initial_capacity = V2_DIM1_CAP;
+    t->st.bytes_current = (size_t) V2_DIM1_CAP * sizeof(V2Dim1);
+    t->st.bytes_peak = t->st.bytes_current;
+    t->slots = MemoryContextAllocZero(t->cxt, t->st.bytes_current);
+}
+
+static void
+v2_dim1_grow(V2Dim1Table *t)
+{
+    V2Dim1     *old = t->slots;
+    int         oldcap = t->st.capacity;
+    int         newcap;
+    size_t      newbytes = v2_dim_next_bytes("dim1", oldcap, sizeof(V2Dim1), &newcap);
+    instr_time  gs, ge;
+
+    INSTR_TIME_SET_CURRENT(gs);
+
+    /* both tables are live from here until the pfree below */
+    if (t->st.bytes_current + newbytes > t->st.bytes_peak)
+        t->st.bytes_peak = t->st.bytes_current + newbytes;
+
+    t->slots = MemoryContextAllocZero(t->cxt, newbytes);
+    t->st.capacity = newcap;
+
+    /*
+     * Reinserted with the new mask, not copied: a slot index is a function of
+     * the capacity, so memcpying to the same indexes would leave entries where
+     * the probe sequence for their key can no longer find them, and a lookup
+     * would then report a missing dimension key -- a wrong join result, not an
+     * error.
+     */
+    for (int i = 0; i < oldcap; i++)
+    {
+        uint32  h;
+        bool    placed = false;
+
+        if (!old[i].occupied)
+            continue;
+        h = (uint32) old[i].key * 2654435761u;
+        for (int probe = 0; probe < newcap; probe++)
+        {
+            int idx = (int) ((h + probe) & (newcap - 1));
+
+            if (!t->slots[idx].occupied)
+            {
+                t->slots[idx] = old[i];
+                placed = true;
+                break;
+            }
+        }
+        if (!placed)
+            elog(ERROR, "v2_register_report: dim1 rehash found no free slot in %d",
+                 newcap);
+        t->st.rehash_entries++;
+    }
+
+    pfree(old);
+    t->st.bytes_current = newbytes;
+    t->st.growths++;
+    /* the chains just measured belong to the table that has been replaced */
+    t->st.max_probe_current = 0;
+
+    INSTR_TIME_SET_CURRENT(ge);
+    t->st.rehash_ms += INSTR_TIME_GET_MILLISEC(ge) - INSTR_TIME_GET_MILLISEC(gs);
+}
+
+/*
+ * Insert or ignore, preserving the original duplicate-key behaviour: the first
+ * payload seen for a key wins and later rows with the same key are dropped.
+ *
+ * Growth is decided from entries and capacity alone -- never from where probing
+ * stopped -- so the threshold cannot depend on insertion order. Invariant: an
+ * entry is only ever added to a table that is strictly less than half full, so
+ * entries can reach exactly capacity/2 and the load factor never exceeds 0.5.
+ */
+static void
+v2_dim1_insert(V2Dim1Table *t, int32 key, int32 payload)
+{
+    uint32  h = (uint32) key * 2654435761u;
+
+    for (;;)
+    {
+        int cap = t->st.capacity;
+
+        for (int probe = 0; probe < cap; probe++)
+        {
+            int idx = (int) ((h + probe) & (cap - 1));
+
+            if (!t->slots[idx].occupied)
+            {
+                if (t->st.entries >= V2_DIM_GROW_AT(cap))
+                    break;              /* grow, then probe again */
+                t->slots[idx].occupied = true;
+                t->slots[idx].key = key;
+                t->slots[idx].payload = payload;
+                t->st.entries++;
+                t->st.insertions++;
+                v2_dim_note_probe(&t->st, probe + 1);
+                return;
+            }
+            if (t->slots[idx].key == key)
+            {
+                v2_dim_note_probe(&t->st, probe + 1);
+                return;                 /* duplicate: first payload wins */
+            }
+        }
+        v2_dim1_grow(t);
+    }
+}
+
+static void
+v2_dim1_build(V2Dim1Table *t, Oid relid)
 {
     int16           attnos[2] = {1, 2};
     XpBatchSource  *src = xpb_heap_source_create_ex(relid, attnos, 2,
                                                     XPB_HEAP_DEFORM, false, 0, 0);
     XpColumnBatch   batch;
 
-    int             nrows_in = 0;
-
-    memset(d, 0, V2_DIM1_CAP * sizeof(V2Dim1));
     memset(&batch, 0, sizeof(batch));
     batch.capacity = 1024;
     batch.ncols = 2;
@@ -412,42 +675,14 @@ v2_dim1_build(V2Dim1 *d, Oid relid)
 
         for (int r = 0; r < batch.nrows; r++)
         {
-            uint32 h;
-
+            /*
+             * A NULL key or payload is skipped, unchanged: under SQL semantics
+             * a NULL key can never equal a fact key, so storing it could only
+             * produce a wrong match.
+             */
             if (xpcb_isnull(&batch, 0, r) || xpcb_isnull(&batch, 1, r))
                 continue;
-            h = (uint32) k[r] * 2654435761u;
-            for (int i = 0; i < V2_DIM1_CAP; i++)
-            {
-                int idx = (h + i) & (V2_DIM1_CAP - 1);
-
-                if (!d[idx].occupied)
-                {
-                    /*
-                     * Refuse rather than drop.  Without this the probe loop
-                     * simply ran off the end of a full table and the
-                     * dimension row was discarded in silence -- and every
-                     * fact row referencing that key then failed the join
-                     * lookup and vanished from the aggregate, so the report
-                     * returned smaller sums with no error at all.  The typed
-                     * pipeline's tp_dim_build has always checked this; these
-                     * two did not.
-                     */
-                    if (nrows_in >= V2_DIM1_CAP * 3 / 4)
-                        ereport(ERROR,
-                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                                 errmsg("v2_register_report: dim1 hash overflow (%d keys, cap %d)",
-                                        nrows_in, V2_DIM1_CAP),
-                                 errdetail("The dimension is larger than this benchmark harness can hold.")));
-                    d[idx].occupied = true;
-                    d[idx].key = k[r];
-                    d[idx].payload = p[r];
-                    nrows_in++;
-                    break;
-                }
-                if (d[idx].key == k[r])
-                    break;
-            }
+            v2_dim1_insert(t, k[r], p[r]);
         }
         xpcb_release_owned(&batch);
     }
@@ -455,16 +690,119 @@ v2_dim1_build(V2Dim1 *d, Oid relid)
 }
 
 static void
-v2_dim2_build(V2Dim2 *d, Oid relid)
+v2_dim2_init(V2Dim2Table *t)
+{
+    memset(t, 0, sizeof(*t));
+    t->cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                   "xpb v2 dim2 hash",
+                                   ALLOCSET_DEFAULT_SIZES);
+    t->st.capacity = V2_DIM2_CAP;
+    t->st.initial_capacity = V2_DIM2_CAP;
+    t->st.bytes_current = (size_t) V2_DIM2_CAP * sizeof(V2Dim2);
+    t->st.bytes_peak = t->st.bytes_current;
+    t->slots = MemoryContextAllocZero(t->cxt, t->st.bytes_current);
+}
+
+static void
+v2_dim2_grow(V2Dim2Table *t)
+{
+    V2Dim2     *old = t->slots;
+    int         oldcap = t->st.capacity;
+    int         newcap;
+    size_t      newbytes = v2_dim_next_bytes("dim2", oldcap, sizeof(V2Dim2), &newcap);
+    instr_time  gs, ge;
+
+    INSTR_TIME_SET_CURRENT(gs);
+
+    if (t->st.bytes_current + newbytes > t->st.bytes_peak)
+        t->st.bytes_peak = t->st.bytes_current + newbytes;
+
+    t->slots = MemoryContextAllocZero(t->cxt, newbytes);
+    t->st.capacity = newcap;
+
+    /*
+     * Reinserted with the new mask, not copied -- same reasoning as dim1.  Note
+     * the (uint32) cast on an int64 key: that truncation is the existing hash
+     * and is reproduced here deliberately, so a rehashed entry lands where a
+     * fresh lookup will look for it.
+     */
+    for (int i = 0; i < oldcap; i++)
+    {
+        uint32  h;
+        bool    placed = false;
+
+        if (!old[i].occupied)
+            continue;
+        h = (uint32) old[i].key * 2654435761u;
+        for (int probe = 0; probe < newcap; probe++)
+        {
+            int idx = (int) ((h + probe) & (newcap - 1));
+
+            if (!t->slots[idx].occupied)
+            {
+                t->slots[idx] = old[i];
+                placed = true;
+                break;
+            }
+        }
+        if (!placed)
+            elog(ERROR, "v2_register_report: dim2 rehash found no free slot in %d",
+                 newcap);
+        t->st.rehash_entries++;
+    }
+
+    pfree(old);
+    t->st.bytes_current = newbytes;
+    t->st.growths++;
+    t->st.max_probe_current = 0;
+
+    INSTR_TIME_SET_CURRENT(ge);
+    t->st.rehash_ms += INSTR_TIME_GET_MILLISEC(ge) - INSTR_TIME_GET_MILLISEC(gs);
+}
+
+static void
+v2_dim2_insert(V2Dim2Table *t, int64 key, int32 payload)
+{
+    uint32  h = (uint32) key * 2654435761u;
+
+    for (;;)
+    {
+        int cap = t->st.capacity;
+
+        for (int probe = 0; probe < cap; probe++)
+        {
+            int idx = (int) ((h + probe) & (cap - 1));
+
+            if (!t->slots[idx].occupied)
+            {
+                if (t->st.entries >= V2_DIM_GROW_AT(cap))
+                    break;
+                t->slots[idx].occupied = true;
+                t->slots[idx].key = key;
+                t->slots[idx].payload = payload;
+                t->st.entries++;
+                t->st.insertions++;
+                v2_dim_note_probe(&t->st, probe + 1);
+                return;
+            }
+            if (t->slots[idx].key == key)
+            {
+                v2_dim_note_probe(&t->st, probe + 1);
+                return;
+            }
+        }
+        v2_dim2_grow(t);
+    }
+}
+
+static void
+v2_dim2_build(V2Dim2Table *t, Oid relid)
 {
     int16           attnos[2] = {1, 2};
     XpBatchSource  *src = xpb_heap_source_create_ex(relid, attnos, 2,
                                                     XPB_HEAP_DEFORM, false, 0, 0);
     XpColumnBatch   batch;
 
-    int             nrows_in = 0;
-
-    memset(d, 0, V2_DIM2_CAP * sizeof(V2Dim2));
     memset(&batch, 0, sizeof(batch));
     batch.capacity = 1024;
     batch.ncols = 2;
@@ -476,42 +814,9 @@ v2_dim2_build(V2Dim2 *d, Oid relid)
 
         for (int r = 0; r < batch.nrows; r++)
         {
-            uint32 h;
-
             if (xpcb_isnull(&batch, 0, r) || xpcb_isnull(&batch, 1, r))
                 continue;
-            h = (uint32) k[r] * 2654435761u;
-            for (int i = 0; i < V2_DIM2_CAP; i++)
-            {
-                int idx = (h + i) & (V2_DIM2_CAP - 1);
-
-                if (!d[idx].occupied)
-                {
-                    /*
-                     * Refuse rather than drop.  Without this the probe loop
-                     * simply ran off the end of a full table and the
-                     * dimension row was discarded in silence -- and every
-                     * fact row referencing that key then failed the join
-                     * lookup and vanished from the aggregate, so the report
-                     * returned smaller sums with no error at all.  The typed
-                     * pipeline's tp_dim_build has always checked this; these
-                     * two did not.
-                     */
-                    if (nrows_in >= V2_DIM2_CAP * 3 / 4)
-                        ereport(ERROR,
-                                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                                 errmsg("v2_register_report: dim2 hash overflow (%d keys, cap %d)",
-                                        nrows_in, V2_DIM2_CAP),
-                                 errdetail("The dimension is larger than this benchmark harness can hold.")));
-                    d[idx].occupied = true;
-                    d[idx].key = k[r];
-                    d[idx].payload = p[r];
-                    nrows_in++;
-                    break;
-                }
-                if (d[idx].key == k[r])
-                    break;
-            }
+            v2_dim2_insert(t, k[r], p[r]);
         }
         xpcb_release_owned(&batch);
     }
@@ -519,32 +824,51 @@ v2_dim2_build(V2Dim2 *d, Oid relid)
 }
 
 static inline bool
-v2_dim1_lookup(const V2Dim1 *d, int32 key, int32 *payload)
+v2_dim1_lookup(V2Dim1Table *t, int32 key, int32 *payload)
 {
-    uint32 h = (uint32) key * 2654435761u;
+    uint32      h = (uint32) key * 2654435761u;
+    int         cap = t->st.capacity;
+    V2Dim1     *d = t->slots;
 
-    for (int i = 0; i < V2_DIM1_CAP; i++)
+    t->st.lookups++;
+    for (int i = 0; i < cap; i++)
     {
-        int idx = (h + i) & (V2_DIM1_CAP - 1);
+        int idx = (int) ((h + i) & (cap - 1));
 
-        if (!d[idx].occupied) return false;
-        if (d[idx].key == key) { *payload = d[idx].payload; return true; }
+        /* first empty slot ends the chain: there are no deletions */
+        if (!d[idx].occupied) { v2_dim_note_probe(&t->st, i + 1); return false; }
+        if (d[idx].key == key)
+        {
+            *payload = d[idx].payload;
+            v2_dim_note_probe(&t->st, i + 1);
+            return true;
+        }
     }
+    v2_dim_note_probe(&t->st, cap);
     return false;
 }
 
 static inline bool
-v2_dim2_lookup(const V2Dim2 *d, int64 key, int32 *payload)
+v2_dim2_lookup(V2Dim2Table *t, int64 key, int32 *payload)
 {
-    uint32 h = (uint32) key * 2654435761u;
+    uint32      h = (uint32) key * 2654435761u;
+    int         cap = t->st.capacity;
+    V2Dim2     *d = t->slots;
 
-    for (int i = 0; i < V2_DIM2_CAP; i++)
+    t->st.lookups++;
+    for (int i = 0; i < cap; i++)
     {
-        int idx = (h + i) & (V2_DIM2_CAP - 1);
+        int idx = (int) ((h + i) & (cap - 1));
 
-        if (!d[idx].occupied) return false;
-        if (d[idx].key == key) { *payload = d[idx].payload; return true; }
+        if (!d[idx].occupied) { v2_dim_note_probe(&t->st, i + 1); return false; }
+        if (d[idx].key == key)
+        {
+            *payload = d[idx].payload;
+            v2_dim_note_probe(&t->st, i + 1);
+            return true;
+        }
     }
+    v2_dim_note_probe(&t->st, cap);
     return false;
 }
 
@@ -571,8 +895,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     int16          *attnos;
     XpBatchSource  *src;
     XpColumnBatch   batch;
-    V2Dim1         *dim1;
-    V2Dim2         *dim2;
+    V2Dim1Table     dim1;
+    V2Dim2Table     dim2;
     V2GroupTable    grp;
     int32          *grp1_buf,
                    *grp2_buf;
@@ -664,10 +988,10 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     INSTR_TIME_SET_CURRENT(t0);
 
     INSTR_TIME_SET_CURRENT(tp);
-    dim1 = palloc0(V2_DIM1_CAP * sizeof(V2Dim1));
-    dim2 = palloc0(V2_DIM2_CAP * sizeof(V2Dim2));
-    v2_dim1_build(dim1, dim1_relid);
-    v2_dim2_build(dim2, dim2_relid);
+    v2_dim1_init(&dim1);
+    v2_dim2_init(&dim2);
+    v2_dim1_build(&dim1, dim1_relid);
+    v2_dim2_build(&dim2, dim2_relid);
     v2_grp_init(&grp);
     INSTR_TIME_SET_CURRENT(tn);
     build_ms = INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
@@ -822,7 +1146,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         INSTR_TIME_SET_CURRENT(tp);
         for (int r = 0; r < nrows; r++)
             keep[r] = !xpcb_isnull(&batch, V2_C_COMPANY, r) &&
-                      v2_dim1_lookup(dim1, col_co[r], &grp1_buf[r]);
+                      v2_dim1_lookup(&dim1, col_co[r], &grp1_buf[r]);
         INSTR_TIME_SET_CURRENT(tn);
         j1_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
 
@@ -831,7 +1155,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         for (int r = 0; r < nrows; r++)
             if (keep[r])
                 keep[r] = !xpcb_isnull(&batch, V2_C_ACCOUNT, r) &&
-                          v2_dim2_lookup(dim2, col_ac[r], &grp2_buf[r]);
+                          v2_dim2_lookup(&dim2, col_ac[r], &grp2_buf[r]);
         INSTR_TIME_SET_CURRENT(tn);
         j2_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
 
@@ -927,8 +1251,7 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                          " grp_rehash_groups=" INT64_FORMAT
                          " grp_rehash_probes=" INT64_FORMAT
                          " grp_rehash_ms=%.3f grp_agg_minus_rehash_ms=%.3f"
-                         " grp_cxt_bytes=%zu"
-                         " dim1_bytes=%zu dim2_bytes=%zu",
+                         " grp_cxt_bytes=%zu",
                          grp.initial_capacity, grp.capacity,
                          V2_GRP_GROW_AT(grp.capacity),
                          grp.ngroups, (double) grp.ngroups / grp.capacity,
@@ -959,9 +1282,15 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                           * own arithmetic: if a growth ever failed to release
                           * its predecessor, this would exceed grp_bytes.
                           */
-                         MemoryContextMemAllocated(grp.cxt, false),
-                         (size_t) V2_DIM1_CAP * sizeof(V2Dim1),
-                         (size_t) V2_DIM2_CAP * sizeof(V2Dim2));
+                         MemoryContextMemAllocated(grp.cxt, false));
+
+        /*
+         * Dimension hash tables, reported per table and never pooled: the two
+         * have different key widths and different capacities, so one combined
+         * figure could not be attributed to either.
+         */
+        v2_dim_report(&extra, "dim1", &dim1.st, dim1.cxt);
+        v2_dim_report(&extra, "dim2", &dim2.st, dim2.cxt);
 
         elog(NOTICE,
              "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
@@ -1016,6 +1345,8 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
      * (section 8).
      */
     MemoryContextDelete(grp.cxt);
+    MemoryContextDelete(dim1.cxt);
+    MemoryContextDelete(dim2.cxt);
 
     src->ops->end(src);
     return (Datum) 0;
