@@ -428,6 +428,59 @@ SQL
          FROM xpb_typed_report('p_allnull_c', ARRAY[2], ARRAY[3], NULL, NULL, 'pgcolumnar')" \
         "SELECT '\\N ' || count(*) || ' ' || coalesce(sum(s)::text,'NULL') FROM p_allnull_f"
 
+    # A NULL on a row the predicate then REJECTS must not leave its cleared
+    # validity bit behind: `out` does not advance, so the next accepted row
+    # reuses that slot, and a stale clear bit reports a present value as NULL.
+    # The bitmap is memset to 0xFF once per group and only ever cleared, never
+    # set, so nothing else repairs it. The heap projected path has always
+    # handled this; the columnar source did not, because its predicate recheck
+    # sits after the column loop rather than before it.
+    #
+    # The two existing pgColumnar cases above cannot see it: they pass no
+    # predicate, so no row is ever rejected after its validity was written.
+    "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE p_pred_f (k int4 NOT NULL, s int8, t int8);
+-- NULLs at every third and fifth row, so rejected-then-accepted runs occur
+-- repeatedly and in both columns rather than once.
+INSERT INTO p_pred_f
+SELECT g,
+       CASE WHEN g % 3 = 0 THEN NULL ELSE g::int8 END,
+       CASE WHEN g % 5 = 0 THEN NULL ELSE g::int8 * 2 END
+FROM generate_series(1, 2000) g;
+CREATE TABLE p_pred_c (LIKE p_pred_f) USING pgcolumnar;
+INSERT INTO p_pred_c SELECT * FROM p_pred_f;
+SQL
+
+    # Physical order is insertion order, so PostgreSQL's k order reproduces the
+    # batch row numbering. Compared per row and per column, not as a total: a
+    # value wrongly reported NULL keeps the row count right.
+    compare_sql "pgColumnar validity survives a predicate rejection" \
+        "SELECT md5(string_agg(rownum||':'||col||':'||is_null||':'||coalesce(val,'N'),
+                               '|' ORDER BY rownum, col))
+         FROM xpb_contract_probe('p_pred_c', ARRAY[1,2,3], 'pgcolumnar', 500, 1500)" \
+        "SELECT md5(string_agg(rn||':'||col||':'||isn||':'||v, '|' ORDER BY rn, col))
+         FROM (SELECT r.rn, c.col, c.isn, coalesce(c.v, 'N') AS v
+               FROM (SELECT (row_number() OVER (ORDER BY k)) - 1 AS rn, k, s, t
+                     FROM p_pred_f WHERE k BETWEEN 500 AND 1500) r,
+                    LATERAL (VALUES (0, r.k::text, false),
+                                    (1, r.s::text, r.s IS NULL),
+                                    (2, r.t::text, r.t IS NULL)) AS c(col, v, isn)) q"
+
+    # Same rows through the heap path, which is the reference implementation of
+    # the same invariant -- if this diverges the test data is wrong, not the
+    # columnar source.
+    compare_sql "heap projected-early agrees on the same predicate and NULLs" \
+        "SELECT md5(string_agg(rownum||':'||col||':'||is_null||':'||coalesce(val,'N'),
+                               '|' ORDER BY rownum, col))
+         FROM xpb_contract_probe('p_pred_f', ARRAY[1,2,3], 'projected-early', 500, 1500)" \
+        "SELECT md5(string_agg(rn||':'||col||':'||isn||':'||v, '|' ORDER BY rn, col))
+         FROM (SELECT r.rn, c.col, c.isn, coalesce(c.v, 'N') AS v
+               FROM (SELECT (row_number() OVER (ORDER BY k)) - 1 AS rn, k, s, t
+                     FROM p_pred_f WHERE k BETWEEN 500 AND 1500) r,
+                    LATERAL (VALUES (0, r.k::text, false),
+                                    (1, r.s::text, r.s IS NULL),
+                                    (2, r.t::text, r.t IS NULL)) AS c(col, v, isn)) q"
+
     # numeric must be refused by name, not read as if it were fixed width
     "${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
 CREATE TABLE p_num_c (k int4 NOT NULL, d numeric(18,2) NOT NULL) USING pgcolumnar;

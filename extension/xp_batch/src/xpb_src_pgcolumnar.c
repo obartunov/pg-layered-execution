@@ -349,7 +349,25 @@ xpcn_load_group(XpcnBatchState *st)
                     skip = true;
             }
 
-            if (!skip)
+            if (skip)
+            {
+                /*
+                 * The row is dropped, but the column loop above has already
+                 * written into slot `out` -- including clearing validity bits
+                 * for any NULL it carried.  `out` does not advance, so the
+                 * next accepted row reuses this slot, and a stale clear bit
+                 * would make its present value look NULL.  The bitmap is only
+                 * ever cleared here, never set (it starts as 0xFF per group),
+                 * so the drop has to restore it.
+                 *
+                 * xpb_src_heap.c does the same for the projected path; this
+                 * source was missing it because its predicate recheck sits
+                 * after the column loop rather than before it.
+                 */
+                for (c = 0; c < st->ncols; c++)
+                    st->ownvalid[c][out >> 3] |= (1 << (out & 7));
+            }
+            else
                 out++;
         }
 

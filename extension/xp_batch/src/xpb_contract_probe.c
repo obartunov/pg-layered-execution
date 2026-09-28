@@ -28,6 +28,10 @@
 #include "xpb_colbatch.h"
 #include "xpb_src_heap.h"
 
+extern XpBatchSource *xpcn_source_create(Oid relid, int16 *requested_attnos,
+                                        int ncols, bool has_pred,
+                                        int32 pred_lo, int32 pred_hi);
+
 PG_FUNCTION_INFO_V1(xpb_contract_probe);
 
 /* Render one value of a batch column as text, or NULL. */
@@ -81,7 +85,8 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
     TupleDesc       tupdesc;
     Tuplestorestate *store;
     MemoryContext   oldcxt;
-    XpbHeapPath     path;
+    XpbHeapPath     path = XPB_HEAP_DEFORM;
+    bool            want_pgcn = false;
     XpBatchSource  *src;
     XpColumnBatch   batch;
     Oid             relid;
@@ -116,7 +121,15 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
                  errmsg("xpb_contract_probe: pred_lo and pred_hi must both be given or both omitted")));
 
     pstr = text_to_cstring(pathname);
-    if (strcmp(pstr, "fixed") == 0)
+    /*
+     * "pgcolumnar" is not a heap path, so it is dispatched separately below
+     * rather than folded into the XpbHeapPath enum.  It is here because the
+     * columnar source is the only one whose validity handling interacts with
+     * the range predicate, and that interaction had no test.
+     */
+    if (strcmp(pstr, "pgcolumnar") == 0)
+        want_pgcn = true;
+    else if (strcmp(pstr, "fixed") == 0)
         path = XPB_HEAP_FIXED;
     else if (strcmp(pstr, "deform") == 0)
         path = XPB_HEAP_DEFORM;
@@ -127,7 +140,7 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
     else
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("xpb_contract_probe: path must be 'fixed', 'deform', 'projected' or 'projected-early', got \"%s\"",
+                 errmsg("xpb_contract_probe: path must be 'fixed', 'deform', 'projected', 'projected-early' or 'pgcolumnar', got \"%s\"",
                         pstr)));
 
     relid = RelnameGetRelid(text_to_cstring(relname));
@@ -182,7 +195,9 @@ xpb_contract_probe(PG_FUNCTION_ARGS)
         int32   lo = has_pred ? PG_GETARG_INT32(3) : 0;
         int32   hi = has_pred ? PG_GETARG_INT32(4) : 0;
 
-        src = xpb_heap_source_create_ex(relid, attnos, ncols, path,
+        src = want_pgcn
+            ? xpcn_source_create(relid, attnos, ncols, has_pred, lo, hi)
+            : xpb_heap_source_create_ex(relid, attnos, ncols, path,
                                         has_pred, lo, hi);
     }
     memset(&batch, 0, sizeof(batch));
