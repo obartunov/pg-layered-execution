@@ -407,10 +407,11 @@ xpcn_next_batch(XpBatchSource *src, XpColumnBatch *batch)
      * source's own per-group buffer.  Both live until the next group is
      * loaded, which is exactly the contract's borrow window.
      *
-     * Validity is NULL because this source does not yet carry NULLs into the
-     * batch: xpcn_load_group() still raises an error when a surviving row has
-     * a NULL in a requested column.  Once that is lifted the present bitmap
-     * borrows straight into the column, since both use bit-set-means-valid.
+     * Validity is exposed only for a column that actually saw a NULL in this
+     * group: pgcolumnar's present bitmap and the batch contract both use
+     * bit-set-means-valid, so the group's own bitmap is handed over directly
+     * rather than restated.  A column with no NULLs passes validity = NULL,
+     * which the contract reads as all-present.
      */
     for (c = 0; c < st->ncols; c++)
     {

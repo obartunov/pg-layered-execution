@@ -120,7 +120,7 @@ Per source:
 | heap, fixed path | owned by consumer | none | all int4, all NOT NULL by the guard |
 | heap, deform path | borrowed | borrowed | both live in the source's per-batch context, reset at the top of each `next_batch()`; numeric and varlena payloads live there too, so nothing is freed per value |
 | ZLFS | borrowed | borrowed, or owned when realigned | the zone outlives the scan, so the data pointers are valid longer than the contract promises — consumers must not rely on that. A batch starting at a row that is not a multiple of 8 needs its validity bits restated into a small owned buffer |
-| pgcolumnar | borrowed | none yet | either pgcolumnar's decoded stream (zero copy) or this source's per-group buffer; both live until the next group loads |
+| pgcolumnar | borrowed | borrowed, and only for a column that saw a NULL | either pgcolumnar's decoded stream (zero copy) or this source's per-group buffer; both live until the next group loads. The group's present bitmap is handed over directly, since it and the batch contract both use bit-set-means-valid |
 
 `xpcb_release_owned()` frees what a batch owns and leaves borrowed columns
 alone. The old batch-level flag could not express the mixed case and got it
@@ -253,10 +253,13 @@ benchmark 04 dataset: 82 ms before, 78 ms median (77–88) after.
   skipped; nothing joins, groups or computes on one.
 * **No numeric or varlena group keys.** Group keys are int4 or int8.
 * **ZLFS carries int4 and int8 only** — no numeric or varlena in a zone.
-* **The pgcolumnar source still rejects NULLs.** It reads validity bitmaps
-  and errors on a NULL in a requested column rather than carrying it into the
-  batch. The bitmap convention already matches, so this is wiring, not
-  design.
+* **The pgcolumnar source carries NULLs** (it no longer rejects them). A NULL
+  occupies no slot in the dense stream, so the present counter must not advance
+  on one; the batch carries the NULL in its validity bitmap with no sentinel.
+  Exercised by `contract_tests.sh` against PostgreSQL, including an all-NULL
+  column, and -- since a row rejected by a pushed-down predicate does not
+  advance the output slot -- including a NULL on a rejected row followed by a
+  present value in the slot it would have reused.
 * **Fixed-capacity hash tables, with three exceptions, all in one file.**
   Benchmark 05-E measured where the group boundary sat -- 12 288 groups, a
   `#define`, not a resource. Hash Aggregate Growth v1 then replaced the group
