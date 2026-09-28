@@ -387,6 +387,61 @@ else
     echo "  SKIP  untyped-file rejection (zone file not writable from here)"
 fi
 
+
+# A zone with no rows has no batch to learn its column types from. They used to
+# default to int4, so an empty zone over an int8 column was written to disk
+# claiming int4 while schema_hash -- computed from the relation -- still said
+# int8. The payload is empty so no wrong value can be read back, but the format
+# metadata was false, and type is part of the persisted ZLFS contract. Types now
+# come from the TupleDesc before the scan, which makes the zero-row case correct
+# by construction rather than by a default.
+echo
+echo "=== ZLFS: empty zone keeps its real column types ==="
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE ez_f (period int4 NOT NULL, account_key int8 NOT NULL, amt int8 NOT NULL);
+INSERT INTO ez_f SELECT 1, g::int8, g::int8 FROM generate_series(1, 10) g;
+SQL
+"${PSQL[@]}" -c "SELECT zlfs_drop_zone(900, 901)" >/dev/null 2>&1
+ez_build=$("${PSQL[@]}" -c "SELECT zlfs_build_zone('ez_f', '1,2,3', 900, 901)" 2>&1 \
+           | grep -vE '^(WARNING|NOTICE)')
+ez_rows=$("${PSQL[@]}" -c "SELECT nrows FROM zlfs_zone_info() WHERE period_lo = 900" 2>/dev/null \
+          | grep -vE '^(WARNING|NOTICE)')
+ez_file=$("${PSQL[@]}" -c "SELECT filepath FROM zlfs_zone_info() WHERE period_lo = 900" 2>/dev/null \
+          | grep -vE '^(WARNING|NOTICE)')
+
+if [ "$ez_build" != "VALID" ] || [ "$ez_rows" != "0" ]; then
+    echo "  FAIL  empty zone did not build (build=$ez_build rows=$ez_rows)"
+    fail=1
+elif [ -r "$ez_file" ] && command -v python3 >/dev/null 2>&1; then
+    # Decode col_types/col_widths straight out of the file header: the defect is
+    # in persisted metadata and has no SQL-visible symptom while nrows = 0.
+    ez_got=$(python3 - "$ez_file" <<'PYEOF'
+import struct, sys
+MAX = 8
+b = open(sys.argv[1], 'rb').read()
+i = b.find(struct.pack('<hhh', 1, 2, 3))     # col_attnos = {1,2,3}
+if i < 0:
+    print('col_attnos not found'); raise SystemExit
+off = i + 2 * MAX + 4                        # past col_attnos and schema_hash
+types = struct.unpack_from('<%dB' % MAX, b, off)
+widths = struct.unpack_from('<%dB' % MAX, b, off + MAX)
+name = {0: 'NONE', 1: 'INT4', 2: 'INT8'}
+print(' '.join('%s/%d' % (name.get(t, t), w)
+               for t, w in zip(types[:3], widths[:3])))
+PYEOF
+)
+    if [ "$ez_got" = "INT4/4 INT8/8 INT8/8" ]; then
+        echo "  PASS  empty zone persists int4/int8/int8, not a default ($ez_got)"
+        pass_count=$((pass_count + 1))
+    else
+        echo "  FAIL  empty zone persisted $ez_got, want INT4/4 INT8/8 INT8/8"
+        fail=1
+    fi
+else
+    echo "  SKIP  empty zone header (file not readable from here, or no python3)"
+fi
+"${PSQL[@]}" -c "SELECT zlfs_drop_zone(900, 901)" >/dev/null 2>&1
+
 echo
 echo "=== pgColumnar source: int8 and validity ==="
 

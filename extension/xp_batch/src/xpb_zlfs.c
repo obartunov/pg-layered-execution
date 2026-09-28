@@ -457,6 +457,50 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     int64           capacity = 0;
     int64           nrows = 0;
 
+    /*
+      * Column types come from the TupleDesc, BEFORE the scan -- not from the
+      * first batch.  Deriving them from the first batch left a zone with no
+      * rows with no batch to learn from, and it defaulted every column to
+      * int4: an empty zone over an int8 column was persisted as int4 while
+      * schema_hash, which is computed from the relation, still said int8.  The
+      * payload was empty so no wrong value could be read back, but the format
+      * metadata was false, and type is part of the persisted ZLFS contract.
+      *
+      * The per-batch check further down is now an assertion against this,
+      * rather than the place the types are established.
+      */
+     {
+         Relation  rel_t = table_open(relid, AccessShareLock);
+         TupleDesc td_t  = RelationGetDescr(rel_t);
+         MemoryContext o3 = MemoryContextSwitchTo(zlfs_reg->mcxt);
+
+         for (int c = 0; c < ncols; c++)
+         {
+             Form_pg_attribute at = TupleDescAttr(td_t, attnos[c] - 1);
+
+             switch (at->atttypid)
+             {
+                 case INT4OID:
+                     zone->col_types[c]  = ZLFS_COL_INT4;
+                     zone->col_widths[c] = sizeof(int32);
+                     break;
+                 case INT8OID:
+                     zone->col_types[c]  = ZLFS_COL_INT8;
+                     zone->col_widths[c] = sizeof(int64);
+                     break;
+                 default:
+                     MemoryContextSwitchTo(o3);
+                     table_close(rel_t, AccessShareLock);
+                     ereport(ERROR,
+                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                              errmsg("ZLFS: column attno %d has type %s, only int4 and int8 are stored",
+                                     attnos[c], format_type_be(at->atttypid))));
+             }
+         }
+         MemoryContextSwitchTo(o3);
+         table_close(rel_t, AccessShareLock);
+     }
+
     src = xpb_heap_source_create_ex(relid, attnos, ncols, XPB_HEAP_DEFORM,
                                     true, lo, hi);
 
@@ -467,33 +511,6 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     while (src->ops->next_batch(src, &batch))
     {
         MemoryContext o2;
-
-        if (nrows == 0)
-        {
-            /* First batch fixes the zone's types; later batches must agree. */
-            o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
-            for (int c = 0; c < ncols; c++)
-            {
-                switch (batch.cols[c].type)
-                {
-                    case XPB_COL_INT4:
-                        zone->col_types[c] = ZLFS_COL_INT4;
-                        zone->col_widths[c] = sizeof(int32);
-                        break;
-                    case XPB_COL_INT8:
-                        zone->col_types[c] = ZLFS_COL_INT8;
-                        zone->col_widths[c] = sizeof(int64);
-                        break;
-                    default:
-                        MemoryContextSwitchTo(o2);
-                        ereport(ERROR,
-                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                 errmsg("ZLFS: column attno %d is %s; a zone carries int4 or int8",
-                                        attnos[c], xpcb_type_name(batch.cols[c].type))));
-                }
-            }
-            MemoryContextSwitchTo(o2);
-        }
 
         if (nrows + batch.nrows > capacity)
         {
@@ -564,18 +581,18 @@ zlfs_build_zone(PG_FUNCTION_ARGS)
     }
     src->ops->end(src);
 
-    /* A zone with no rows still has to have well-defined columns. */
+    /*
+     * A zone with no rows still needs a non-NULL payload pointer.  Its types
+     * are already correct: they came from the TupleDesc before the scan, so
+     * there is nothing to guess here any more.
+     */
     if (nrows == 0)
     {
         MemoryContext o2 = MemoryContextSwitchTo(zlfs_reg->mcxt);
 
         for (int c = 0; c < ncols; c++)
-            if (zone->col_types[c] == ZLFS_COL_NONE)
-            {
-                zone->col_types[c] = ZLFS_COL_INT4;
-                zone->col_widths[c] = sizeof(int32);
+            if (zone->cols[c] == NULL)
                 zone->cols[c] = palloc(1);
-            }
         MemoryContextSwitchTo(o2);
     }
 
