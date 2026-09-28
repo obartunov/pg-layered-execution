@@ -1,0 +1,53 @@
+############ local_ht silent drop -- reproducer ############
+
+NOTICE:  table "sd_local" does not exist, skipping
+=== the shape is reachable through the planner, not forced ===
+Global correlation passes the >= 0.8 gate; page 0 is out of order, so
+execution still takes the hash fallback that owns local_ht.
+  k1 correlation = 0.9933481
+
+=== source-mode proof: both xp_batch arms really run XpGroupAgg2 ===
+Without this the comparison below could be PostgreSQL against itself.
+  PASS  local_partial=off uses XpGroupAgg2 (Batch Grouping: NONE)
+  PASS  local_partial=on uses XpGroupAgg2 (Batch Grouping: LOCAL_PARTIAL, 1 batch)
+
+=== three-way comparison, 301 distinct groups against a 256-slot local hash ===
+
+  PostgreSQL                  groups= 301  sum(v)=  901  1311def94a0c6016
+  xp_batch local_partial=off  groups= 301  sum(v)=  901  1311def94a0c6016
+  xp_batch local_partial=on   groups= 256  sum(v)=  766  a2b89ab2b85a4b31
+
+=== saturation boundary: output pins at local_cap and never grows ===
+distinct | true_grp | xpb_grp | true_sum | xpb_sum | verdict
+     100 |      101 |     101 |      301 |     301 | ok
+     200 |      201 |     201 |      601 |     601 | ok
+     254 |      255 |     255 |      763 |     763 | ok
+     255 |      256 |     256 |      766 |     766 | ok
+     256 |      257 |     256 |      769 |     766 | LOST 1 groups / 3 rows
+     257 |      258 |     256 |      772 |     766 | LOST 2 groups / 6 rows
+     300 |      301 |     256 |      901 |     766 | LOST 45 groups / 135 rows
+     500 |      501 |     256 |     1501 |     766 | LOST 245 groups / 735 rows
+
+=== it is not an artifact of the 256 minimum: same at the 2048 default ===
+  cap=2048  true_groups=2101  returned=2048  LOST 53
+
+=== failure mode: pure loss, or corrupted survivors? ===
+
+  groups returned with a wrong sum : 0
+  groups missing entirely          : 45
+  groups invented                  : 0
+
+=== the backend survives, and nothing is raised ===
+  
+  query returned 256 rows summing to 766, no error raised (true: 301 groups, 901)
+  backend alive: true
+
+############ verdict ############
+R1 REACHABLE: 45 of 301 groups lost and 135 rows unaccounted, with no error, from SQL alone
+
+
+Observability note: LP Max Groups In Batch stays 0 here. The final partial
+flush (xpb_groupagg2.c:745-783) never updates lp_max_groups_in_batch -- only
+the full-batch path at :681-682 does -- so on a single-batch query that
+counter cannot be used to detect saturation. LP Partials Emitted does pin at
+local_cap and is the usable signal.

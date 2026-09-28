@@ -1,6 +1,21 @@
 # Unguarded fixed hash tables that drop rows instead of erroring
 
-Status: **open, reachability unproven. Starts with a reproducer, not a fix.**
+Status: **site 3 (`local_ht`) is R1 -- REACHABLE, reproduced from SQL.
+Sites 1 and 2 still unproven. Not fixed yet, deliberately.**
+
+| site | table | reachability | evidence |
+|---|---|---|---|
+| 1 | `xpb_projection.c` `AGG_CAP` | unproven | — |
+| 2 | `xpb_columnar_pipeline.c` `WHASH_CAP` | unproven | — |
+| 3 | `xpb_groupagg2.c` `local_ht` | **R1 reachable** | `test/reproducers/local_ht_silent_drop.sh` |
+| 4 | `xpb_groupagg2.c` global hash | guard sound for itself | — |
+
+**No published result in this repository is affected by site 3.** Nothing under
+`benchmarks/` or `extension/` sets `xp_batch.groupagg2_local_partial`, and it
+defaults to off; the only two files that enable `xp_batch.groupagg2` at all
+(`test/zlfs_v01.sql`, `test/zlfs_persistence.sh`) leave local partial off. The
+broken behaviour is being kept observable until sites 1 and 2 have been answered
+the same way.
 
 Found while updating `docs/TYPED_BATCH_CONTRACT.md` for Dimension Hash Growth
 v1. The milestone's own tables were the ones being changed; auditing the table
@@ -79,10 +94,59 @@ It is gated behind `xp_batch.groupagg2_local_partial`, which defaults to off —
 but that is a `PGC_USERSET` boolean, so a session enabling it is not a build
 change or an administrative act.
 
-One useful consequence for the reproducer: `lp_max_groups_in_batch` pins at
-`local_cap` exactly when the table saturates, so the observable already exists
-and nothing currently checks it. That is the cheapest available signal for step
-1 on this site.
+### R1: reproduced, 2026-09-28
+
+`extension/xp_batch/test/reproducers/local_ht_silent_drop.sh`, raw run in
+`raw/2026-09-28-local-ht-r1.txt`. 301 distinct groups, a 256-slot local hash:
+
+```
+PostgreSQL                  groups=301  sum=901  md5 1311def94a0c6016
+xp_batch local_partial=off  groups=301  sum=901  md5 1311def94a0c6016
+xp_batch local_partial=on   groups=256  sum=766  md5 a2b89ab2b85a4b31
+```
+
+`off` reproduces PostgreSQL bit for bit, so the divergence is the local hash and
+nothing else. No error, backend alive, query returns normally.
+
+**The reachable shape was the part that needed finding.** `xpga2_add_path()`
+requires `|correlation(k1)| >= 0.8`, on the reasoning that the node only wins
+when STREAM activates -- but `local_ht` is used only on the hash fallback
+(`if (!is_sorted)`, :419), and `is_sorted` is decided by an optimistic probe of
+**page 0 alone** (:362-390). So the shape that reaches it is a table that is
+globally clustered, which is what the planner gate asks for, but whose first page
+is locally out of order. One row inserted ahead of a clustered body is enough.
+That is an ordinary table after a few out-of-order inserts, not a contrived one.
+
+**Failure mode is pure loss**, measured per group against PostgreSQL: 45 groups
+missing entirely, **0 groups with a wrong sum, 0 groups invented**. Survivors are
+exact. The output group count saturates at exactly `local_cap` and never grows
+again:
+
+```
+distinct groups   255  256  257  258  301  501
+returned          255  256  256  256  256  256
+```
+
+255 is clean and 256 is clean; 257 loses exactly one. Reproduces identically at
+the shipped default cap of 2048 (2101 groups in, 2048 out), so it is not an
+artifact of the 256 minimum.
+
+**Two corrections to this note's earlier guesses**, both found by running it:
+
+* `lp_max_groups_in_batch` is **not** a usable signal. The final partial flush
+  (:745-783) never updates it -- only the full-batch path at :681-682 does -- so
+  on a single-batch query it stays 0 while the table is saturated.
+  `LP Partials Emitted` does pin at `local_cap` and is the signal to use.
+* The node is only chosen when the aggregate is **consumed downstream**. With
+  `SELECT count(*) FROM (SELECT k1, k2, sum(v) ... GROUP BY ...)` the planner
+  prunes `sum(v)` from the subquery tlist, `naggs != 1` at :1558 then declines,
+  and the measurement silently becomes stock HashAggregate. Three blocks of the
+  reproducer reported correct results for exactly this reason before it was
+  found. Any test for sites 1 and 2 has to prove the node was used, not assume it.
+
+This also contradicts the file's own stated contract at :1589 -- *"v0 contract:
+correct result OR explicit decline. No silent corruption."* The NULL and
+multi-aggregate guards honour it; `local_ht` does not.
 
 Because linear probing scans all slots, a drop requires the table to be
 **completely** full -- not merely heavily loaded. What "full" costs differs by
