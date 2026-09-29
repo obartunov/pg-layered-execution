@@ -11,6 +11,7 @@
 #include "funcapi.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "portability/instr_time.h"
 #include "utils/builtins.h"
@@ -142,7 +143,25 @@ get_partitions_in_range(Oid parent_oid, int32 lo, int32 hi)
 
     foreach(lc, children)
     {
-        Oid child_oid = lfirst_oid(lc);
+        Oid   child_oid = lfirst_oid(lc);
+        char  relkind = get_rel_relkind(child_oid);
+
+        /*
+         * find_inheritance_children() returns DIRECT children only.  A child
+         * that is itself partitioned owns no storage, so handing it to
+         * xpb_heap_source_create() would scan an empty relation and silently
+         * contribute zero rows for its entire subtree.  Any other relkind
+         * (foreign table, view-like child) is likewise not a heap we can
+         * read.  Refuse before any batch is produced rather than return a
+         * partial aggregate.
+         */
+        if (relkind != RELKIND_RELATION)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("XpBatchPartition: partition \"%s\" has relkind '%c'; "
+                            "only ordinary leaf partitions are supported",
+                            get_rel_name(child_oid), relkind)));
+
         /* For now, include all children — partition pruning
          * is handled by per-partition predicate in the source */
         result = lappend_oid(result, child_oid);
@@ -280,24 +299,37 @@ adim_build(ADimHash *d, Oid relid)
     table_close(rel, AccessShareLock);
 }
 
-static inline int32 pdim_year(PDimHash *d, int32 pk) {
+/*
+ * Both lookups report the miss through a separate bool, never through the
+ * value.  They used to return -1 for "no such key", and the caller dropped the
+ * row on `yr < 0 || ag < 0` -- so any dimension row whose payload was itself
+ * negative read as a join miss and silently deleted every fact row referencing
+ * it.  dim_period.year and dim_account.account_group are plain `int NOT NULL`
+ * with no CHECK anywhere, so -3 is ordinary data, and the test was `< 0`
+ * rather than `== -1`, which made the hole wider than the sentinel.
+ *
+ * The sibling implementations in xpb_batch_hashjoin.c already do this: one
+ * returns a pointer, the other carries `bool *found`.  These two copies
+ * dropped the flag and invented a value instead.
+ */
+static inline bool pdim_year(PDimHash *d, int32 pk, int32 *year) {
     uint32 h = (uint32)pk * 2654435761u;
     for (int i=0; i<DIM_CAP; i++) {
         int idx = (h+i) & (DIM_CAP-1);
-        if (!d->entries[idx].occupied) return -1;
-        if (d->entries[idx].key == pk) return d->entries[idx].year;
+        if (!d->entries[idx].occupied) return false;
+        if (d->entries[idx].key == pk) { *year = d->entries[idx].year; return true; }
     }
-    return -1;
+    return false;
 }
 
-static inline int32 adim_group(ADimHash *d, int32 ak) {
+static inline bool adim_group(ADimHash *d, int32 ak, int32 *grp) {
     uint32 h = (uint32)ak * 2654435761u;
     for (int i=0; i<DIM2_CAP; i++) {
         int idx = (h+i) & (DIM2_CAP-1);
-        if (!d->entries[idx].occupied) return -1;
-        if (d->entries[idx].key == ak) return d->entries[idx].payload;
+        if (!d->entries[idx].occupied) return false;
+        if (d->entries[idx].key == ak) { *grp = d->entries[idx].payload; return true; }
     }
-    return -1;
+    return false;
 }
 
 /* ══ SQL entry point ══ */
@@ -359,6 +391,9 @@ xpb_partition_join2_groupby(PG_FUNCTION_ARGS)
     /* Batch-level join buffers */
     int32 *year_buf = palloc(XPCB_BATCH_CAP * sizeof(int32));
     int32 *agrp_buf = palloc(XPCB_BATCH_CAP * sizeof(int32));
+    /* miss flags, kept beside the values so no payload doubles as a sentinel */
+    bool  *year_found = palloc(XPCB_BATCH_CAP * sizeof(bool));
+    bool  *agrp_found = palloc(XPCB_BATCH_CAP * sizeof(bool));
 
     XpColumnBatch batch;
     memset(&batch, 0, sizeof(batch));
@@ -391,14 +426,14 @@ xpb_partition_join2_groupby(PG_FUNCTION_ARGS)
         /* Join1: period_key → year (vectorized over batch) */
         INSTR_TIME_SET_CURRENT(tp);
         for (int i = 0; i < nrows; i++)
-            year_buf[i] = pdim_year(&pdim, col_pk[i]);
+            year_found[i] = pdim_year(&pdim, col_pk[i], &year_buf[i]);
         { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
           j1_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
 
         /* Join2: account_key → account_group (vectorized) */
         INSTR_TIME_SET_CURRENT(tp);
         for (int i = 0; i < nrows; i++)
-            agrp_buf[i] = adim_group(&adim, col_ak[i]);
+            agrp_found[i] = adim_group(&adim, col_ak[i], &agrp_buf[i]);
         { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
           j2_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
 
@@ -407,7 +442,8 @@ xpb_partition_join2_groupby(PG_FUNCTION_ARGS)
         for (int i = 0; i < nrows; i++)
         {
             int32 yr = year_buf[i], ag = agrp_buf[i], ck = col_ck[i];
-            if (yr < 0 || ag < 0) continue;  /* no match — skip */
+            /* inner join: a miss drops the row, a negative payload does not */
+            if (!year_found[i] || !agrp_found[i]) continue;
             int64 dt = (int64)col_dt[i];
             uint32 h = (uint32)yr * 2654435761u ^ (uint32)ag * 2246822519u ^ (uint32)ck * 0x45d9f3bu;
             int sl = (int)(h & (GRP_CAP - 1));
