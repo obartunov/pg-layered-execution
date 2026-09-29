@@ -1,0 +1,30 @@
+############ Silent-Drop Reachability — runtime reproducers ############
+
+Each case: identical data, xp_batch against plain PostgreSQL.
+
+=== control: 10 000 distinct (period,company) pairs, under every cap ===
+  ok      projection_experiment below AGG_CAP (= 10000)
+  ok      ctr_pipeline below S2CAP (= 10000)
+
+=== R1-1 / R1-3: 16 900 distinct pairs, past AGG_CAP and S2CAP (both 16384) ===
+  ok      R1-1 xpb_projection.c AGG_CAP (was 16384 of 16900) (refused: projection_experiment: aggregate hash is full (16384 slots))
+  ok      R1-3 xpb_columnar_pipeline.c S2CAP (was 16384 of 16900) (refused: ctr_pipeline: stage-2 group hash is full (16384 slots))
+
+=== R1-2: 140 000 distinct triples, past WHASH_CAP (131072) ===
+    pairs held at 10 000 so stage 2 is clean and only WHASH can drop
+  ok      R1-2 xpb_columnar_pipeline.c WHASH_CAP (was 131072 of 140000) (refused: ctr_pipeline: stage-1 group hash is full (131072 slots))
+
+=== R1-5: a negative dimension payload reads as a join miss ===
+  ok      R1-5 xpb_batch_partition.c -1 sentinel (was 200 of 400) (= 400)
+
+=== R1-6 / R1-7: xpb_pageagg.c — predicates that are never applied ===
+  ok      R1-6 residual qual dropped (WHERE name='x') (was 20000 of 2000) (= 2000)
+  ok      R1-7 page skip uses the aggregated column's min/max (was 0 of 21929000) (= 21929000)
+
+=== R1-8: xpb_groupagg2.c — residual qual dropped when one pred was pushed ===
+  ok      R1-8 residual qual dropped (k1<=500 AND tag='keep') (was 5010 of 501) (= 501)
+
+=== A4: a sub-partitioned child owns no storage ===
+  ok      A4 xpb_batch_partition.c sub-partitioned child (was 0 of 400) (refused: XpBatchPartition: partition "pt2_mid" has relkind 'p'; only ordinary leaf partitions are supported)
+
+############ 10 correct, 0 silently wrong ############
