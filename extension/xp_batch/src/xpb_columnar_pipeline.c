@@ -117,6 +117,12 @@ ctr_pipeline(PG_FUNCTION_ARGS)
                     g->sum_dt += vdt; g->sum_ct += vct; g->sum_qty += vqty;
                     break;
                 }
+                if (pr == WHASH_CAP - 1)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("ctr_pipeline: stage-1 group hash is full (%d slots)",
+                                    WHASH_CAP),
+                             errhint("More distinct (period, company, account) triples than the fixed table holds.")));
             }
         }
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -163,6 +169,12 @@ ctr_pipeline(PG_FUNCTION_ARGS)
                 int idx = (sl + pr) & (S2CAP - 1);
                 if (!s2[idx].occ) { s2[idx].k1=pk; s2[idx].k2=ck; s2[idx].sum=dt; s2[idx].occ=true; break; }
                 if (s2[idx].k1==pk && s2[idx].k2==ck) { s2[idx].sum+=dt; break; }
+                if (pr == S2CAP - 1)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("ctr_pipeline: stage-2 group hash is full (%d slots)",
+                                    S2CAP),
+                             errhint("More distinct (period, company) pairs than the fixed table holds.")));
             }
         }
 
@@ -208,6 +220,12 @@ ctr_pipeline(PG_FUNCTION_ARGS)
                 int idx = (sl + pr) & (S2CAP - 1);
                 if (!s2[idx].occ) { s2[idx].k1=pk; s2[idx].k2=ck; s2[idx].sum=dt; s2[idx].occ=true; break; }
                 if (s2[idx].k1==pk && s2[idx].k2==ck) { s2[idx].sum+=dt; break; }
+                if (pr == S2CAP - 1)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("ctr_pipeline: stage-2 group hash is full (%d slots)",
+                                    S2CAP),
+                             errhint("More distinct (period, company) pairs than the fixed table holds.")));
             }
         }
 

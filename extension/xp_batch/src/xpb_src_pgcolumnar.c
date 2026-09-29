@@ -435,7 +435,19 @@ xpcn_next_batch(XpBatchSource *src, XpColumnBatch *batch)
                  * byte offset is exact; a non-multiple would need the bits
                  * restated, as the ZLFS source does.
                  */
-                Assert((st->cursor & 7) == 0);
+                /*
+                 * The exposed bitmap is a byte-aligned slice of the group's
+                 * own, so the cursor must sit on a byte boundary. An Assert
+                 * alone left a non-assert build shifting the validity window
+                 * by up to 7 bits -- present values read as NULL and NULLs as
+                 * present. The ZLFS source restates the bits instead; this one
+                 * requires the alignment, so it says so.
+                 */
+                if ((st->cursor & 7) != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("pgcolumnar source: batch capacity must be a multiple of 8 to carry NULLs"),
+                             errdetail("Cursor %ld is not byte-aligned.", (long) st->cursor)));
                 valid = st->ownvalid[c] + (st->cursor >> 3);
             }
         }

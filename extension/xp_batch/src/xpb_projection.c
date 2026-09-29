@@ -62,6 +62,22 @@ agg_insert(AggEntry *ht, int32 k1, int32 k2, int32 val)
             ht[idx].sum += val; return;
         }
     }
+    /*
+     * Every slot is occupied and none matched, so this group cannot be
+     * recorded.  Falling out of the loop here used to discard the row: the
+     * result came back short with no error, and both arms of the A/B dropped
+     * the same rows, so the experiment's own equivalence check still agreed.
+     * Measured: 16 900 distinct pairs in, 16 384 out.
+     *
+     * An explicit refusal, not growth: this is a timed path in benchmark 02,
+     * and growing it would change the cost being measured. The error is raised
+     * before any row is emitted.
+     */
+    ereport(ERROR,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+             errmsg("projection_experiment: aggregate hash is full (%d slots)",
+                    AGG_CAP),
+             errhint("More distinct (period_key, company_key) pairs than the fixed table holds.")));
 }
 
 Datum
@@ -120,6 +136,21 @@ projection_experiment(PG_FUNCTION_ARGS)
             }
 
             char *d = (char *)htup + htup->t_hoff;
+            /*
+             * capacity is nblocks*200, a guess, not a bound: MaxHeapTuplesPerPage
+             * is 291 at BLCKSZ 8192, so a narrow row overruns four palloc'd
+             * arrays. Refuse before writing rather than corrupt the heap.
+             */
+            if (nrows >= capacity)
+            {
+                LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+                ReleaseBuffer(buf);
+                if (vmbuf != InvalidBuffer) ReleaseBuffer(vmbuf);
+                ereport(ERROR,
+                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                         errmsg("projection_experiment: more rows than the projection was sized for (%ld)",
+                                (long) capacity)));
+            }
             col_pk[nrows]  = *(int32 *)(d);
             col_ck[nrows]  = *(int32 *)(d + 4);
             col_ak[nrows]  = *(int32 *)(d + 8);
