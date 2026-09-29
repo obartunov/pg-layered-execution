@@ -468,17 +468,38 @@ xppa_build_summaries(XpPageAggState *state)
  * Currently only applies to predicates on the summary column (attno=1 for period_key).
  */
 static inline bool
-xppa_page_can_skip(const XpPageSummary *s, const SimpleQual *q)
+xppa_page_can_skip(const XpPageSummary *s, const SimpleQual *q,
+                   AttrNumber summary_attno)
 {
     if (!s->valid || s->min_val > s->max_val)
+        return false;
+
+    /*
+     * A summary describes ONE column.  Without that column's identity there is
+     * nothing to compare a predicate against, so nothing can be skipped: the
+     * persistent side table records only (relfilenode, relpages, blkno) and no
+     * column, which is why it cannot drive pruning either.
+     */
+    if (summary_attno <= 0)
         return false;
 
     for (int i = 0; i < q->npreds; i++)
     {
         const SimpleQualPred *p = &q->preds[i];
-        /* Summary is on one column — only apply matching preds.
-         * For now: summary tracks the first qual's attno.
-         * This is conservative: non-matching preds just don't skip. */
+
+        /*
+         * Only a predicate on the summarised column can prune.  This used to
+         * apply every predicate to whatever column the summary happened to be
+         * built over -- agg_attno, the column being SUMMED -- so
+         * `sum(amount_dt) WHERE period_key < 10` compared amount_dt's min/max
+         * against period_key's bound and skipped whole pages before the
+         * visibility check and before the qual.  Measured: 0 instead of
+         * 21 929 000.  The old comment here described this rule; the code did
+         * not implement it.
+         */
+        if (p->attno != summary_attno)
+            continue;
+
         bool skip = false;
         switch (p->op)
         {
@@ -539,7 +560,8 @@ xppa_exec(CustomScanState *node)
                                 : NULL;
 
             /* pPD1: min/max page skip */
-            if (do_skip && s && xppa_page_can_skip(s, &state->qual))
+            if (do_skip && s &&
+                xppa_page_can_skip(s, &state->qual, state->agg_attno))
             {
                 state->blocks_skipped++;
                 continue;
@@ -633,6 +655,33 @@ xppa_add_path(PlannerInfo *root, RelOptInfo *input_rel,
     }
 
 
+    /*
+     * This node emits exactly ONE value: xppa_begin installs a one-attribute
+     * result slot.  So it may only be chosen when the target list is exactly
+     * one bare Aggref -- not an expression over one, and not several.
+     *
+     * Without this:
+     *   SELECT 'x' || sum(a) FROM t   returned 2000 where SQL gives x21929000
+     *                                 (the expression discarded, a different
+     *                                 value emitted -- silently)
+     *   SELECT count(*), sum(a)       emitted one field for a two-column plan:
+     *                                 "unexpected field count in D message",
+     *                                 and a backend crash on some shapes.
+     *
+     * The old loop took the FIRST Aggref it found and ignored the rest of the
+     * list, which is what let both shapes through.
+     */
+    {
+        int          ntle = list_length(root->processed_tlist);
+        TargetEntry *only;
+
+        if (ntle != 1)
+            return;
+        only = (TargetEntry *) linitial(root->processed_tlist);
+        if (!IsA(only->expr, Aggref))
+            return;
+    }
+
     /* detect aggregate type from processed_tlist */
     {
         ListCell *lc;
@@ -671,6 +720,14 @@ xppa_add_path(PlannerInfo *root, RelOptInfo *input_rel,
      */
     int         npreds = 0;
     SimpleQualPred preds[SQ_MAX_PREDS];
+    /*
+     * Set by every clause this extractor cannot represent -- unsupported
+     * shape, type or operator, or no room left in preds[].  A residual is
+     * never re-applied: this node sets scan.plan.qual = NIL with
+     * scanrelid = 0 and never calls ExecQual, so taking the path with one
+     * answers the query as though the clause had been applied.
+     */
+    bool        has_residual = false;
 
     {
         ListCell *lc;
@@ -679,30 +736,32 @@ xppa_add_path(PlannerInfo *root, RelOptInfo *input_rel,
             RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
             Expr         *clause = rinfo->clause;
 
-            if (npreds >= SQ_MAX_PREDS) break;
-            if (!IsA(clause, OpExpr)) continue;
+            if (npreds >= SQ_MAX_PREDS) { has_residual = true; break; }
+            if (!IsA(clause, OpExpr)) { has_residual = true; continue; }
             OpExpr *op = (OpExpr *) clause;
-            if (list_length(op->args) != 2) continue;
+            if (list_length(op->args) != 2) { has_residual = true; continue; }
 
             Expr *larg = (Expr *) linitial(op->args);
             Expr *rarg = (Expr *) lsecond(op->args);
 
-            if (!IsA(larg, Var) || !IsA(rarg, Const)) continue;
+            if (!IsA(larg, Var) || !IsA(rarg, Const)) { has_residual = true; continue; }
             Var   *v = (Var *) larg;
             Const *c = (Const *) rarg;
 
-            if (v->vartype != INT4OID || c->consttype != INT4OID) continue;
+            if (v->vartype != INT4OID || c->consttype != INT4OID)
+                { has_residual = true; continue; }
+            if (c->constisnull) { has_residual = true; continue; }
 
             /* map operator to SimpleQualOp */
             char *opname = get_opname(op->opno);
             SimpleQualOp sq_op;
-            if      (!opname)                        continue;
+            if      (!opname)                    { has_residual = true; continue; }
             else if (strcmp(opname, "<")  == 0)  sq_op = SQ_LT;
             else if (strcmp(opname, "<=") == 0)  sq_op = SQ_LE;
             else if (strcmp(opname, "=")  == 0)  sq_op = SQ_EQ;
             else if (strcmp(opname, ">=") == 0)  sq_op = SQ_GE;
             else if (strcmp(opname, ">")  == 0)  sq_op = SQ_GT;
-            else                                     continue;
+            else                                 { has_residual = true; continue; }
 
             preds[npreds].attno = v->varattno;
             preds[npreds].op    = sq_op;
@@ -711,6 +770,21 @@ xppa_add_path(PlannerInfo *root, RelOptInfo *input_rel,
             /* continue collecting — no break */
         }
     }
+
+    /*
+     * Refuse rather than approximate.  An accepted Custom Scan must implement
+     * the query's semantics exactly; whatever it does not implement has to be
+     * a refusal before execution, never a silent approximation.
+     */
+    if (has_residual)
+        return;
+
+    /*
+     * HAVING is never examined here and no upper node re-applies it, because
+     * this path replaces the whole grouping rel.  Same refusal.
+     */
+    if (root->parse->havingQual != NULL)
+        return;
 
     /* build path:
      * custom_private = [agg_type, agg_attno, npreds, (attno,op,rhs)*npreds, relid]
