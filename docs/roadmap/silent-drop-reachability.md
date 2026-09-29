@@ -1,8 +1,10 @@
 # Silent-Drop Reachability — the map
 
-Status: **map complete, no fixes applied.** Phase 4 of the audit. Nothing in
-this document has been repaired; the reproducers are kept failing on purpose so
-that the broken behaviour stays observable until each site is closed.
+Status: **closed. SILENT_DROP = 0, AMBIGUOUS = 0.** Phase 4 mapped the space,
+phase 5 closed it. `test/reproducers/silent_drop_map.sh` has become the
+regression suite for these sites and now passes 10/10; the wrong result each
+case originally produced is recorded beside it so the test visibly closes an
+observed defect.
 
 Starting point: checkpoint `cf0c891`. Benchmark 05 is a reviewed boundary and is
 not revisited here.
@@ -16,13 +18,106 @@ The question asked of every site:
 ## Result
 
 ```
-bounded sites examined        31
-  SAFE_GROW                    5
-  SAFE_ERROR                  13
-  UNREACHABLE                  3   (each with the enforcing code named)
-  SILENT_DROP                  8   (all reproduced against PostgreSQL)
-  AMBIGUOUS                    4
+                          phase 4      phase 5
+bounded sites examined        31           31
+  SAFE_GROW                    5            6   (local_ht now drains and reuses)
+  SAFE_ERROR                  13           20   (AGG_CAP, WHASH_CAP, S2CAP,
+                                                 and the four former AMBIGUOUS)
+  UNREACHABLE                  3            3
+  SILENT_DROP                  8            0
+  AMBIGUOUS                    4            0
+
+defects found while fixing:  +2  -> both closed (R1-9, R1-10)
+initial SILENT_DROP:          8
+new defects found:            2   (R1-9, R1-10)
+                             +1   (A4, found by analysing an AMBIGUOUS site)
+fixed:                       11
+remaining:                    0
 ```
+
+The count went from 8 to 11 rather than staying at a tidy 8: fixing the
+page-skip exposed two more, resolving the AMBIGUOUS four turned one of them
+into a real silent drop, and all three are recorded at full weight.
+
+Neither column sums to 31. The rows are classification entries, not distinct
+sites — R1-3 is two instances in one row — and R1-5…R1-10 are semantic defects
+that leave the bounded-state taxonomy entirely once fixed. The site inventory
+is the sections below, not this summary.
+
+## The rule this phase established
+
+> An Xp execution path either implements the query's semantics completely, or
+> refuses the query before executing it. Partially understood SQL is not an
+> acceptable fast path.
+
+Six of the ten defects were that rule being broken, not a table being too small.
+
+## Per site
+
+| # | site | before | root cause | policy | after |
+|---|---|---|---|---|---|
+| R1-1 | `AGG_CAP`, `xpb_projection.c` | 16384 of 16900 | probe loop falls off the end | refuse (timed path; growth would change the measured cost) | SAFE_ERROR |
+| R1-2 | `WHASH_CAP`, `xpb_columnar_pipeline.c` | 131072 of 140000 | same | refuse | SAFE_ERROR |
+| R1-3 | `S2CAP`, `xpb_columnar_pipeline.c` ×2 | 16384 of 16900 | same | refuse | SAFE_ERROR |
+| R1-4 | `local_ht`, `xpb_groupagg2.c` | 256 of 301 groups | same | **drain into the global hash and reuse** — growth would defeat its L1 purpose, and the same file already drains the elastic buffer and ScalarBatch this way | SAFE_GROW |
+| R1-5 | `pdim_year`/`adim_group` | 200 of 400 | `-1` meant miss, full, and a legal payload | explicit `bool` + out-param, as the hashjoin siblings already had | fixed |
+| R1-6 | residual quals, `xpb_pageagg.c` | 20000 of 2000 | path taken with clauses it cannot represent, never re-applied | refuse when any clause is unrepresented | fixed |
+| R1-7 | page skip, `xpb_pageagg.c` | 0 of 21929000 | min/max built over the **aggregated** column, tested against the **qual's** predicates | skip only on a predicate for the summarised column | fixed |
+| R1-8 | residual quals, `xpb_groupagg2.c` | 5010 of 501 | refused only when *nothing* was pushable | refuse on any residual | fixed |
+| R1-9 | target list, `xpb_pageagg.c` | `'x' \|\| sum(a)` gave `2000`, SQL gives `x21929000` | node emits one value; gate took the first Aggref and ignored the rest of the list | accept only a target list that is exactly one bare Aggref | fixed |
+| R1-10 | target list, `xpb_pageagg.c` | `count(*), sum(a)` → protocol error and a backend crash | one-attribute slot serving a two-column plan | same gate | fixed |
+
+R1-9 and R1-10 were found by running the R1-7 fix: the query shape used to
+check it was itself mis-answered.
+
+The four sites source inspection could not classify were resolved the same way:
+each became a provable refusal instead of a "cannot prove".
+
+| # | site | was | resolution | after |
+|---|---|---|---|---|
+| A1 | `slots[XPB_PAGE_TUPLES_MAX]`, `xpb_groupagg2.c` | cannot fill at `BLCKSZ` 8192, can at 16 KB; nothing enforces `BLCKSZ` | `poff` hoisted out of the collection loop; a page left unfinished now raises `ERRCODE_PROGRAM_LIMIT_EXCEEDED` instead of aggregating a truncated page | SAFE_ERROR |
+| A2 | validity slice needs `capacity % 8 == 0`, `xpb_src_pgcolumnar.c` | `Assert` only — a non-assert build shifts the window by up to 7 bits | the `Assert` replaced by a real `ereport(ERROR)` stating the byte-alignment invariant | SAFE_ERROR |
+| A3 | `palloc(nblocks * 200)`, `xpb_projection.c` | 200 is not a bound on tuples per page (`MaxHeapTuplesPerPage` is 291); observable is corruption, not a drop | fill loop bounded; `nrows >= capacity` raises before writing `col_pk[nrows]` | SAFE_ERROR |
+| A4 | sub-partitioned children, `xpb_batch_partition.c` | could not be settled from source | **it was a silent drop.** A partitioned child owns no storage, so its whole subtree contributed zero rows with no error. `get_partitions_in_range` now refuses any child whose `relkind != RELKIND_RELATION` | SAFE_ERROR |
+
+A4 is counted as a new defect, not absorbed into the original eight. Its
+reproducer is the last case in `silent_drop_map.sh`: a two-level partitioned
+table whose 400 was returned as 0.
+
+## HAVING
+
+Proven by refusal, which was the cheaper of the two branches the brief allowed.
+`root->parse->havingQual != NULL` now declines the path in both
+`xpb_pageagg.c` and `xpb_groupagg2.c`. Verified by EXPLAIN: a `HAVING` query
+selects neither node. Nothing re-applies `HAVING` above either of them — both
+replace the whole grouping rel — so refusing is the only correct option short of
+implementing it.
+
+## The A/B equivalence rule
+
+`AGG_CAP` and `S2CAP` both dropped the **same** rows in **both** arms of the
+experiment that hosts them, so each experiment's own equivalence check stayed
+green while both halves were wrong. Agreement between two arms of the same
+experiment is therefore not a correctness oracle, and never was.
+
+**Rule for the benchmark harness from here: every A/B correctness claim needs a
+third party — plain PostgreSQL, or an exactly generated expectation.** The
+reproducer suite is written this way; `run-dim-growth.sh` and the 05-x gates
+already were.
+
+## EXPLAIN gate for the refusals
+
+A refusal that accidentally disabled the path would be "correct" and useless, so
+acceptance was checked in both directions:
+
+```
+supported predicate only          -> Xp PRESENT
+two supported predicates          -> Xp PRESENT
+text equality / LIKE / IS NULL    -> Xp ABSENT
+OR / int8 column / mixed          -> Xp ABSENT
+HAVING                            -> Xp ABSENT
+```
+
 
 The audit did not stop at capacity. Four of the eight silent drops are capacity
 exhaustion; the other four are a **sentinel or a predicate** being dropped, found
@@ -38,12 +133,22 @@ returns the count of the whole table. That needs no cardinality at all — one
 
 Runtime evidence for every R1 below:
 `extension/xp_batch/test/reproducers/silent_drop_map.sh`, raw run in
-`raw/2026-09-30-silent-drop-map.txt`. Two control cases in the same script stay
-green, so the harness is not simply always-red.
+`raw/2026-09-30-silent-drop-map.txt` (2 of 9 agreeing — the defects as found).
+Two control cases in the same script stay green, so the harness is not simply
+always-red. The same script after phase 5, 10 of 10:
+`raw/2026-09-30-silent-drop-map-phase5-green.txt`.
+
+The script also gained a preflight and a numeric check on both sides of every
+comparison. Without them a dead server made six of the cases pass vacuously —
+`psql` wrote the same connection error to both sides and they compared equal.
+That was observed, not hypothesised; a wrong port now exits 2.
 
 ---
 
-## SILENT_DROP — reproduced (8)
+## SILENT_DROP — as phase 4 reproduced them (8)
+
+All eight are closed; the table is the record of what was observed, kept so the
+regression suite is visibly tied to measured defects rather than to a theory.
 
 | # | site | file | cap source | want / got |
 |---|---|---|---|---|
@@ -167,9 +272,14 @@ The last two are safe by arithmetic done elsewhere, not by anything the
 declaring code states. Raising `TP_MAX_SUMS` to 5 turns the third into an
 overrun with no diagnostic.
 
-## AMBIGUOUS (4)
+## AMBIGUOUS (4) — all resolved, now 0
 
-Source inspection cannot settle these.
+Source inspection could not settle these in phase 4. Phase 5 did not try harder
+to prove them safe; it made each one refuse, so the proof is no longer needed.
+Three became SAFE_ERROR guards over invariants that were previously implicit;
+the fourth (sub-partitioned children) turned out to be a genuine silent drop and
+is counted as one. Resolutions are in the A-table above. The phase-4 reasoning
+is kept below unchanged.
 
 - **`slots[XPB_PAGE_TUPLES_MAX]`**, `xpb_groupagg2.c:1121`. The collection loop
   stops at 256 and the rest of the page is never examined. At `BLCKSZ` 8192 the
@@ -188,6 +298,7 @@ Source inspection cannot settle these.
   `find_inheritance_children` returns direct children only, and a partitioned
   child is handed to `xpb_heap_source_create` with no relkind check. Whether that
   errors or silently scans zero rows cannot be settled from this repository.
+  *(Settled by running it: it scanned zero rows and returned no error. See A4.)*
 
 ---
 
@@ -233,16 +344,68 @@ Recorded so they are not lost. Each is a candidate for its own reproducer.
   `batch->capacity`** — they agree only because every consumer assigns the same
   constant.
 
-## Performance observations
+## Performance
 
-None taken. Measurement comes after correctness closure, and no fix has been
-applied yet, so there is nothing to compare. When it happens, its only purpose is
-to check for a catastrophic regression from removing the ceilings — not to
-optimise rehash.
+Measured after correctness, as a paired before/after: the phase-5 source diff is
+reverted, rebuilt, installed, the server restarted, measured; then re-applied,
+rebuilt, restarted, measured again — back to back in one session, on one host.
+Cross-session timings on this host drift by up to 1.6× and are not used.
+
+**Benchmarks 02 and 05-A — no detectable change.** Median of 5 warm runs,
+after/before:
+
+```
+02  xpb_heap 1.02   xpb_zlfs 0.97   xpb_pgcolumnar 0.95   plain SQL 0.94
+05-A (by range 1..1 / 1..3 / 1..6 / 1..12)
+    xpb_heap        1.15  1.25  1.07  0.99
+    xpb_zlfs        0.89  1.02  0.95  1.00
+    xpb_pgcolumnar  1.40  0.93  0.73  0.86
+```
+
+This is not a claim that nothing changed. Only the `xpb_pgcolumnar` arm runs
+through a file the diff touches (`xpb_src_pgcolumnar.c`, which now restores the
+validity bit on a predicate-rejected row). The `xpb_heap` and `xpb_zlfs` arms
+are untouched by the diff and are therefore the noise floor — and they scatter
+0.89–1.25, as wide as the touched arm's 0.73–1.40, which includes ratios below
+1.0 that added work cannot produce. **This pairing cannot resolve anything
+smaller than roughly ±25%.** No regression is shown; none is excluded either.
+
+**The refusals do cost, and the cost is the point.** Where a wrong-but-fast Xp
+path is now declined, the query falls back to the PostgreSQL executor. On 2M
+rows, median of 5:
+
+```
+                                     before            after          ratio
+pageagg, residual qual               18.0 ms           72.8 ms        4.05x
+  (WHERE name='x')                   2 000 000 rows    200 000 rows
+                                     WRONG             correct
+pageagg, page skip, supported-only   20.1 ms           56.8 ms        2.83x
+  (WHERE period_key < 10)            0                 200192900000
+                                     WRONG             correct
+```
+
+The "before" numbers are not a baseline to defend: both produced the wrong
+answer, and the page-skip one was fast precisely because it skipped every page.
+A 4× slowdown that replaces a wrong answer with a right one is the intended
+outcome of this phase, recorded rather than compensated for.
+
+**groupagg2's refusal cost is unmeasured, not zero.** No shape was found in
+which `XpGroupAgg2` both wins on cost and carries a residual qual: at 10 000
+rows it is selected and the runtime is below timing resolution; at 2M rows the
+planner picks a parallel `GroupAggregate` in both arms, so the refusal changes
+nothing that was going to be chosen. Stated as a gap, not as a result.
+
+Raw runs: `/tmp` scratch only — these are diagnostic pairings, not published
+benchmark artifacts, and nothing under `benchmarks/*/raw/` or `plans/` was
+rewritten.
 
 ---
 
-## What phase 5 must decide, per site
+## What phase 5 decided, per site (the phase-4 plan, kept for comparison)
+
+Every line below was followed as written; the per-site table at the top is what
+was actually built. The one place the plan was silent is A4, which the plan
+listed as unknowable and which turned out to be a defect.
 
 The policy preference is growth where the structure is naturally dynamic state,
 and an explicit ERROR where growth would change the scope of the milestone.
