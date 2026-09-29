@@ -1,12 +1,19 @@
 # Unguarded fixed hash tables that drop rows instead of erroring
 
-Status: **site 3 (`local_ht`) is R1 -- REACHABLE, reproduced from SQL.
-Sites 1 and 2 still unproven. Not fixed yet, deliberately.**
+Status: **superseded as a register by
+`docs/roadmap/silent-drop-reachability.md`, which maps the whole extension.
+All four sites here are now R1, reproduced. Not fixed yet, deliberately.**
+
+This note remains the detailed write-up of the first four sites and of how
+`local_ht` was reached. The full classification of every bounded structure in
+`xp_batch` -- 31 sites, of which 8 are reproduced silent drops -- is in the map,
+along with four further silent drops that are not capacity exhaustion and that a
+load-factor audit could not have found.
 
 | site | table | reachability | evidence |
 |---|---|---|---|
-| 1 | `xpb_projection.c` `AGG_CAP` | unproven | — |
-| 2 | `xpb_columnar_pipeline.c` `WHASH_CAP` | unproven | — |
+| 1 | `xpb_projection.c` `AGG_CAP` | **R1 reachable** | `test/reproducers/silent_drop_map.sh` (16900 in, 16384 out) |
+| 2 | `xpb_columnar_pipeline.c` `WHASH_CAP` | **R1 reachable** | same script (140000 in, 131072 out) |
 | 3 | `xpb_groupagg2.c` `local_ht` | **R1 reachable** | `test/reproducers/local_ht_silent_drop.sh` |
 | 4 | `xpb_groupagg2.c` global hash | guard sound for itself | — |
 
@@ -62,6 +69,14 @@ sum that is quietly too small. Ten of the extension's other fixed tables
 `xpb_batch_partition.c`, `xpb_zlfs.c`) raise at 3/4 load before the probe loop,
 which both prevents the drop and guarantees the loop terminates on a free slot.
 These three have no such guard.
+
+That statement is about **insert** loops, and it is correct. It is also
+incomplete: `xpb_batch_partition.c`'s *lookup* loops return `-1` for a miss and
+the caller drops on `yr < 0 || ag < 0`, so a negative dimension payload -- a
+legal `int NOT NULL` with no CHECK anywhere -- silently deletes every fact row
+referencing it. A load-factor audit could not find that, and this file should
+not be read as vouching for `xpb_batch_partition.c` as a whole. See R1-5 in the
+map.
 
 ### The fourth table: a guard that covers only itself
 
