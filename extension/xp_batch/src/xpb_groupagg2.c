@@ -285,6 +285,41 @@ xpga2_stream_cb(ReadStream *stream, void *cb_data, void *per_buffer_data)
     return p->current_blocknum++;
 }
 
+/*
+ * Drain the per-batch local partial hash into the global hash and clear it.
+ *
+ * Called both at the end of a batch and when the local table fills mid-batch.
+ * Draining and reusing is what keeps local_ht L1-resident -- its whole reason
+ * to exist -- while losing nothing: growing it would defeat the purpose, and
+ * dropping the row that did not fit is what this used to do. The elastic
+ * buffer and ScalarBatch in the same function already work this way.
+ */
+static inline void
+xpga2_drain_local(CGroupEntry *local_ht, int local_cap,
+                  CGroupEntry *htable, int64 hash_cap, int64 *ngroups)
+{
+    for (int i = 0; i < local_cap; i++)
+    {
+        if (!local_ht[i].occupied) continue;
+        uint32 h = (uint32)local_ht[i].k1 * 2654435761u
+                 ^ (uint32)local_ht[i].k2 * 2246822519u;
+        int64 sl = (int64)(h & (uint32)(hash_cap - 1));
+        for (int64 pr = 0; pr < hash_cap; pr++)
+        {
+            int64 idx = (sl + pr) & (hash_cap - 1);
+            CGroupEntry *ge = &htable[idx];
+            if (!ge->occupied) { *ge = local_ht[i]; (*ngroups)++; break; }
+            if (ge->k1 == local_ht[i].k1 && ge->k2 == local_ht[i].k2)
+            {
+                ge->sum_val += local_ht[i].sum_val;
+                ge->count   += local_ht[i].count;
+                break;
+            }
+        }
+    }
+    memset(local_ht, 0, local_cap * sizeof(CGroupEntry));
+}
+
 static TupleTableSlot *
 xpga2_exec(CustomScanState *node)
 {
@@ -633,48 +668,45 @@ xpga2_exec(CustomScanState *node)
                                 uint32 h = (uint32)ck1[i] * 2654435761u
                                          ^ (uint32)ck2[i] * 2246822519u;
                                 int64 sl = (int64)(h & (uint32)(local_cap - 1));
-                                for (int pr = 0; pr < local_cap; pr++)
+                                bool placed = false;
+                                for (int attempt = 0; attempt < 2 && !placed; attempt++)
                                 {
-                                    int idx = (int)((sl + pr) & (local_cap - 1));
-                                    CGroupEntry *e = &local_ht[idx];
-                                    if (!e->occupied) {
-                                        e->k1 = ck1[i]; e->k2 = ck2[i];
-                                        e->sum_val = cv[i]; e->count = 1;
-                                        e->occupied = true; local_ngroups++;
-                                        break;
+                                    for (int pr = 0; pr < local_cap; pr++)
+                                    {
+                                        int idx = (int)((sl + pr) & (local_cap - 1));
+                                        CGroupEntry *e = &local_ht[idx];
+                                        if (!e->occupied) {
+                                            e->k1 = ck1[i]; e->k2 = ck2[i];
+                                            e->sum_val = cv[i]; e->count = 1;
+                                            e->occupied = true; local_ngroups++;
+                                            placed = true; break;
+                                        }
+                                        if (e->k1 == ck1[i] && e->k2 == ck2[i]) {
+                                            e->sum_val += cv[i]; e->count++;
+                                            placed = true; break;
+                                        }
                                     }
-                                    if (e->k1 == ck1[i] && e->k2 == ck2[i]) {
-                                        e->sum_val += cv[i]; e->count++;
-                                        break;
+                                    /* local table full: drain to global, then retry once */
+                                    if (!placed)
+                                    {
+                                        xpga2_drain_local(local_ht, local_cap,
+                                                          htable, hash_cap, &ngroups);
+                                        state->lp_partials_emitted += local_ngroups;
+                                        local_ngroups = 0;
                                     }
                                 }
                             }
 
                             /* Step 2: merge local hash → global hash */
-                            for (int i = 0; i < local_cap; i++)
-                            {
-                                if (!local_ht[i].occupied) continue;
-                                uint32 h = (uint32)local_ht[i].k1 * 2654435761u
-                                         ^ (uint32)local_ht[i].k2 * 2246822519u;
-                                int64 sl = (int64)(h & (uint32)(hash_cap - 1));
-                                for (int64 pr = 0; pr < hash_cap; pr++)
-                                {
-                                    int64 idx = (sl + pr) & (hash_cap - 1);
-                                    CGroupEntry *ge = &htable[idx];
-                                    if (!ge->occupied) {
-                                        *ge = local_ht[i];
-                                        ngroups++;
-                                        break;
-                                    }
-                                    if (ge->k1 == local_ht[i].k1 && ge->k2 == local_ht[i].k2) {
-                                        ge->sum_val += local_ht[i].sum_val;
-                                        ge->count += local_ht[i].count;
-                                        break;
-                                    }
-                                }
-                            }
+                            xpga2_drain_local(local_ht, local_cap,
+                                              htable, hash_cap, &ngroups);
 
-                            /* Metrics */
+                            /*
+                             * Metrics. With mid-batch draining, local_ngroups
+                             * counts groups since the last drain, not since the
+                             * start of the batch; lp_max_groups_in_batch is
+                             * bounded by local_cap by construction.
+                             */
                             state->lp_input_tuples += sb->nrows;
                             state->lp_partials_emitted += local_ngroups;
                             state->lp_batches++;
@@ -742,43 +774,35 @@ xpga2_exec(CustomScanState *node)
                         uint32 h = (uint32)ck1[i] * 2654435761u
                                  ^ (uint32)ck2[i] * 2246822519u;
                         int64 sl = (int64)(h & (uint32)(local_cap - 1));
-                        for (int pr = 0; pr < local_cap; pr++)
+                        bool placed = false;
+                        for (int attempt = 0; attempt < 2 && !placed; attempt++)
                         {
-                            int idx = (int)((sl + pr) & (local_cap - 1));
-                            CGroupEntry *e = &local_ht[idx];
-                            if (!e->occupied) {
-                                e->k1 = ck1[i]; e->k2 = ck2[i];
-                                e->sum_val = cv[i]; e->count = 1;
-                                e->occupied = true; local_ngroups++;
-                                break;
+                            for (int pr = 0; pr < local_cap; pr++)
+                            {
+                                int idx = (int)((sl + pr) & (local_cap - 1));
+                                CGroupEntry *e = &local_ht[idx];
+                                if (!e->occupied) {
+                                    e->k1 = ck1[i]; e->k2 = ck2[i];
+                                    e->sum_val = cv[i]; e->count = 1;
+                                    e->occupied = true; local_ngroups++;
+                                    placed = true; break;
+                                }
+                                if (e->k1 == ck1[i] && e->k2 == ck2[i]) {
+                                    e->sum_val += cv[i]; e->count++;
+                                    placed = true; break;
+                                }
                             }
-                            if (e->k1 == ck1[i] && e->k2 == ck2[i]) {
-                                e->sum_val += cv[i]; e->count++;
-                                break;
+                            if (!placed)
+                            {
+                                xpga2_drain_local(local_ht, local_cap,
+                                                  htable, hash_cap, &ngroups);
+                                state->lp_partials_emitted += local_ngroups;
+                                local_ngroups = 0;
                             }
                         }
                     }
-                    for (int i = 0; i < local_cap; i++)
-                    {
-                        if (!local_ht[i].occupied) continue;
-                        uint32 h = (uint32)local_ht[i].k1 * 2654435761u
-                                 ^ (uint32)local_ht[i].k2 * 2246822519u;
-                        int64 sl = (int64)(h & (uint32)(hash_cap - 1));
-                        for (int64 pr = 0; pr < hash_cap; pr++)
-                        {
-                            int64 idx = (sl + pr) & (hash_cap - 1);
-                            CGroupEntry *ge = &htable[idx];
-                            if (!ge->occupied) {
-                                *ge = local_ht[i]; ngroups++;
-                                break;
-                            }
-                            if (ge->k1 == local_ht[i].k1 && ge->k2 == local_ht[i].k2) {
-                                ge->sum_val += local_ht[i].sum_val;
-                                ge->count += local_ht[i].count;
-                                break;
-                            }
-                        }
-                    }
+                    xpga2_drain_local(local_ht, local_cap,
+                                      htable, hash_cap, &ngroups);
                     state->lp_input_tuples += sb->nrows;
                     state->lp_partials_emitted += local_ngroups;
                     state->lp_batches++;
@@ -1122,7 +1146,8 @@ xpga2_exec(CustomScanState *node)
                 int nslots = 0;
                 LiveBitmap bm;
 
-                for (OffsetNumber poff = FirstOffsetNumber;
+                OffsetNumber poff;
+                for (poff = FirstOffsetNumber;
                      poff <= pmaxoff && nslots < XPB_PAGE_TUPLES_MAX; poff++)
                 {
                     ItemId plp = PageGetItemId(page, poff);
@@ -1138,6 +1163,24 @@ xpga2_exec(CustomScanState *node)
                             continue;
                     }
                     slots[nslots++] = poff;
+                }
+
+                /*
+                 * The loop above stops at XPB_PAGE_TUPLES_MAX and used to leave
+                 * the rest of the page unexamined -- rows silently absent from
+                 * the aggregate. Whether a page can hold more than 256 visible
+                 * tuples depends on BLCKSZ (226 max at 8 KB, 454 at 16 KB) and
+                 * nothing in this extension constrains BLCKSZ, so it is refused
+                 * rather than assumed away.
+                 */
+                if (poff <= pmaxoff)
+                {
+                    LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+                    ReleaseBuffer(buf);
+                    ereport(ERROR,
+                            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                             errmsg("XpGroupAgg2: page %u holds more than %d visible tuples",
+                                    blkno, XPB_PAGE_TUPLES_MAX)));
                 }
 
                 /* Build bitmap: all nslots bits set */
@@ -1741,8 +1784,20 @@ xpga2_add_path(PlannerInfo *root, RelOptInfo *input_rel,
 
     /* Don't take path if residual quals remain (correctness: we
      * cannot apply ExecQual inside XpGroupAgg2 yet) */
-    if (pqfrag_tmp.has_residual && pqfrag_tmp.npreds == 0)
-        return;  /* all quals non-pushable: let baseline handle it */
+    /*
+     * Any residual at all is a refusal, not just "nothing was pushable".
+     * The residual clauses are discarded below (scan.plan.qual = NIL with
+     * scanrelid = 0) and this node never calls ExecQual, so taking the path
+     * with npreds > 0 && has_residual answered the query as though the
+     * unrepresented clause had been applied.
+     */
+    if (pqfrag_tmp.has_residual)
+        return;
+
+    /* HAVING is not examined here and no upper node re-applies it. */
+    if (root->parse->havingQual != NULL)
+        return;
+
 
     /* Encode pqfrag into custom_private as (npreds, [attno,op,rhs]*n, residual) */
     cpath->custom_private   = list_make4(
