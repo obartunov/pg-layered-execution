@@ -1,0 +1,54 @@
+diff --git a/src/columnar.h b/src/columnar.h
+index 1b84591..691d7ba 100644
+--- a/src/columnar.h
++++ b/src/columnar.h
+@@ -458,7 +458,7 @@ typedef struct PgColumnarProjection
+ struct SMgrRelationData;
+ 
+ extern void PgColumnarReadMetapage(Relation rel, PgColumnarMetapage *meta);
+-extern uint64 PgColumnarStorageId(Relation rel);
++extern PGDLLEXPORT uint64 PgColumnarStorageId(Relation rel);
+ 
+ /* row number <-> item pointer (spec 6) */
+ extern void PgColumnarRowNumberToItemPointer(uint64 rowNumber, ItemPointer tid);
+@@ -680,7 +680,7 @@ extern void PgColumnarFlushDeleteVectorForRelation(Relation rel);
+  * ------------------------------------------------------------------------- */
+ typedef struct PgColumnarReadState PgColumnarReadState;
+ 
+-extern PgColumnarReadState *PgColumnarBeginRead(Relation rel, Snapshot snapshot,
++extern PGDLLEXPORT PgColumnarReadState *PgColumnarBeginRead(Relation rel, Snapshot snapshot,
+ 											ParallelTableScanDesc parallelScan,
+ 											Bitmapset *projectedColumns,
+ 											int nkeys, ScanKey keys);
+@@ -705,7 +705,7 @@ extern bool PgColumnarReadNextRow(PgColumnarReadState *readState,
+ typedef bool (*PgColumnarRowFilter) (void *arg);
+ 
+ extern void PgColumnarRescanRead(PgColumnarReadState *readState);
+-extern void PgColumnarEndRead(PgColumnarReadState *readState);
++extern PGDLLEXPORT void PgColumnarEndRead(PgColumnarReadState *readState);
+ 
+ /*
+  * Batch-fold accessors (#289): expose the current loaded group's decoded buffer
+diff --git a/src/columnar_reader.h b/src/columnar_reader.h
+index dab74e8..40f2240 100644
+--- a/src/columnar_reader.h
++++ b/src/columnar_reader.h
+@@ -32,15 +32,15 @@ extern bool PgColumnarReadNextRowFiltered(PgColumnarReadState *readState,
+ 
+ extern uint64 PgColumnarRowsFilteredEarly(PgColumnarReadState *readState);
+ 
+-extern bool PgColumnarReadFoldNextGroup(PgColumnarReadState *readState);
++extern PGDLLEXPORT bool PgColumnarReadFoldNextGroup(PgColumnarReadState *readState);
+ 
+-extern void PgColumnarReadFoldGroupInfo(PgColumnarReadState *readState, uint64 *nrows,
++extern PGDLLEXPORT void PgColumnarReadFoldGroupInfo(PgColumnarReadState *readState, uint64 *nrows,
+ 									  const char **deleteMask, uint32 *deleteMaskLen,
+ 									  const bool **skipVec, bool *decodeSkipped,
+ 									  const uint32 **vecStart,
+ 									  int *vectorCount);
+ 
+-extern bool PgColumnarReadFoldColumn(PgColumnarReadState *readState, int attidx,
++extern PGDLLEXPORT bool PgColumnarReadFoldColumn(PgColumnarReadState *readState, int attidx,
+ 								   const char **validity, const char **packed,
+ 								   int16 *attlen, const uint32 **vecRawLen);
+ 

@@ -3,7 +3,7 @@
  *                        compact int32 batches through the fold reader API.
  *
  * Built against commandprompt/pgcolumnar at 5b20ae8 (VERSION 1.0-alpha5) with
- * patches/pgcolumnar-alpha5/0001-export-fold-reader-api.patch applied: the six
+ * patches/pgcolumnar/0001-export-fold-reader-api.patch applied: the six
  * symbols below are local in a stock build (PostgreSQL compiles extension
  * modules with -fvisibility=hidden) and cannot be linked against otherwise.
  *
