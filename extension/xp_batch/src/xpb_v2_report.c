@@ -62,6 +62,9 @@ extern XpBatchSource *xpcn_source_create(Oid relid, int16 *requested_attnos,
 extern void xpcn_source_pruning(XpBatchSource *src, int64 *groups_read,
                                 int64 *group_rows_seen,
                                 int64 *rows_vec_skipped, int64 *rows_emitted);
+extern void xpcn_source_stats(XpBatchSource *src, int64 *groups,
+                              int64 *groups_copied, int64 *rows,
+                              int64 *bytes_copied);
 
 PG_FUNCTION_INFO_V1(xpb_v2_register_report);
 
@@ -944,6 +947,21 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
     double          dim1_build_ms = 0, dim2_build_ms = 0;
     double          build_ms = 0, open_ms = 0, source_ms = 0,
                     j1_ms = 0, j2_ms = 0, agg_ms = 0;
+    /*
+     * Row-flow accounting (§4 of the cost study). rows_in is what the source
+     * handed over -- already post-predicate for every heap path, because every
+     * heap path applies the predicate inside next_batch. The pre-predicate
+     * count is tuples_visited, which the source already keeps.
+     */
+    int64           rows_j1 = 0;        /* survived the dim1 probe */
+    int64           rows_j2 = 0;        /* survived dim2 too == v2_grp_upsert calls */
+    int64           rows_emitted_out = 0;
+    double          emit_ms = 0;
+    /* ZLFS decomposition (§9): where its speed actually comes from. */
+    double          zlfs_scan_ms = 0;
+    int64           zlfs_zone_rows = 0;
+    int64           zlfs_zone_bytes = 0;
+    int             zlfs_zone_ncols = 0;
 
     if (rsi == NULL || !IsA(rsi, ReturnSetInfo) ||
         (rsi->allowedModes & SFRM_Materialize) == 0)
@@ -1064,8 +1082,22 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
          * 1..12 both present, a request for 1..12 was served from the 1..1
          * zone and returned 83 334 rows instead of 1 000 008.
          */
-        zlfs_ensure_registry();
-        zlfs_scan_directory();
+        /*
+         * Split `open` for ZLFS. Everything ZLFS does at query time that is
+         * not pointer arithmetic happens here: scan_directory reads and
+         * validates every zone file in the data directory. Its own next_batch
+         * only advances a cursor, so without this split ZLFS looks like a
+         * source with no read cost at all.
+         */
+        {
+            instr_time  zs0, zs1;
+
+            zlfs_ensure_registry();
+            INSTR_TIME_SET_CURRENT(zs0);
+            zlfs_scan_directory();
+            INSTR_TIME_SET_CURRENT(zs1);
+            zlfs_scan_ms = INSTR_TIME_GET_MILLISEC(zs1) - INSTR_TIME_GET_MILLISEC(zs0);
+        }
         if (zlfs_reg)
             for (int i = 0; i < zlfs_reg->nzones; i++)
                 if (zlfs_reg->zones[i]->source_relid == fact_relid &&
@@ -1073,6 +1105,13 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                     zlfs_reg->zones[i]->pred_hi == hi &&
                     zlfs_reg->zones[i]->freshness == ZLFS_VALID)
                 { zone = zlfs_reg->zones[i]; break; }
+        if (zone != NULL)
+        {
+            zlfs_zone_rows = zone->nrows;
+            for (int c = 0; c < zone->ncols; c++)
+                zlfs_zone_bytes += (int64) zone->col_widths[c] * zone->nrows;
+            zlfs_zone_ncols = zone->ncols;
+        }
         if (zone == NULL)
             ereport(ERROR,
                     (errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -1194,6 +1233,15 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         INSTR_TIME_SET_CURRENT(tn);
         j1_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
 
+        /*
+         * Row-flow accounting. Counted in their own pass, outside the timed
+         * loops, so the stage timings stay comparable with the uninstrumented
+         * binary. Two extra linear passes over `keep` per batch; their cost is
+         * what the instrumentation-overhead measurement reports.
+         */
+        for (int r = 0; r < nrows; r++)
+            if (keep[r]) rows_j1++;
+
         /* join 2: account_key -> account_group */
         INSTR_TIME_SET_CURRENT(tp);
         for (int r = 0; r < nrows; r++)
@@ -1202,6 +1250,9 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                           v2_dim2_lookup(&dim2, col_ac[r], &grp2_buf[r]);
         INSTR_TIME_SET_CURRENT(tn);
         j2_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
+
+        for (int r = 0; r < nrows; r++)
+            if (keep[r]) rows_j2++;
 
         /* aggregate */
         INSTR_TIME_SET_CURRENT(tp);
@@ -1245,6 +1296,29 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
                              " rows_vec_skipped=" INT64_FORMAT
                              " rows_emitted=" INT64_FORMAT,
                              gr, grs, vskip, remit);
+            {
+                /*
+                 * Already collected, never printed. groups_copied separates
+                 * the zero-copy borrow from the materialize-and-filter walk,
+                 * which is the difference between pgColumnar avoiding work
+                 * and pgColumnar doing cheaper work (§3).
+                 */
+                int64   g_, gc_, r_, bc_;
+
+                xpcn_source_stats(src, &g_, &gc_, &r_, &bc_);
+                appendStringInfo(&extra,
+                                 " groups_copied=" INT64_FORMAT
+                                 " bytes_copied=" INT64_FORMAT,
+                                 gc_, bc_);
+            }
+        }
+        else if (zlfs_zone_rows > 0)
+        {
+            appendStringInfo(&extra,
+                             "  zlfs_scan_dir_ms=%.3f zone_rows=" INT64_FORMAT
+                             " zone_bytes=" INT64_FORMAT " zone_ncols=%d",
+                             zlfs_scan_ms, zlfs_zone_rows, zlfs_zone_bytes,
+                             zlfs_zone_ncols);
         }
         else if (is_heap)
         {
@@ -1253,10 +1327,24 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             bool    isdef;
             int64   ts_, aw_, am_;
             int64   ta_, tr_, wa_, wr_, ma_, mr_;
+            int64   prej_, pscan_, tvis_, tpass_;
 
             xpb_heap_source_deform_stats(src, &td_, &ad_, &ar_, &isdef);
             xpb_heap_source_projected_stats(src, &ts_, &aw_, &am_);
             xpb_heap_source_early_stats(src, &ta_, &tr_, &wa_, &wr_, &ma_, &mr_);
+            /*
+             * These four already existed and were never printed. tuples_visited
+             * is the only PRE-predicate row count available for a heap path --
+             * rows_in is post-predicate, because every heap path filters inside
+             * next_batch -- so without it the row-flow model has no source row.
+             */
+            xpb_heap_source_stats(src, &prej_, &pscan_, &tvis_, &tpass_);
+            appendStringInfo(&extra,
+                             "  pages_scanned=" INT64_FORMAT
+                             " pages_rejected=" INT64_FORMAT
+                             " tuples_visited=" INT64_FORMAT
+                             " tuples_passed=" INT64_FORMAT,
+                             pscan_, prej_, tvis_, tpass_);
             appendStringInfo(&extra,
                              "  heap_path=%s  tuples_deformed=" INT64_FORMAT
                              " attrs_deformed=" INT64_FORMAT
@@ -1338,12 +1426,14 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
         appendStringInfo(&extra, "  dim1_build_ms=%.3f dim2_build_ms=%.3f",
                          dim1_build_ms, dim2_build_ms);
 
-        elog(NOTICE,
-             "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
-             "open=%.1f ms  source=%.1f ms  join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
-             "operators=%.1f ms  rows=" INT64_FORMAT "  batches=%d  groups=%d%s",
-             lo, hi, mode, total_ms, build_ms, open_ms, source_ms, j1_ms, j2_ms, agg_ms,
-             j1_ms + j2_ms + agg_ms, rows_in, nbatches, grp.ngroups, extra.data);
+        /*
+         * Result emission is timed and reported, but deliberately NOT folded
+         * into total_ms: total_ms is written into every emitted row, so it
+         * cannot include the cost of emitting them. Before this it was simply
+         * unaccounted -- the sweep is over grp.capacity, not grp.ngroups, so
+         * at low group counts it is dominated by scanning empty slots.
+         */
+        INSTR_TIME_SET_CURRENT(tp);
 
         for (int i = 0; i < grp.capacity; i++)
         {
@@ -1379,7 +1469,23 @@ xpb_v2_register_report(PG_FUNCTION_ARGS)
             }
             vals[6] = Float8GetDatum(total_ms);
             tuplestore_putvalues(store, rsi->setDesc, vals, nulls);
+            rows_emitted_out++;
         }
+
+        INSTR_TIME_SET_CURRENT(tn);
+        emit_ms = INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp);
+
+        elog(NOTICE,
+             "v2_register_report [%d..%d] mode=%s: total=%.1f ms  build=%.1f ms  "
+             "open=%.1f ms  source=%.1f ms  join1=%.1f ms  join2=%.1f ms  agg=%.1f ms  "
+             "operators=%.1f ms  emit=%.1f ms  rows=" INT64_FORMAT "  batches=%d  groups=%d  "
+             "flow_rows_in=" INT64_FORMAT " flow_rows_j1=" INT64_FORMAT
+             " flow_rows_j2=" INT64_FORMAT " flow_agg_updates=" INT64_FORMAT
+             " flow_rows_emitted=" INT64_FORMAT " flow_emit_slots_scanned=%d%s",
+             lo, hi, mode, total_ms, build_ms, open_ms, source_ms, j1_ms, j2_ms, agg_ms,
+             j1_ms + j2_ms + agg_ms, emit_ms, rows_in, nbatches, grp.ngroups,
+             rows_in, rows_j1, rows_j2, rows_j2, rows_emitted_out, grp.capacity,
+             extra.data);
     }
 
     /*
