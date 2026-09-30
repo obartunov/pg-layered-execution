@@ -1,0 +1,5 @@
+fully supported|accepted: Custom Scan (XpGroupAgg2)|26.5|ok
+one residual qual|refused -> HashAggregate|94.3|ok
+unsupported target expression|refused -> Aggregate|85.5|ok
+HAVING|refused -> HashAggregate|158.8|ok
+supported single aggregate|refused -> Aggregate|82.7|ok

@@ -1,0 +1,2 @@
+NOTICE:  ZLFS zone [1..12] built: 1000008 rows, 147 ms, 19531 KB, ncols=5, schema_hash=36cbbdc1, file=/tmp/pgdata20/zlfs/zone_118761_1_12.zlfs
+VALID
