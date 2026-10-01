@@ -1778,27 +1778,37 @@ xpga2_plan_path(PlannerInfo *root, RelOptInfo *rel,
     cscan->custom_plans         = NIL;
     cscan->scan.plan.qual       = NIL;
 
-    /* PG20: plan->targetlist and custom_scan_tlist must use INDEX_VAR */
-    {
-        List *idx_tlist = NIL;
-        ListCell *lc;
-        int resno = 1;
-        foreach(lc, tlist)
-        {
-            TargetEntry *tle = (TargetEntry *) lfirst(lc);
-            Var *v = makeVar(INDEX_VAR, resno,
-                             exprType((Node *) tle->expr),
-                             exprTypmod((Node *) tle->expr),
-                             exprCollation((Node *) tle->expr),
-                             0);
-            idx_tlist = lappend(idx_tlist,
-                                makeTargetEntry((Expr *) v, resno,
-                                                tle->resname, tle->resjunk));
-            resno++;
-        }
-        cscan->scan.plan.targetlist = idx_tlist;
-        cscan->custom_scan_tlist    = copyObject(idx_tlist);
-    }
+    /*
+     * scanrelid = 0, so the two target lists play different roles and must not
+     * be the same list:
+     *
+     *   scan.plan.targetlist   Vars of INDEX_VAR whose varattno is a POSITION
+     *                          in custom_scan_tlist.
+     *   custom_scan_tlist      the expressions those positions denote.
+     *
+     * Both used to be set to the INDEX_VAR list, so entry i of
+     * custom_scan_tlist was Var(INDEX_VAR, i) — a reference to itself. Nothing
+     * in execution noticed, because the only consumers read exprType(). But
+     * EXPLAIN (VERBOSE) deparses the target list, and resolving INDEX_VAR means
+     * following it into custom_scan_tlist, which pointed straight back. That
+     * loop never terminated and could not be interrupted: statement_timeout did
+     * not fire, pg_terminate_backend() did not end it, and the backend held a
+     * relation lock until an immediate restart. Two were observed, at 39 and 9
+     * minutes, on a plan whose non-VERBOSE form returns in 0.04 ms.
+     *
+     * Both get the real expressions. set_customscan_references() then builds an
+     * index over custom_scan_tlist and rewrites scan.plan.targetlist into
+     * INDEX_VAR references against it — that conversion is setrefs' job, not
+     * this function's. Hand-building the INDEX_VAR list here is what created
+     * the self-reference: the entries matched each other literally, so setrefs
+     * raised no complaint and nothing in execution cared, because the only
+     * consumers of custom_scan_tlist read exprType().
+     *
+     * exprType() of each entry is unchanged by this, so ExecTypeFromTL() and
+     * the agg-output-type lookup in xpga2_begin behave exactly as before.
+     */
+    cscan->scan.plan.targetlist = tlist;
+    cscan->custom_scan_tlist    = copyObject(tlist);
     cscan->custom_private       = best_path->custom_private;
     return (Plan *) cscan;
 }

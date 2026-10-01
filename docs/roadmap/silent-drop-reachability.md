@@ -539,3 +539,35 @@ once by the hash-preallocation probe and once by the main scan loop. An
 off-by-one in an observability counter, pre-existing, left alone to keep this
 repair to the correctness boundary.
 
+---
+
+## R1-12 — EXPLAIN (VERBOSE) on XpGroupAgg2 could not be interrupted
+
+Found in the same session, separate defect, separate mechanism.
+Reproducer `test/reproducers/groupagg2_explain_verbose.sh`.
+
+`xpga2_plan_path()` set `scan.plan.targetlist` **and** `custom_scan_tlist` to the
+same hand-built list of `Var(INDEX_VAR, i)`, so entry *i* of `custom_scan_tlist`
+was a reference to itself. Execution never noticed — its only consumers read
+`exprType()` — and `setrefs` raised no complaint because the two lists matched
+each other literally. But `EXPLAIN (VERBOSE)` deparses the target list, and
+resolving `INDEX_VAR` means following it into `custom_scan_tlist`, which pointed
+straight back.
+
+The loop could not be stopped: `statement_timeout` did not fire,
+`pg_terminate_backend()` did not end it, and only `pg_ctl restart -m immediate`
+cleared it. It held a relation lock while wedged, so later `DROP TABLE`s queued
+behind it and three gate runs queued behind those — which is how it was found,
+after they appeared to hang and were in fact waiting on one such backend.
+
+Fix: both lists get the real expressions and
+`set_customscan_references()` performs the `INDEX_VAR` rewrite, which was always
+its job. `exprType()` of every entry is unchanged, so the tuple descriptor and
+the agg-output-type lookup are unaffected. `EXPLAIN (VERBOSE)` now prints
+`Output: k1, k2, (sum(v))` and returns in milliseconds.
+
+The regression test wraps every `psql` call in a **client-side** `timeout`,
+because `statement_timeout` provably cannot end this failure mode; a test that
+relied on it would hang the suite meant to detect it.
+
+Classification: **fixed.**
