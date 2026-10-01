@@ -1,0 +1,6 @@
+asc|1.0000|1000|12739|1001657|1000|Custom Scan (XpGroupAgg2)|24883|24883.18
+blocks100|0.1053|1000|12739|-|-|HashAggregate|-|45363.96
+blocks10|0.1101|1000|12739|-|-|HashAggregate|-|45283.38
+jitter|0.9817|1000|12739|997342|1000|Custom Scan (XpGroupAgg2)|24828|24828.16
+random|0.0065|1000|12739|-|-|HashAggregate|-|45314.79
+desc|-1.0000|1000|12739|986326|1000|Custom Scan (XpGroupAgg2)|24688|24687.71

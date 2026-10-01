@@ -1,0 +1,6 @@
+asc :: xpga2 cost: C1_scan=20616 C2_group=2003 C3_out=10 C4_qual=2254 total=24883  pages=12739 nrows=1001657 ngroups=1000 npreds=1
+blocks100 :: 
+blocks10 :: 
+jitter :: xpga2 cost: C1_scan=20579 C2_group=1995 C3_out=10 C4_qual=2244 total=24828  pages=12739 nrows=997342 ngroups=1000 npreds=1
+random :: 
+desc :: xpga2 cost: C1_scan=20486 C2_group=1973 C3_out=10 C4_qual=2219 total=24688  pages=12739 nrows=986326 ngroups=1000 npreds=1

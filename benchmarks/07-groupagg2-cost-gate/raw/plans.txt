@@ -1,0 +1,39 @@
+=== rung asc (correlation 1.0000) ===
+Custom Scan (XpGroupAgg2)  (cost=20616.13..24883.18 rows=1000 width=40)
+  Pushed Pred: col1 <= 500
+  GroupAgg Path: pending
+  CostFloor: C1=20616 C2=2003 C3=10 C4=2254 total=24883
+  BatchProperties.order_scope: NONE
+
+=== rung blocks100 (correlation 0.1053) ===
+HashAggregate  (cost=45351.46..45363.96 rows=1000 width=40)
+  Group Key: k1, k2
+  ->  Seq Scan on cg_t  (cost=0.00..37739.00 rows=1014995 width=16)
+        Filter: (k1 <= 500)
+
+=== rung blocks10 (correlation 0.1101) ===
+HashAggregate  (cost=45270.88..45283.38 rows=1000 width=40)
+  Group Key: k1, k2
+  ->  Seq Scan on cg_t  (cost=0.00..37739.00 rows=1004250 width=16)
+        Filter: (k1 <= 500)
+
+=== rung jitter (correlation 0.9817) ===
+Custom Scan (XpGroupAgg2)  (cost=20579.46..24828.16 rows=1000 width=40)
+  Pushed Pred: col1 <= 500
+  GroupAgg Path: pending
+  CostFloor: C1=20579 C2=1995 C3=10 C4=2244 total=24828
+  BatchProperties.order_scope: NONE
+
+=== rung random (correlation 0.0065) ===
+HashAggregate  (cost=45302.29..45314.79 rows=1000 width=40)
+  Group Key: k1, k2
+  ->  Seq Scan on cg_t  (cost=0.00..37739.00 rows=1008439 width=16)
+        Filter: (k1 <= 500)
+
+=== rung desc (correlation -1.0000) ===
+Custom Scan (XpGroupAgg2)  (cost=20485.82..24687.71 rows=1000 width=40)
+  Pushed Pred: col1 <= 500
+  GroupAgg Path: pending
+  CostFloor: C1=20486 C2=1973 C3=10 C4=2219 total=24688
+  BatchProperties.order_scope: NONE
+
