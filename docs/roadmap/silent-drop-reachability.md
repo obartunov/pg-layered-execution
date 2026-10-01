@@ -1,10 +1,27 @@
 # Silent-Drop Reachability — the map
 
-Status: **closed. SILENT_DROP = 0, AMBIGUOUS = 0.** Phase 4 mapped the space,
-phase 5 closed it. `test/reproducers/silent_drop_map.sh` has become the
-regression suite for these sites and now passes 10/10; the wrong result each
-case originally produced is recorded beside it so the test visibly closes an
-observed defect.
+Status: **reopened 2026-10-01 for R1-11, then closed again. SILENT_DROP = 0,
+AMBIGUOUS = 0.**
+
+Phase 4 mapped the space and phase 5 closed it at 11 defects. The map was then
+reopened: auditing the `XpGroupAgg2` correlation cost gate found a twelfth
+silent drop that phase 4 never examined, because the inventory was a survey of
+**bounded state** — capacity limits — and R1-11 is not a capacity limit. It is an
+ordering assumption. The map's original question did not reach it.
+
+`test/reproducers/silent_drop_map.sh` passes 10/10 and
+`test/reproducers/groupagg2_desc_stream_exit.sh` passes 14/14; the wrong result
+each case originally produced is recorded beside it so each test visibly closes
+an observed defect.
+
+The question the map asked of every site, and the one it did not:
+
+> asked:     can a local **capacity** limit silently change the answer?
+> not asked: can an unproven assumption about **physical row order** silently
+>            change the answer?
+
+R1-11 was reachable through the second question for as long as the map claimed
+SILENT_DROP = 0 under the first. Any future survey here should ask both.
 
 Starting point: checkpoint `cf0c891`. Benchmark 05 is a reviewed boundary and is
 not revisited here.
@@ -31,13 +48,18 @@ defects found while fixing:  +2  -> both closed (R1-9, R1-10)
 initial SILENT_DROP:          8
 new defects found:            2   (R1-9, R1-10)
                              +1   (A4, found by analysing an AMBIGUOUS site)
-fixed:                       11
+                             +1   (R1-11, found after the map was closed)
+fixed:                       12
 remaining:                    0
 ```
 
-The count went from 8 to 11 rather than staying at a tidy 8: fixing the
+The count went from 8 to 12 rather than staying at a tidy 8: fixing the
 page-skip exposed two more, resolving the AMBIGUOUS four turned one of them
-into a real silent drop, and all three are recorded at full weight.
+into a real silent drop, and reopening the map for the cost-gate audit added a
+twelfth. All four are recorded at full weight.
+
+R1-11 is not in the bounded-state table above because it is not bounded state.
+It sits in its own section at the end.
 
 Neither column sums to 31. The rows are classification entries, not distinct
 sites — R1-3 is two instances in one row — and R1-5…R1-10 are semantic defects
@@ -426,3 +448,94 @@ Ignoring, dropping, returning not-found and partial results are all ruled out.
 
 Do not add spill-to-disk anywhere in this task; that is a separate architectural
 layer.
+
+---
+
+## R1-11 — XpGroupAgg2 assumed a physical row order it never established
+
+Found 2026-10-01, after this map had been closed, while auditing the
+`XpGroupAgg2` correlation cost gate. Not a capacity limit, which is why the
+phase-4 survey did not reach it. Full analysis in
+`docs/GROUPAGG2_COST_GATE_AUDIT.md`; reproducer
+`test/reproducers/groupagg2_desc_stream_exit.sh`.
+
+### Before
+
+| data | predicate | PostgreSQL | XpGroupAgg2 |
+|---|---|---|---|
+| descending, correlation −1.0 | `k1 <= 500` | 501 groups, sum 100200 | **0 groups** |
+| nearly sorted, correlation 0.9998 | `k1 <= 500` | 501 groups, sum 100200 | 501 groups, **sum 99728** |
+| nearly sorted, correlation 0.9953 | `k1 <= 500` | 501 groups, sum 100200 | 501 groups, **sum 98697** |
+| nearly sorted, correlation 0.9329 | `k1 <= 500` | 501 groups, sum 100200 | 501 groups, **sum 93430** |
+
+No error in any case. The near-sorted rows are the dangerous ones: the group
+count is right and only the aggregates are short, by 0.1% to 6.8% as physical
+order degrades — all at correlations the applicability gate admits, with nothing
+forced.
+
+### Root cause
+
+Three page-skip mechanisms, all resting on an ordering nothing established:
+
+1. **Class 1 tail exit** — terminated the whole scan when a page's *first* tuple
+   key exceeded the predicate's upper bound.
+2. **Class 1 prefix skip** — skipped a page whose first and last tuple keys were
+   both below the lower bound.
+3. **Page-level quick reject** — took the first and last tuple on the page,
+   called them `pmin`/`pmax`, and rejected the page as "definitely outside
+   range". Its own comment called it a heuristic for locally clustered data.
+
+None used a true per-page min/max, so all three were unsound even per page on a
+page that is not internally ordered. (1) and (2) were additionally licensed by
+`is_sorted`, which at that point had been inferred from **page 0 alone** — and a
+page of equal keys passes that probe, which is how descending data was reported
+ordered and then truncated on its first page.
+
+The applicability gate accepted the path on `fabs(correlation) >= 0.8`. That is
+not the same condition as monotonic, and `fabs` additionally admitted
+correlation −1.0, where the node's own STREAM definition cannot hold.
+
+Runtime STREAM detection could not catch any of it: it reports
+`order_scope: STREAM`, "monotonic order detected at runtime", while rows are
+dropped, because it inspects only the tuples that survived the skip. It is
+vacuous for exactly the rows that were lost.
+
+### Policy chosen
+
+**Scan rather than early-exit.** All three mechanisms removed. The correlation
+gate is left exactly as it was — not re-tuned, not replaced by another
+statistical threshold — and is now what its name claims: a performance
+heuristic choosing between STREAM and hash, with no correctness load.
+
+Deliberately not done: inferring monotonicity from the prefix already scanned,
+and substituting a different statistic. A sound page skip needs real per-page
+bounds, which means visiting every tuple on the page; that is a separate
+decision and is recorded as such, not smuggled into a correctness repair.
+
+### After
+
+Every rung correct against PostgreSQL, and the node still runs — the repair is
+not correctness-by-declining:
+
+```
+ga_asc   all four predicate shapes          ok
+ga_desc  all four predicate shapes          ok   (was 0 of 501 on two of them)
+jitter   0 / 20 / 100 / 400                 ok   (was short by up to 6.8%)
+XpGroupAgg2 chosen, ascending               ok
+XpGroupAgg2 chosen, descending              ok
+```
+
+Counters on the formerly failing case: `actual rows=501`, `Tuples Visited:
+200000`, every page read. On sorted data `order_scope: STREAM` and
+`StreamingAgg (STREAM, dual-key)` still activate, so the fast path survived; it
+simply no longer skips pages.
+
+Classification: **fixed.** The two cases are permanent regression tests.
+
+### Known cosmetic inaccuracy, not fixed
+
+`Pages Scanned` now reports 1083 for a 1082-page relation: page 0 is counted
+once by the hash-preallocation probe and once by the main scan loop. An
+off-by-one in an observability counter, pre-existing, left alone to keep this
+repair to the correctness boundary.
+

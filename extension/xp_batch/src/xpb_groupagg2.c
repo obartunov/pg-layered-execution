@@ -394,7 +394,20 @@ xpga2_exec(CustomScanState *node)
         CGroupEntry *htable   = NULL;
         int64        ngroups  = 0;
 
-        /* Optimistic probe: check first page local order */
+        /*
+         * Optimistic probe: is page 0 internally non-decreasing?
+         *
+         * This is a HASH PRE-ALLOCATION HINT AND NOTHING ELSE. It used to set
+         * `is_sorted`, which in turn licensed whole-scan page skipping — one
+         * page standing in for the relation. That was R1-11; see the note below
+         * where the Class 1 bounds used to be computed.
+         *
+         * Being wrong here costs an allocation, never a row: when order is
+         * violated later in the scan, `is_sorted` is cleared, the open group and
+         * everything already streamed are migrated into the hash, and every
+         * subsequent row is hashed. Note also that a page of EQUAL keys passes
+         * this probe, which is how descending data was once reported ordered.
+         */
         {
             int64 p_k1 = PG_INT64_MIN, p_k2 = PG_INT32_MIN;
             bool  p_ok = true;
@@ -427,16 +440,37 @@ xpga2_exec(CustomScanState *node)
         }
 
         /*
-         * Class 1 STREAM scan boundary: use pre-classified lo/hi from frag.
-         * can_early_exit:  stop when page_k1 > stream_key_hi (tail skip)
-         * can_skip_prefix: skip when page_k1 < stream_key_lo (prefix skip)
+         * Class 1 STREAM scan boundary — REMOVED (R1-11).
+         *
+         * There was a tail exit (stop the scan when a page's leading key
+         * exceeds the predicate's upper bound) and a prefix skip (skip a page
+         * whose first and last keys are both below the lower bound). Both were
+         * licensed by `is_sorted`, which at that point in the function had been
+         * inferred from the ordering of PAGE 0 ALONE. A single ordered page
+         * does not make the relation ordered, and both rules require a
+         * whole-relation ordering invariant that nothing establishes.
+         *
+         * Measured consequences, both silent and both with the applicability
+         * gate accepting naturally:
+         *
+         *   descending data (correlation -1.0), k1 <= 500
+         *       page 0 holds the maximum key and is internally all-equal, so
+         *       the page-0 probe reported "ordered"; the tail exit then fired
+         *       on page 0 and the scan ended having visited 0 tuples.
+         *       501 groups / sum 100200 became 0 groups.
+         *
+         *   nearly sorted data (correlation 0.9329), k1 <= 500
+         *       501 groups / sum 100200 became 501 groups / sum 93430 --
+         *       correct group count, aggregates short by 6.8%.
+         *
+         * Neither rule is replaced with another threshold or another statistic.
+         * Until a real physical-order invariant exists, this node scans.
+         *
+         * Note for anyone restoring a page skip here: the per-page bounds used
+         * by all three former skips were taken from the FIRST and LAST tuple on
+         * the page, never a true min/max, so they were unsound on an unordered
+         * page even per page. A sound page skip needs real per-page bounds.
          */
-        int64 stream_k1_max  = state->pqfrag.has_key_hi
-                              ? state->pqfrag.stream_key_hi : state->k1ops->sentinel_max;
-        int64 stream_k1_min  = state->pqfrag.has_key_lo
-                              ? state->pqfrag.stream_key_lo : state->k1ops->sentinel_min;
-        bool can_early_exit  = is_sorted && state->pqfrag.has_key_hi;
-        bool can_skip_prefix = is_sorted && state->pqfrag.has_key_lo;
 
 #ifdef XPB_DENSE_PROBE
         /*
@@ -538,10 +572,7 @@ xpga2_exec(CustomScanState *node)
             }
             /* ── End ZLFS check, fall through to heap scan ── */
 
-            /* Page-level quick reject bounds (from pqfrag key predicates) */
-            bool has_page_reject = (state->pqfrag.has_key_lo || state->pqfrag.has_key_hi);
-            int k1_off = (state->pqfrag.npreds > 0 && state->pqfrag.preds[0].fixed_offset >= 0)
-                         ? state->pqfrag.preds[0].fixed_offset : -1;
+            /* has_page_reject / k1_off removed with the page reject (R1-11). */
             state->pages_rejected = 0;
 
             for (BlockNumber blkno = 0; blkno < nblocks; blkno++)
@@ -555,58 +586,19 @@ xpga2_exec(CustomScanState *node)
                 OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
                 Oid  rel_oid = RelationGetRelid(rel);
 
-                /* Page-level quick reject: sample first+last tuple k1.
-                 * If both are on the same side of the range, skip page.
-                 * Heuristic for burst-loaded data with local clustering. */
-                if (has_page_reject && k1_off >= 0 && maxoff >= 2)
-                {
-                    int32 k1_first = 0, k1_last = 0;
-                    bool got_first = false, got_last = false;
-
-                    /* First normal tuple */
-                    for (OffsetNumber po = FirstOffsetNumber; po <= maxoff && !got_first; po++)
-                    {
-                        ItemId plp = PageGetItemId(page, po);
-                        if (ItemIdIsNormal(plp)) {
-                            k1_first = *(int32 *)((char *)PageGetItem(page, plp)
-                                       + ((HeapTupleHeader)PageGetItem(page, plp))->t_hoff + k1_off);
-                            got_first = true;
-                        }
-                    }
-                    /* Last normal tuple */
-                    for (OffsetNumber po = maxoff; po >= FirstOffsetNumber && !got_last; po--)
-                    {
-                        ItemId plp = PageGetItemId(page, po);
-                        if (ItemIdIsNormal(plp)) {
-                            k1_last = *(int32 *)((char *)PageGetItem(page, plp)
-                                      + ((HeapTupleHeader)PageGetItem(page, plp))->t_hoff + k1_off);
-                            got_last = true;
-                        }
-                    }
-
-                    if (got_first && got_last)
-                    {
-                        int32 pmin = (k1_first < k1_last) ? k1_first : k1_last;
-                        int32 pmax = (k1_first > k1_last) ? k1_first : k1_last;
-
-                        /* Only check bounds that actually exist in predicates.
-                         * Reject if page is entirely outside the predicate range. */
-                        bool reject = false;
-                        if (state->pqfrag.has_key_hi && pmin > (int32)state->pqfrag.stream_key_hi)
-                            reject = true;
-                        if (state->pqfrag.has_key_lo && pmax < (int32)state->pqfrag.stream_key_lo)
-                            reject = true;
-
-                        if (reject)
-                        {
-                            /* Page definitely outside range */
-                            state->pages_rejected++;
-                            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-                            ReleaseBuffer(buf);
-                            continue;
-                        }
-                    }
-                }
+                /*
+                 * Page-level quick reject removed (R1-11). It sampled the first
+                 * and last tuple on the page and treated them as the page's
+                 * min/max; on a page that is not internally ordered a middle
+                 * tuple can lie outside that interval, so "page definitely
+                 * outside range" was not definite. Its own comment called it a
+                 * heuristic for locally clustered data -- a heuristic may
+                 * choose not to prune, it may not choose to drop rows.
+                 *
+                 * A sound version needs real per-page bounds, which means
+                 * visiting every tuple on the page. That is a separate
+                 * decision, not part of this repair.
+                 */
 
                 for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
                 {
@@ -901,41 +893,11 @@ xpga2_exec(CustomScanState *node)
                                  & VISIBILITYMAP_ALL_VISIBLE) != 0;
                 OffsetNumber eb_maxoff = PageGetMaxOffsetNumber(eb_page);
 
-                /* Class1 early exit check */
-                if ((can_early_exit || can_skip_prefix) && is_sorted && eb_maxoff > 0)
-                {
-                    /* Peek first tuple k1 */
-                    int64 pk1 = state->k1ops->sentinel_min;
-                    for (OffsetNumber po = FirstOffsetNumber; po <= eb_maxoff; po++) {
-                        ItemId plp = PageGetItemId(eb_page, po);
-                        if (!ItemIdIsNormal(plp)) continue;
-                        pk1 = state->k1ops->getattr_fn(
-                            (HeapTupleHeader)PageGetItem(eb_page, plp), k1att, tupdesc);
-                        break;
-                    }
-                    if (can_early_exit && pk1 > stream_k1_max) {
-                        ReleaseBuffer(eb_buf);
-                        state->pages_scanned++;
-                        state->pages_early_exit += nblocks - eb_blkno - 1;
-                        break;  /* exit while loop, flush below */
-                    }
-                    if (can_skip_prefix && pk1 < stream_k1_min) {
-                        /* Check last tuple too for boundary detection */
-                        int64 last_k1 = pk1;
-                        for (OffsetNumber po = eb_maxoff; po >= FirstOffsetNumber; po--) {
-                            ItemId plp = PageGetItemId(eb_page, po);
-                            if (!ItemIdIsNormal(plp)) continue;
-                            last_k1 = state->k1ops->getattr_fn(
-                                (HeapTupleHeader)PageGetItem(eb_page, plp), k1att, tupdesc);
-                            break;
-                        }
-                        if (last_k1 < stream_k1_min) {
-                            ReleaseBuffer(eb_buf);
-                            state->pages_early_exit++;
-                            continue;
-                        }
-                    }
-                }
+                /*
+                 * Class 1 tail exit and prefix skip removed here (R1-11); see
+                 * the note where the bounds used to be computed. Every page is
+                 * read. The predicate is still applied per tuple below.
+                 */
 
                 /* Extract surviving tuples into elastic batch */
                 for (OffsetNumber off = FirstOffsetNumber; off <= eb_maxoff; off++)
@@ -1096,47 +1058,10 @@ xpga2_exec(CustomScanState *node)
                    & VISIBILITYMAP_ALL_VISIBLE) != 0;
             page = BufferGetPage(buf);
 
-            /* Class 1: STREAM scan boundary — peek at page's first k1. */
-            if ((can_early_exit || can_skip_prefix) && is_sorted)
-            {
-                OffsetNumber pmx2 = PageGetMaxOffsetNumber(page);
-                int64 page_k1 = state->k1ops->sentinel_min; bool got_k1 = false;
-                for (OffsetNumber po2 = FirstOffsetNumber; po2 <= pmx2; po2++) {
-                    ItemId plp2 = PageGetItemId(page, po2);
-                    if (!ItemIdIsNormal(plp2)) continue;
-                    page_k1 = state->k1ops->getattr_fn((HeapTupleHeader)PageGetItem(page,plp2), k1att, tupdesc);
-                    got_k1 = true; break;
-                }
-                if (got_k1) {
-                    if (can_early_exit && page_k1 > stream_k1_max) {
-                        /* Tail: k1 > hi → all remaining pages beyond range */
-                        ReleaseBuffer(buf);
-                        state->pages_scanned++;
-                        state->pages_early_exit += nblocks - blkno - 1;
-                        goto scan_done;
-                    }
-                    if (can_skip_prefix && page_k1 < stream_k1_min) {
-                        /* Prefix skip ONLY if last tuple also < lo.
-                         * A boundary page may have first tuple < lo
-                         * but also contain tuples >= lo. */
-                        int64 last_k1 = page_k1;
-                        for (OffsetNumber po3 = pmx2; po3 >= FirstOffsetNumber; po3--) {
-                            ItemId plp3 = PageGetItemId(page, po3);
-                            if (!ItemIdIsNormal(plp3)) continue;
-                            last_k1 = state->k1ops->getattr_fn(
-                                (HeapTupleHeader)PageGetItem(page,plp3), k1att, tupdesc);
-                            break;
-                        }
-                        if (last_k1 < stream_k1_min) {
-                            /* All tuples on page are < lo: safe skip */
-                            ReleaseBuffer(buf);
-                            state->pages_early_exit++;
-                            continue;
-                        }
-                        /* Boundary page: first < lo but last >= lo, scan it */
-                    }
-                }
-            }
+            /*
+             * Class 1 tail exit and prefix skip removed here (R1-11); see the
+             * note where the bounds used to be computed. Every page is read.
+             */
             /* Phase 2/3: LiveBitmap path (scalar or SIMD mask build) */
             if (xpb_groupagg2_bitmap_enabled && state->pqfrag.npreds > 0)
             {
@@ -1379,7 +1304,8 @@ if (false && xpb_groupagg2_simd_enabled && nslots > 0)
             ReleaseBuffer(buf);
             state->pages_scanned++;
         }
-        scan_done: ;
+        /* `scan_done` removed with its only jump, the Class 1 tail exit (R1-11).
+         * The scan now ends only by exhausting the read stream. */
         read_stream_end(rs);
         elastic_done: ;
 

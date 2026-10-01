@@ -50,8 +50,7 @@ fi
 pass=0; fail=0
 check() {   # check <label> <want> <got>   -- both are "<rows>|<sum>"
     case "$2" in
-        *'|'*) ;;
-        *) echo "  BROKEN  $1 — malformed reference [$2]"; fail=$((fail+1)); return ;;
+        ''|*[!0-9'|'null]*) echo "  BROKEN  $1 — malformed reference [$2]"; fail=$((fail+1)); return ;;
     esac
     if [ "$2" = "$3" ]; then echo "  ok      $1 (= $3)"; pass=$((pass+1))
     else echo "  WRONG   $1 — want $2, got $3"; fail=$((fail+1)); fi
@@ -108,11 +107,11 @@ for tbl in ga_asc ga_desc; do
     echo
 done
 
-echo "=== nearly-sorted data, which the gate admits with no forcing ==="
+echo "=== exact-sorted control (j=0) and near-sorted, admitted with no forcing ==="
 echo "The gate's test is |correlation| >= 0.8. The early exit needs MONOTONIC."
 echo "Those are not the same condition, and the gap loses rows:"
 echo
-for j in 0 20 100 400; do
+for j in 0 20 100 400; do   # j=0 is the exact-sorted control
     "${PSQL[@]}" >/dev/null 2>&1 <<SQL
 SET client_min_messages=warning;
 DROP TABLE IF EXISTS ga_j;
@@ -127,6 +126,28 @@ SQL
     check "$(printf 'jitter=%-4s correlation=%-8s' "$j" "$corr")" "$want" "$got"
 done
 "${PSQL[@]}" -c "DROP TABLE IF EXISTS ga_j" >/dev/null 2>&1
+echo
+
+echo "=== the node must still RUN (correctness must not come from declining) ==="
+echo "A repair that silently stopped selecting XpGroupAgg2 would make every"
+echo "comparison above green while delivering nothing. Assert the plan."
+echo
+node_used() {   # node_used <table> <predicate>
+    "${PSQL[@]}" -c "SET client_min_messages=warning; $GUC $XPON
+        EXPLAIN (COSTS OFF) SELECT k1,k2,sum(v) FROM $1 WHERE $2 GROUP BY k1,k2" 2>&1 \
+      | grep -c 'Custom Scan (XpGroupAgg2)'
+}
+"${PSQL[@]}" >/dev/null 2>&1 <<'SQL'
+SET client_min_messages=warning;
+DROP TABLE IF EXISTS ga_asc, ga_desc;
+CREATE TABLE ga_asc  (k1 int4 NOT NULL, k2 int4 NOT NULL, v int8 NOT NULL);
+CREATE TABLE ga_desc (k1 int4 NOT NULL, k2 int4 NOT NULL, v int8 NOT NULL);
+INSERT INTO ga_asc  SELECT k1,0,1 FROM (SELECT (g/200)::int4 AS k1 FROM generate_series(0,199999) g) s ORDER BY k1;
+INSERT INTO ga_desc SELECT k1,0,1 FROM (SELECT (g/200)::int4 AS k1 FROM generate_series(0,199999) g) s ORDER BY k1 DESC;
+ANALYZE ga_asc; ANALYZE ga_desc;
+SQL
+check "XpGroupAgg2 chosen, ascending  " "1" "$(node_used ga_asc  'k1 <= 500')"
+check "XpGroupAgg2 chosen, descending " "1" "$(node_used ga_desc 'k1 <= 500')"
 echo
 
 echo "--- the node's own counters on the failing case ---"
