@@ -24,14 +24,43 @@ parsing does not mix with data volume), on
 
 `meta_bytes` is 65 536 in one call in all four cases, including the last.
 
-The shape is exact, not approximate:
+`data_bytes` equalled `attributed_bytes` — the compressed size the footer
+attributes to the selected chunks — to the byte. No over-read.
+
+### Correction: the read-call shape, measured on a second file
+
+This note first recorded the request shape as
 
     read_calls = 1 (footer) + row_groups_read * projected_columns
 
-One request per selected column chunk, one request for the footer. No
-coalescing, no read-ahead, no over-read: `data_bytes` equalled
-`attributed_bytes` — the compressed size the footer attributes to the selected
-chunks — to the byte.
+which is **wrong in general**. It fits the table above only because every
+projection there selects columns that are not adjacent in the file. The
+benchmark-02 Parquet arm (200 row groups, 8 columns, pruned to 21 row groups)
+separates the two readings:
+
+| projection | file column indices | read calls |
+|---|---|---|
+| `period_key` | 0 | 23 |
+| `period_key, company_key` | 0,1 | 23 |
+| `period_key, company_key, account_key` | 0,1,2 | 23 |
+| `period_key, amount_dt` | 0,5 | 44 |
+| `period_key, company_key, account_key, amount_dt` | 0,1,2,5 | 44 |
+| `period_key, amount_kt, payload` | 0,6,7 | 44 |
+
+Three adjacent columns cost the same number of requests as one. The shape is
+
+    read_calls = metadata_calls
+               + row_groups_read * (contiguous RUNS of selected column chunks)
+
+Arrow already coalesces adjacent column chunks within a row group into a single
+range read. `metadata_calls` is 2 for that file and 1 for the one above, because
+its footer is 237 693 bytes and does not fit the reader's initial 64 KiB read.
+
+Both facts matter below, where request count carries the whole argument: one
+layer of coalescing exists already, and how many requests a projection costs
+depends on how its columns are laid out in the file — which is a property of the
+writer, not of the query. Raw numbers in
+`benchmarks/02-batch-joins/PARQUET_ARMS.md`.
 
 ## Why that shape is the whole object-storage question
 
@@ -46,8 +75,8 @@ at a per-request latency of 20–80 ms cost 0.34–1.36 s before a single byte o
 decode — more than the transfer of 3 MB on any plausible link. The byte-optimal
 plan and the request-optimal plan are not the same plan.
 
-Two consequences follow directly from the table above and are worth stating
-before any code:
+Two consequences follow directly from the measurements above and are worth
+stating before any code:
 
 1. **The footer read is unavoidable and is on the critical path.** The
    prune-to-nothing case transfers zero data bytes and still costs 65 536 bytes
@@ -56,12 +85,15 @@ before any code:
    thing anyone would want, and it is a correctness question (invalidation), not
    only a performance one.
 
-2. **Request count grows with the product of row groups and projected
+2. **Request count grows with row groups times column RUNS, not row groups times
    columns.** Locally that product is free. Remotely it is the dominant term for
-   a wide projection over many row groups, which is precisely the shape a
-   columnar scan produces. Coalescing adjacent chunks and issuing requests
-   concurrently are the two obvious answers; both are future questions, and
-   neither is implemented.
+   a scattered projection over many row groups, which is a shape a columnar scan
+   readily produces — the benchmark-02 arm pays 44 requests for 4 columns in 2
+   runs over 21 row groups, where the same 4 columns laid out adjacently would
+   pay 23. Adjacent-chunk coalescing is therefore not a future answer; Arrow
+   already does it, and what is left is coalescing across a gap (reading an
+   unwanted chunk to turn two requests into one) and issuing requests
+   concurrently. Both are future questions, and neither is implemented.
 
 ## The reader surface
 
