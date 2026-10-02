@@ -630,10 +630,24 @@ positions, all `ZLFS_COL_INT4`, all non-NULL and all present. Otherwise the path
 falls through to the heap scan below it, which is the general path and always
 correct. `count(*)` is excluded because the loop sums a column unconditionally.
 
-`test/reproducers/groupagg2_zlfs_zone_mismatch.sh` passes 6/6 and asserts both
-directions, because correctness reached by declining the zone for every query
-would agree with PostgreSQL and prove nothing: the ZLFS path must still run for
-the one query the zone answers, and must not run for the two it does not.
+`test/reproducers/groupagg2_zlfs_zone_mismatch.sh` passes 6/6 on its own fixture
+and asserts both directions, because correctness reached by declining the zone for
+every query would agree with PostgreSQL and prove nothing: the ZLFS path must
+still run for the one query the zone answers and must not run for the one it does
+not. Verified to fail before the fix — `sum(v2)` returned the sum of `v1`, 3.2x
+out.
+
+The fixture is its own, not `reg_buh`: `heap_layout_guard.sh` and
+`silent_drop_map.sh` both DROP `reg_buh`, `dim_period` and `dim_account` in
+whatever database they are pointed at, so a reproducer resting on the benchmark
+dataset would pass or fail by suite order.
+
+**Not covered by a test:** the `col_types`/`col_validity` arms of the guard. An
+int8 or nullable aggregate is declined by the node's shape gate before the zone
+check is reached — the test records that, labelled as what it is, rather than
+claiming coverage it does not have. Those two arms are code-level only; they exist
+because the attno check above them could be loosened later and they are the
+assumptions underneath it.
 
 Classification: **fixed.**
 
