@@ -162,6 +162,41 @@ int64_t     xpq_data_calls(const XpqReader *r);
 int64_t     xpq_interrupt_skipped_offthread(const XpqReader *r);
 
 /*
+ * Reads that came back short while the reader did not claim end of object --
+ * the case the v0 contract would have accepted as a clean EOF.
+ */
+int64_t     xpq_short_reads_without_eof(const XpqReader *r);
+
+/*
+ * What ARROW asked for, counted at the adapter. The physical counters above are
+ * what the reader actually did; these two differ as soon as anything below
+ * retries or splits a read, which is how "a retry changes the physical traffic
+ * and not the logical request" is shown rather than asserted.
+ */
+int64_t     xpq_logical_calls(const XpqReader *r);
+int64_t     xpq_logical_bytes(const XpqReader *r);
+
+/*
+ * Open with a fault injected underneath the Parquet reader.
+ *
+ * Same file, same bytes, same decode path; only the delivery is damaged, so the
+ * answer stays checkable against the PostgreSQL oracle. mode matches
+ * xpb::FaultMode: 0 none, 1 short-without-eof, 2 transient-then-succeed,
+ * 3 fail-after-n-bytes, 4 genuine EOF, 5 chunked.
+ *
+ * For tests. Nothing in the normal path calls it, and it is the only way to
+ * reach failure semantics without a network.
+ */
+XpqReader  *xpq_open_faulty(const char *path, int mode, int64_t at_read,
+                            int64_t nbytes, int retries,
+                            char *errbuf, size_t errbuflen);
+
+/* Physical attempts the faulty reader made against the real file, and faults
+ * actually injected. -1 when the reader is not a faulty one. */
+int64_t     xpq_faulty_attempts(const XpqReader *r);
+int64_t     xpq_faulty_injected(const XpqReader *r);
+
+/*
  * Install the interrupt check used between range reads. Called once from the
  * module's _PG_init; the hook may longjmp.
  */

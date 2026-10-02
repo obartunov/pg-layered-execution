@@ -26,26 +26,56 @@
  * Spelled out because "obvious" is how the previous boundary acquired its
  * assumptions.
  *
- *   read_at(offset, nbytes, out)
+ *   TWO OPERATIONS, because one could not tell EOF from a truncated transfer
+ *
+ *       v0 had a single read_at() that was "exact except at end of object", so
+ *       a caller inferred EOF from a short return. That inference is correct
+ *       for a local file -- pread() returning 0 means the file ended -- and
+ *       WRONG for anything over a transport. A ranged GET can return fewer
+ *       bytes than asked while the object continues, so the v0 contract would
+ *       have reported a dropped connection as a clean end of object. For a
+ *       column store that is not a crash but a silently short column: the
+ *       worst failure shape there is.
+ *
+ *       EOF is therefore never inferred. It is either stated by the
+ *       implementation or it is not EOF.
+ *
+ *   read_exact(offset, nbytes, out) -> bool
+ *       Exactly nbytes, or failure. Never short, never partially satisfied,
+ *       and no EOF concept at all: a request that runs off the end of the
+ *       object is an ERROR, because the caller asked for bytes that do not
+ *       exist. Returns false with last_error() set.
+ *
+ *       This is the operation Parquet needs and the only one the Arrow adapter
+ *       uses for ranges. Arrow asks for ranges it computed from the footer, so
+ *       they are known to be inside the object; measured on the benchmark file,
+ *       every range Arrow requested was inside it and no read was ever short.
+ *       Giving that caller "exact or error" means a transport failure can no
+ *       longer arrive as a shortened column chunk.
+ *
+ *       Retry is the IMPLEMENTATION's business, underneath this call. A reader
+ *       that can retry does so before returning false. The adapter has no
+ *       retry policy and must not grow one.
+ *
+ *   read_at_most(offset, nbytes, out) -> ReadResult{bytes, eof, ok}
+ *       Up to nbytes, for the one caller that legitimately does not know how
+ *       much is there. `eof` is AUTHORITATIVE: an implementation sets it only
+ *       when it knows the object ended at that point, and must never set it
+ *       merely because it received less than it asked for. A short result with
+ *       eof == false is a failure of the transport, not an end of object, and
+ *       read_exact built on top of it reports an error rather than success.
+ *
+ *   both
  *       Caller-provided buffer: the reader never allocates and never hands
  *       back memory, so there is no ownership question and no lifetime tied to
  *       a returned buffer.
- *
- *       EXACT, except at end of object. Returns nbytes when nbytes are
- *       available. Returns fewer ONLY because the object ends there, and that
- *       is not an error -- Parquet's footer probe reads backwards from the end
- *       and a short read is its normal answer. Returns -1 on a real failure,
- *       with last_error() set.
  *
  *       offset < 0, nbytes < 0, or offset + nbytes overflowing int64 are
  *       errors, not clamps. A clamped range would read the wrong bytes and
  *       report success.
  *
- *       nbytes == 0 returns 0 without touching the object and without counting
+ *       nbytes == 0 succeeds without touching the object and without counting
  *       a read. A zero-length read is not I/O.
- *
- *       Reading entirely past the end returns 0, not an error. EOF is "no more
- *       bytes here", never a failure in itself.
  *
  *   size()
  *       The object's size in bytes, or -1 with last_error() set. Fixed for the
@@ -132,14 +162,67 @@ typedef void (*InterruptHook)(void);
 
 enum class ReadPhase { kMetadata, kData };
 
+/*
+ * The result of a read that is allowed to be short.
+ *
+ * Three fields rather than a signed count, because "how many bytes" and "did
+ * the object end" are independent facts and the v0 contract's single int64
+ * forced the caller to guess the second from the first.
+ */
+struct ReadResult
+{
+    int64_t bytes = 0;      /* placed in the caller's buffer          */
+    bool    eof   = false;  /* the object ends here. Stated, never inferred */
+    bool    ok    = false;  /* false: see last_error()                 */
+
+    static ReadResult failure()              { return ReadResult{0, false, false}; }
+    static ReadResult got(int64_t n, bool e) { return ReadResult{n, e, true}; }
+};
+
 class ObjectReader
 {
 public:
     virtual ~ObjectReader() = default;
 
     virtual int64_t size() = 0;
-    virtual int64_t read_at(int64_t offset, int64_t nbytes, void *out) = 0;
     virtual void    close() = 0;
+
+    /*
+     * Up to nbytes. eof is set only when the implementation KNOWS the object
+     * ended there; see the semantics note above.
+     */
+    virtual ReadResult read_at_most(int64_t offset, int64_t nbytes, void *out) = 0;
+
+    /*
+     * Exactly nbytes or failure. Default implementation is the only one that
+     * should ever be needed: ask for the bytes, and treat anything less as an
+     * error whether or not the implementation called it EOF. An implementation
+     * overrides this only if its transport has a cheaper exact-read primitive.
+     */
+    virtual bool read_exact(int64_t offset, int64_t nbytes, void *out)
+    {
+        ReadResult r = read_at_most(offset, nbytes, out);
+        if (!r.ok)
+            return false;
+        if (r.bytes == nbytes)
+            return true;
+        /*
+         * Short. Both reasons are errors here, and they are reported
+         * differently because they are different faults: one means the caller
+         * asked beyond the object, the other means the transport lost data and
+         * the implementation did not recover it.
+         */
+        if (r.eof)
+            fail("read past end of object: wanted " + std::to_string(nbytes) +
+                 " at " + std::to_string(offset) + ", object ends after " +
+                 std::to_string(r.bytes));
+        else
+            fail("short read with no end of object: wanted " + std::to_string(nbytes) +
+                 " at " + std::to_string(offset) + ", got " + std::to_string(r.bytes) +
+                 " -- truncated transfer, not EOF");
+        short_reads_without_eof_ += (r.eof ? 0 : 1);
+        return false;
+    }
 
     const char *last_error() const { return error_.c_str(); }
 
@@ -164,6 +247,14 @@ public:
      * untested.
      */
     int64_t interrupt_skipped_offthread() const { return skipped_offthread_; }
+
+    /*
+     * Reads that came back short while the implementation did NOT claim end of
+     * object. Exactly the case v0 would have accepted as a clean EOF. Counted
+     * so a test can show the fault was injected and refused, rather than
+     * asserting the absence of something that never happened.
+     */
+    int64_t short_reads_without_eof() const { return short_reads_without_eof_; }
 
     int64_t read_calls()      const { return read_calls_; }
     int64_t bytes_requested() const { return bytes_requested_; }
@@ -247,6 +338,7 @@ private:
     std::atomic<int64_t> meta_calls_{0};
     std::atomic<int64_t> data_calls_{0};
     std::atomic<int64_t> skipped_offthread_{0};
+    std::atomic<int64_t> short_reads_without_eof_{0};
 };
 
 /*
@@ -254,6 +346,55 @@ private:
  * about a pathname, a file descriptor, pread() or errno.
  */
 ObjectReader *open_file_reader(const char *path, std::string *error);
+
+/* ------------------------------------------------------------------ faults --
+ *
+ * A reader that fails on purpose, so failure semantics are tested without a
+ * network. It exists because the question "what does a read mean when storage
+ * is unreliable" has to be answered before a remote reader is written, not
+ * during -- otherwise transport, semantics and accounting all get invented at
+ * once and the first two leak into the Parquet shim.
+ *
+ * It wraps a real reader, so the bytes are real and the answer is checkable
+ * against the PostgreSQL oracle. Only the delivery is damaged.
+ *
+ * Deterministic by construction: the trigger is a read ordinal, not a clock or
+ * a random number, so a failing case is a failing case on every run.
+ */
+enum class FaultMode
+{
+    kNone = 0,
+    kShortNoEof,      /* return fewer bytes and do NOT claim eof -- the case
+                       * v0's contract would have accepted as a clean end */
+    kTransientFirst,  /* fail the first attempt of a read, succeed on retry */
+    kFailAfterNBytes, /* deliver n bytes of the range, then fail             */
+    kGenuineEof,      /* report the real end of the object, truthfully       */
+    kChunked          /* satisfy a read in several short pieces, eof unset,
+                       * so read_exact must still come back whole or error   */
+};
+
+struct FaultSpec
+{
+    FaultMode mode = FaultMode::kNone;
+    int64_t   at_read = 1;     /* 1-based ordinal of the read to damage      */
+    int64_t   nbytes = 0;      /* for kFailAfterNBytes / kShortNoEof         */
+    int       retries = 0;     /* attempts the reader makes before giving up */
+};
+
+/*
+ * Wraps `inner` and takes ownership of it. `physical_attempts()` counts calls
+ * made to the inner reader, which is how "retry does not change the logical
+ * request but may change the physical traffic" is demonstrated rather than
+ * asserted.
+ */
+ObjectReader *open_faulty_reader(ObjectReader *inner, const FaultSpec &spec,
+                                 std::string *error);
+
+/* Physical attempts against the inner reader, for a reader from
+ * open_faulty_reader(); -1 for anything else. */
+int64_t faulty_physical_attempts(const ObjectReader *r);
+/* Faults actually injected, so a test can prove the fault fired. */
+int64_t faulty_injected(const ObjectReader *r);
 
 }   /* namespace xpb */
 

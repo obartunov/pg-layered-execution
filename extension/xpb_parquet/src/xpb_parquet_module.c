@@ -163,6 +163,59 @@ xpq_open_held(const char *path, char *errbuf, size_t errbuflen)
     return h;
 }
 
+/*
+ * ARMED FAULT, for test/object_reader.sh only.
+ *
+ * The provider opens its own reader, so a fault has to be requested before the
+ * scan rather than passed into it. One shot: the next xpq_open consumes it and
+ * disarms, so a test cannot accidentally poison a later query in the same
+ * session, and a scan that never opens a reader leaves it armed rather than
+ * silently swallowing it.
+ *
+ * Deliberately not a GUC. A GUC would be a supported knob; this is a test hook
+ * and should look like one.
+ */
+typedef struct XpqArmedFault
+{
+    bool    armed;
+    int     mode;
+    int64   at_read;
+    int64   nbytes;
+    int     retries;
+} XpqArmedFault;
+
+static XpqArmedFault g_armed_fault = {false, 0, 1, 0, 0};
+
+PG_FUNCTION_INFO_V1(xpq_arm_fault);
+
+Datum
+xpq_arm_fault(PG_FUNCTION_ARGS)
+{
+    g_armed_fault.armed   = PG_GETARG_INT32(0) != 0;
+    g_armed_fault.mode    = PG_GETARG_INT32(0);
+    g_armed_fault.at_read = PG_GETARG_INT64(1);
+    g_armed_fault.nbytes  = PG_GETARG_INT64(2);
+    g_armed_fault.retries = PG_GETARG_INT32(3);
+    PG_RETURN_BOOL(g_armed_fault.armed);
+}
+
+/*
+ * Open the source's reader, consuming an armed fault if there is one.
+ */
+static XpqReader *
+xpq_open_for_source(const char *path, char *errbuf, size_t errbuflen)
+{
+    if (g_armed_fault.armed)
+    {
+        XpqArmedFault f = g_armed_fault;
+
+        g_armed_fault.armed = false;
+        return xpq_open_faulty(path, f.mode, f.at_read, f.nbytes, f.retries,
+                               errbuf, errbuflen);
+    }
+    return xpq_open(path, errbuf, errbuflen);
+}
+
 /* ────────────────────────────────────────────────────────── next_batch ── */
 
 static bool
@@ -318,7 +371,7 @@ xpq_create(const XpbSourceRequest *req)
     st->path = pstrdup(req->uri);
 
     errbuf[0] = '\0';
-    st->reader = xpq_open(st->path, errbuf, sizeof(errbuf));
+    st->reader = xpq_open_for_source(st->path, errbuf, sizeof(errbuf));
     if (st->reader == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_FILE),
@@ -699,7 +752,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(25);
+    tupdesc = CreateTemplateTupleDesc(30);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -727,6 +780,13 @@ xpq_scan(PG_FUNCTION_ARGS)
     TupleDescInitEntry(tupdesc, 24, "data_calls",      INT8OID, -1, 0);
     /* Reads whose interrupt check was skipped as off-thread; see the shim. */
     TupleDescInitEntry(tupdesc, 25, "irq_skipped_offthread", INT8OID, -1, 0);
+    /* Failure semantics: see the shim. -1 for a non-faulty reader. */
+    TupleDescInitEntry(tupdesc, 26, "short_reads_without_eof", INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 27, "fault_attempts",          INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 28, "fault_injected",          INT8OID, -1, 0);
+    /* What Arrow asked for, as opposed to what the reader did. */
+    TupleDescInitEntry(tupdesc, 29, "logical_calls",           INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 30, "logical_bytes",           INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -736,8 +796,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[25];
-        bool    nulls[25] = {false};
+        Datum   vals[30];
+        bool    nulls[30] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -766,6 +826,11 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[22] = Int64GetDatum(xpq_meta_calls(st->reader));
         vals[23] = Int64GetDatum(xpq_data_calls(st->reader));
         vals[24] = Int64GetDatum(xpq_interrupt_skipped_offthread(st->reader));
+        vals[25] = Int64GetDatum(xpq_short_reads_without_eof(st->reader));
+        vals[26] = Int64GetDatum(xpq_faulty_attempts(st->reader));
+        vals[27] = Int64GetDatum(xpq_faulty_injected(st->reader));
+        vals[28] = Int64GetDatum(xpq_logical_calls(st->reader));
+        vals[29] = Int64GetDatum(xpq_logical_bytes(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 

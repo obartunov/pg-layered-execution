@@ -12,6 +12,7 @@
 #include "xpb_parquet_shim.h"
 #include "xpb_object_reader.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -52,6 +53,20 @@ class ArrowObjectInput : public arrow::io::RandomAccessFile
 public:
     explicit ArrowObjectInput(xpb::ObjectReader *obj) : obj_(obj) {}
 
+    /*
+     * What ARROW asked for, counted here because this is the layer Arrow's
+     * request arrives at. The reader's bytes_requested/bytes_returned are the
+     * PHYSICAL level underneath, and the two differ as soon as anything below
+     * retries or splits a read.
+     *
+     * Three levels are worth distinguishing for a remote source: what Arrow
+     * wanted, what was asked of the store, and what crossed the wire. For a
+     * local reader the last two coincide, so only two counters exist; the
+     * third needs a transport before it means anything.
+     */
+    int64_t logical_calls() const { return logical_calls_; }
+    int64_t logical_bytes() const { return logical_bytes_; }
+
     /* Everything read before the first column chunk is metadata. */
     void start_data_phase() { obj_->set_phase(xpb::ReadPhase::kData); }
 
@@ -76,45 +91,80 @@ public:
         return n;
     }
 
+    /*
+     * POSITIONAL reads use read_exact. Arrow computes these ranges from the
+     * footer, so they are known to lie inside the object: anything short is a
+     * fault, and accepting it would hand Parquet a column chunk with a hole in
+     * it. Measured on the benchmark file, every range Arrow asked for was
+     * inside the object and no read was ever short.
+     *
+     * Retry, if a reader has any, happens below this line. There is
+     * deliberately no retry policy here -- that is what keeps transport
+     * concerns out of the Parquet shim.
+     */
     arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void *out) override
     {
-        int64_t got = obj_->read_at(position, nbytes, out);
-        if (got < 0)
+        note_logical(nbytes);
+        if (!obj_->read_exact(position, nbytes, out))
             return arrow::Status::IOError(obj_->last_error());
-        return got;
+        return nbytes;
     }
 
     arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position,
                                                         int64_t nbytes) override
     {
+        note_logical(nbytes);
         ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
-        int64_t got = obj_->read_at(position, nbytes, buf->mutable_data());
-        if (got < 0)
+        if (!obj_->read_exact(position, nbytes, buf->mutable_data()))
             return arrow::Status::IOError(obj_->last_error());
-        if (got < nbytes)
-            ARROW_RETURN_NOT_OK(buf->Resize(got));
         return std::shared_ptr<arrow::Buffer>(std::move(buf));
     }
 
-    /* The sequential half, which is what the footer probe uses. */
+    /*
+     * The SEQUENTIAL half, which is Arrow's stream shape and is where a short
+     * read is a legitimate answer -- a stream reader asks for a buffer-full and
+     * takes what is there. So this one uses read_at_most, and the end of the
+     * object comes from the reader's eof flag rather than from comparing counts.
+     */
     arrow::Result<int64_t> Read(int64_t nbytes, void *out) override
     {
-        ARROW_ASSIGN_OR_RAISE(int64_t got, ReadAt(pos_, nbytes, out));
-        pos_ += got;
-        return got;
+        note_logical(nbytes);
+        xpb::ReadResult r = obj_->read_at_most(pos_, nbytes, out);
+        if (!r.ok)
+            return arrow::Status::IOError(obj_->last_error());
+        pos_ += r.bytes;
+        return r.bytes;
     }
 
     arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override
     {
-        ARROW_ASSIGN_OR_RAISE(auto buf, ReadAt(pos_, nbytes));
-        pos_ += buf->size();
-        return buf;
+        note_logical(nbytes);
+        ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
+        xpb::ReadResult r = obj_->read_at_most(pos_, nbytes, buf->mutable_data());
+        if (!r.ok)
+            return arrow::Status::IOError(obj_->last_error());
+        if (r.bytes < nbytes)
+            ARROW_RETURN_NOT_OK(buf->Resize(r.bytes));
+        pos_ += r.bytes;
+        return std::shared_ptr<arrow::Buffer>(std::move(buf));
     }
 
 private:
+    /* Atomic for the same reason the reader's counters are: Arrow calls this
+     * from its thread pool as well as from the backend thread. */
+    void note_logical(int64_t nbytes)
+    {
+        if (nbytes <= 0)
+            return;
+        logical_calls_.fetch_add(1, std::memory_order_relaxed);
+        logical_bytes_.fetch_add(nbytes, std::memory_order_relaxed);
+    }
+
     xpb::ObjectReader  *obj_;       /* borrowed; XpqReader owns it */
     int64_t             pos_ = 0;
     bool                closed_ = false;
+    std::atomic<int64_t> logical_calls_{0};
+    std::atomic<int64_t> logical_bytes_{0};
 };
 
 /*
@@ -189,8 +239,29 @@ struct XpqReader
 
 extern "C" {
 
-XpqReader *
-xpq_open(const char *path, char *errbuf, size_t errbuflen)
+/*
+ * The one place a byte source is chosen. open_file_reader() is the only thing
+ * in the module that touches a local file; the faulty wrapper exists so that
+ * failure semantics can be tested without a network, and takes ownership of
+ * the real reader it wraps.
+ *
+ * A second real implementation (S3) would be a third branch here and nothing
+ * else -- that is the claim the boundary is for.
+ */
+static xpb::ObjectReader *
+make_object_reader(const char *path, const xpb::FaultSpec *fault, std::string *err)
+{
+    xpb::ObjectReader *base = xpb::open_file_reader(path, err);
+    if (base == nullptr)
+        return nullptr;
+    if (fault == nullptr || fault->mode == xpb::FaultMode::kNone)
+        return base;
+    return xpb::open_faulty_reader(base, *fault, err);
+}
+
+static XpqReader *
+xpq_open_internal(const char *path, const xpb::FaultSpec *fault,
+                  char *errbuf, size_t errbuflen)
 {
     try
     {
@@ -212,7 +283,7 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
          * point of the boundary.
          */
         std::string oerr;
-        r->object.reset(xpb::open_file_reader(path, &oerr));
+        r->object.reset(make_object_reader(path, fault, &oerr));
         if (!r->object)
         {
             set_err(errbuf, errbuflen, oerr);
@@ -250,6 +321,39 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
         return nullptr;
     }
 }
+
+XpqReader *
+xpq_open(const char *path, char *errbuf, size_t errbuflen)
+{
+    return xpq_open_internal(path, nullptr, errbuf, errbuflen);
+}
+
+XpqReader *
+xpq_open_faulty(const char *path, int mode, int64_t at_read, int64_t nbytes,
+                int retries, char *errbuf, size_t errbuflen)
+{
+    xpb::FaultSpec spec;
+
+    switch (mode)
+    {
+        case 1: spec.mode = xpb::FaultMode::kShortNoEof;      break;
+        case 2: spec.mode = xpb::FaultMode::kTransientFirst;  break;
+        case 3: spec.mode = xpb::FaultMode::kFailAfterNBytes; break;
+        case 4: spec.mode = xpb::FaultMode::kGenuineEof;      break;
+        case 5: spec.mode = xpb::FaultMode::kChunked;         break;
+        default: spec.mode = xpb::FaultMode::kNone;           break;
+    }
+    spec.at_read = at_read > 0 ? at_read : 1;
+    spec.nbytes  = nbytes;
+    spec.retries = retries;
+
+    return xpq_open_internal(path, &spec, errbuf, errbuflen);
+}
+
+int64_t xpq_faulty_attempts(const XpqReader *r)
+{ return (r && r->object) ? xpb::faulty_physical_attempts(r->object.get()) : -1; }
+int64_t xpq_faulty_injected(const XpqReader *r)
+{ return (r && r->object) ? xpb::faulty_injected(r->object.get()) : -1; }
 
 void
 xpq_set_interrupt_hook(void (*hook)(void))
@@ -599,6 +703,12 @@ int64_t xpq_data_calls(const XpqReader *r)
 { return (r && r->object) ? r->object->data_calls() : 0; }
 int64_t xpq_interrupt_skipped_offthread(const XpqReader *r)
 { return (r && r->object) ? r->object->interrupt_skipped_offthread() : 0; }
+int64_t xpq_short_reads_without_eof(const XpqReader *r)
+{ return (r && r->object) ? r->object->short_reads_without_eof() : 0; }
+int64_t xpq_logical_calls(const XpqReader *r)
+{ return (r && r->input) ? r->input->logical_calls() : 0; }
+int64_t xpq_logical_bytes(const XpqReader *r)
+{ return (r && r->input) ? r->input->logical_bytes() : 0; }
 
 /*
  * Controlled failure for the exception boundary.
