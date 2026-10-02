@@ -100,7 +100,7 @@ boundary acquired its assumptions.
 | Who owns the buffer? | **The caller provides it.** The reader never allocates and never hands memory back. | No ownership question and no lifetime tied to a returned buffer. |
 | Is `size()` stable? | **Fixed for the life of the reader.** | A local file that grows underneath is not supported, and a Parquet file whose footer moved is corrupt by the time anyone notices. |
 | `close()` twice? | **Idempotent.** A read after close is an error, not undefined. | `end()`-not-idempotent was a real bug in this project, found by the conformance harness (`buffer ... is not owned by resource owner Portal`). |
-| Threads? | **Not thread-safe, not reentrant.** | One reader belongs to one source in one backend, and a PostgreSQL backend is single-threaded. A concurrent reader would need its own synchronisation and would have to say so in the header. |
+| Threads? | **`read_at()` is called from several threads.** Counters are atomic; an implementation must not assume the caller is the backend thread. Still not reentrant on one thread. | Corrected. The first version said "a PostgreSQL backend is single-threaded", which is true of the backend and false of Arrow — `pre_buffer` reads column chunks on its thread pool. §4 and §7. |
 | Error reporting | `read_at`/`size` return −1; `last_error()` gives the reason. Never NULL, empty when nothing failed, valid until the next call. | No exception crosses into the C ABI, and the C side already has an errbuf convention. |
 
 `FileReader` loops on short `pread()` until it returns 0, because `pread` may
@@ -113,24 +113,51 @@ stable size, and Parquet needs to read its footer from the end.
 
 ## 4. Cancellation
 
+> **This section was wrong as first written and is corrected here.** It framed
+> the hook as safe because it fires "between range reads, never inside a
+> `pread()` already in the kernel". That is about *where* in the read sequence
+> and misses *which thread*. See §7 for the defect and the fix.
+
 `ObjectReader` does not know about PostgreSQL. The interrupt check is
 **injected**: `set_interrupt_hook()` installs a callback invoked *before each
-physical read* — between range reads, never inside a `pread()` already in the
-kernel.
+physical read*. The hook is `xpq_interrupt_check()`, installed once from the
+module's `_PG_init` and consisting of `CHECK_FOR_INTERRUPTS()`. It reaches the
+reader as a function pointer, so `xpb_object_reader.cpp` includes no PostgreSQL
+header.
 
-The hook may `longjmp`, because that is what `ereport` does. So the reader holds
-no C++ object needing destruction across the call: the hook runs first, then the
-read, and the counters are touched only after the read returns.
+**The hook fires only on the thread that installed it**, because Arrow's
+`pre_buffer` dispatches column-chunk reads to `arrow::internal::ThreadPool` and
+`read_at()` is therefore reached from worker threads. Measured, with pid/tid
+logged at the `pread` (backend pid 13478):
 
-The hook is `xpq_interrupt_check()`, installed once from the module's `_PG_init`
-and consisting of `CHECK_FOR_INTERRUPTS()`. It is the only PostgreSQL-aware line
-in the byte path, and it reaches the reader as a function pointer, so
-`xpb_object_reader.cpp` includes no PostgreSQL header.
+```
+tid=13478 pid=13478 off=180077809 n=65536   footer        -- backend thread
+tid=13478 pid=13478 off=179971180 n=172157  footer        -- backend thread
+tid=13480 pid=13478 off=35997325  n=218     column chunk  -- Arrow worker
+tid=13480 pid=13478 off=36093826  n=255368  column chunk  -- Arrow worker
+```
 
-Measured, against the same scan run uninterrupted (§6): cancelled at 26–39 ms
-against 283–297 ms, over four runs. The bound is calibrated against the
-uninterrupted scan in the same run rather than a constant, because a fixed
-threshold flaked between 110 ms idle and 170 ms busy earlier in this project.
+On the four-column pruned scan: 44 physical reads, 2 metadata on the backend
+thread, **42 data reads on workers**. `irq_skipped_offthread` counts the reads
+whose check was skipped, and it equals `data_calls` exactly.
+
+The resulting limitation, stated rather than hidden: **a cancel arriving while a
+pool-dispatched read is in flight is not seen by this layer.** It is seen by the
+backend thread's own reads and by the per-row-group `CHECK_FOR_INTERRUPTS()` in
+the provider.
+
+That costs nothing measurable, which is the reason not to go further. Cancel
+latency with the guard: **32–34 ms** against an uninterrupted 291–373 ms, versus
+26–39 ms before the guard — unchanged. So the hook on the data path was never
+the mechanism by which cancellation worked. Disabling `pre_buffer` to get
+per-range checks on the data path would remove the gap-based coalescing measured
+in §6 and buy no cancellation improvement; on this file the largest column chunk
+is ~255 KB, so a single range read is sub-millisecond and is not what bounds
+cancel latency. `pre_buffer` stays.
+
+The bound in the test is calibrated against the uninterrupted scan in the same
+run rather than a constant, because a fixed threshold flaked between 110 ms idle
+and 170 ms busy earlier in this project.
 
 ---
 
@@ -339,6 +366,47 @@ source path: one holder, one `MemoryContextCallback`, so both paths release a
 reader the same way. Reachability is reasoned from the code, not demonstrated
 (§5).
 
+### The interrupt hook ran on Arrow worker threads — my own, introduced in 9408ca5
+
+`before_read()` called `CHECK_FOR_INTERRUPTS()` before every physical read, and
+Arrow performs column-chunk reads on `arrow::internal::ThreadPool`. So the macro
+executed on a non-backend thread 42 times per four-column pruned scan.
+
+PostgreSQL's interrupt machinery is not thread-safe. Acting on it off-thread
+runs `ProcessInterrupts()` → `ereport` → `siglongjmp` into
+`PG_exception_stack`, which belongs to the backend thread; on the FATAL path it
+runs `proc_exit()` and its exit handlers. Captured once in the wild, from the
+backtrace of a backend that would not die:
+
+```
+Thread 1  ReadRangeCache::Impl::Read -> condition_variable::wait   (backend thread, parked)
+Thread 2  proc_exit -> __run_exit_handlers
+             -> arrow::internal::ThreadPool::Shutdown               (Arrow worker, own pool)
+```
+
+The worker was shutting down the pool it belonged to while the backend thread
+waited for that worker's read. Unkillable backend, and it blocked cluster
+shutdown — twice, and the first time I misdiagnosed it as my own test harness
+leaking a session.
+
+Fixed by recording the installing thread in `set_interrupt_hook()` and running
+the hook only on that thread, plus making the counters `std::atomic` since they
+are written from workers as well.
+
+**Honest limits of the evidence.** The *off-thread call* is deterministic and
+measured: `irq_skipped_offthread` equals `data_calls` on every scan. The
+*deadlock* is not deterministic — it needs the signal to land while the backend
+thread is already parked in `ReadRangeCache::Read()` and a worker then runs the
+check. I removed the guard and tried 24 terminate-mid-scan attempts with
+jittered timing and did not reproduce the hang; the backend thread's own far
+more frequent interrupt checks normally win the race. So this is reported as one
+captured occurrence with a backtrace, plus a code-level argument that longjmping
+across threads is undefined behaviour whether or not it hangs. The guard is
+required on the second ground alone.
+
+Read counts are unchanged by the fix: `read_calls`, `meta_bytes` and
+`data_bytes` identical across the same five shapes.
+
 ### Harness defects found and fixed in passing
 
 * `optional_module.sh` renames the installed `.so` out of the way and restored
@@ -474,6 +542,11 @@ Grounds, all from this phase and all measured:
    file that three earlier Parquet phases did not.
 7. S3 can be added without changing `ParquetReader` or the operators, with one
    named open question that is not an interface problem.
+
+One ground that did **not** survive: the v0 cancellation test was presented as
+evidence that the injected hook is the cancellation mechanism on the data path.
+It is not, and the test could not have detected that the hook was unsafe. §4 and
+§7 record what it actually showed.
 
 Not A because it is finished: §9 lists what is open. A because the layering is
 real in the code, measured rather than asserted, and the one thing it had to

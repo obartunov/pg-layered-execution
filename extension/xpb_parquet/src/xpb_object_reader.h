@@ -62,20 +62,48 @@
  *       nothing has failed. The string is owned by the reader and valid until
  *       the next call on it.
  *
- *   threads / reentrancy
- *       NOT thread-safe and not reentrant. One reader belongs to one source in
- *       one backend, and a PostgreSQL backend is single-threaded. A reader that
- *       wanted concurrency would need its own synchronisation and would have to
- *       say so here.
+ *   threads
+ *       read_at() IS CALLED FROM MORE THAN ONE THREAD, and the first version of
+ *       this header was wrong to say otherwise on the grounds that "a
+ *       PostgreSQL backend is single-threaded". The backend is; Arrow is not.
+ *       With pre_buffer enabled, parquet's ReadRangeCache dispatches
+ *       column-chunk reads to arrow::internal::ThreadPool, so the footer reads
+ *       arrive on the backend thread and the data reads arrive on Arrow worker
+ *       threads. Measured, with pid/tid logged at the pread: footer on the
+ *       backend tid, every column chunk on a worker tid.
+ *
+ *       So: the counters are atomic, and an implementation must not assume the
+ *       calling thread is the backend's. A reader is still owned by one source
+ *       and is not reentrant on one thread; what is not true is that only one
+ *       thread ever touches it.
  *
  *   cancellation
  *       The reader does not know about PostgreSQL. An interrupt check is
- *       INJECTED: set_interrupt_hook() installs a callback that is invoked
- *       before each physical read, which is the safe boundary -- between range
- *       reads, never inside a pread() already in the kernel. The hook may
- *       longjmp (that is what ereport does), so the reader holds no C++ object
- *       needing destruction across the call: the hook runs first, then the
- *       read.
+ *       INJECTED: set_interrupt_hook() installs a callback invoked before each
+ *       physical read.
+ *
+ *       THE HOOK FIRES ONLY ON THE THREAD THAT INSTALLED IT. This is not a
+ *       refinement, it is the correctness requirement. PostgreSQL's interrupt
+ *       machinery is not thread-safe: ProcessInterrupts() raises, ereport
+ *       siglongjmps into PG_exception_stack -- which belongs to the backend
+ *       thread -- and the FATAL path runs proc_exit() and its exit handlers.
+ *       Called from an Arrow worker that is exactly what happened: the worker
+ *       ran proc_exit -> __run_exit_handlers -> ThreadPool::Shutdown() on the
+ *       pool it belonged to, while the backend thread sat in
+ *       ReadRangeCache::Read() waiting for that read. The backend became
+ *       unkillable and blocked cluster shutdown. Longjmping into another
+ *       thread's stack is undefined behaviour besides.
+ *
+ *       The consequence is a real limitation, stated rather than hidden: a
+ *       cancel arriving while a pool-dispatched read is in flight is not seen
+ *       by this layer. It is seen by the backend thread's own reads and by the
+ *       per-row-group CHECK_FOR_INTERRUPTS() in the provider. Finer
+ *       granularity on the data path would mean not letting Arrow own the
+ *       reads, which is a separate decision with its own cost.
+ *
+ *       The hook may longjmp on its own thread (that is what ereport does), so
+ *       the reader holds no C++ object needing destruction across the call: the
+ *       hook runs first, then the read.
  *
  *   accounting
  *       The reader is the authoritative place for it, because it is the only
@@ -84,12 +112,18 @@
  *       projection needs, and the difference is over-read rather than a
  *       rounding artefact. The phase tag is set from above -- "metadata" versus
  *       "data" is a Parquet notion and the reader does not invent it.
+ *
+ *       The counters are atomic because of the thread note above. Relaxed
+ *       ordering: they are an instrument, and no decision is taken on them
+ *       mid-scan.
  */
 #ifndef XPB_OBJECT_READER_H
 #define XPB_OBJECT_READER_H
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 namespace xpb {
 
@@ -109,8 +143,27 @@ public:
 
     const char *last_error() const { return error_.c_str(); }
 
-    void set_interrupt_hook(InterruptHook hook) { interrupt_ = hook; }
+    /*
+     * Records the installing thread as well as the hook. Only that thread may
+     * run it; see the cancellation note above for why this is a correctness
+     * requirement and not a tidiness one.
+     */
+    void set_interrupt_hook(InterruptHook hook)
+    {
+        interrupt_ = hook;
+        interrupt_owner_ = std::this_thread::get_id();
+    }
+
     void set_phase(ReadPhase p) { phase_ = p; }
+
+    /*
+     * How many times the hook was NOT run because the read was on another
+     * thread. Exposed so a test can assert the off-thread case actually occurs
+     * -- otherwise "no interrupt check ran off-thread" would also be satisfied
+     * by a build where Arrow never used its pool, and the guard would be
+     * untested.
+     */
+    int64_t interrupt_skipped_offthread() const { return skipped_offthread_; }
 
     int64_t read_calls()      const { return read_calls_; }
     int64_t bytes_requested() const { return bytes_requested_; }
@@ -124,17 +177,31 @@ protected:
     /* Called by an implementation around each physical read. */
     void before_read()
     {
-        if (interrupt_ != nullptr)
-            interrupt_();
+        if (interrupt_ == nullptr)
+            return;
+        if (std::this_thread::get_id() != interrupt_owner_)
+        {
+            skipped_offthread_++;
+            return;
+        }
+        interrupt_();
     }
 
     void account(int64_t requested, int64_t returned)
     {
-        read_calls_++;
-        bytes_requested_ += requested;
-        bytes_returned_  += returned;
-        if (phase_ == ReadPhase::kData) { data_bytes_ += returned; data_calls_++; }
-        else                            { meta_bytes_ += returned; meta_calls_++; }
+        read_calls_.fetch_add(1, std::memory_order_relaxed);
+        bytes_requested_.fetch_add(requested, std::memory_order_relaxed);
+        bytes_returned_.fetch_add(returned, std::memory_order_relaxed);
+        if (phase_ == ReadPhase::kData)
+        {
+            data_bytes_.fetch_add(returned, std::memory_order_relaxed);
+            data_calls_.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            meta_bytes_.fetch_add(returned, std::memory_order_relaxed);
+            meta_calls_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     int64_t fail(const std::string &why)
@@ -168,14 +235,18 @@ protected:
 private:
     std::string     error_;
     InterruptHook   interrupt_ = nullptr;
+    std::thread::id interrupt_owner_{};
     ReadPhase       phase_ = ReadPhase::kMetadata;
-    int64_t         read_calls_ = 0;
-    int64_t         bytes_requested_ = 0;
-    int64_t         bytes_returned_ = 0;
-    int64_t         meta_bytes_ = 0;
-    int64_t         data_bytes_ = 0;
-    int64_t         meta_calls_ = 0;
-    int64_t         data_calls_ = 0;
+
+    /* Atomic: written from Arrow worker threads as well as the backend's. */
+    std::atomic<int64_t> read_calls_{0};
+    std::atomic<int64_t> bytes_requested_{0};
+    std::atomic<int64_t> bytes_returned_{0};
+    std::atomic<int64_t> meta_bytes_{0};
+    std::atomic<int64_t> data_bytes_{0};
+    std::atomic<int64_t> meta_calls_{0};
+    std::atomic<int64_t> data_calls_{0};
+    std::atomic<int64_t> skipped_offthread_{0};
 };
 
 /*

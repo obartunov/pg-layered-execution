@@ -39,7 +39,7 @@ RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, nulls_first_col
   row_groups_stats_available int, row_groups_considered int, min_last_col bigint,
   max_last_col bigint, null_key_sum bigint, meta_bytes bigint, data_bytes bigint,
   read_calls bigint, decode_ms float8, bytes_requested bigint, bytes_returned bigint,
-  meta_calls bigint, data_calls bigint)
+  meta_calls bigint, data_calls bigint, irq_skipped_offthread bigint)
 LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan';"
 
 pass=0; fail=0
@@ -360,6 +360,77 @@ sleep 0.5
 STILL=$(ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c "$(basename "$PQ")" || true)
 [ "$STILL" -eq 0 ] && ok "after backend exit nothing on the host holds the file" \
                    || echo "  note    $STILL descriptor(s) elsewhere on the host (other sessions)"
+
+echo "=== 7. the interrupt hook must not run on an Arrow thread ==="
+#
+# Arrow's pre_buffer dispatches column-chunk reads to arrow::internal::ThreadPool,
+# so read_at() -- and therefore the interrupt hook -- is reached from a worker
+# thread, not the backend's. Measured with pid/tid logged at the pread: the two
+# footer reads arrive on the backend tid, every column chunk on a worker tid.
+#
+# That matters because CHECK_FOR_INTERRUPTS() is not thread-safe. Acting on it
+# off-thread runs ProcessInterrupts() -> ereport -> siglongjmp into
+# PG_exception_stack, which belongs to the backend thread, and on the FATAL path
+# proc_exit() plus its exit handlers -- observed once as a worker running
+# ThreadPool::Shutdown() on its own pool while the backend thread sat in
+# ReadRangeCache::Read() waiting for that read. Unkillable backend, blocked
+# cluster shutdown.
+#
+# The hook therefore fires only on the thread that installed it. The assertion
+# below is not "no hook ran off-thread" on its own -- that would pass in a build
+# where Arrow never used its pool, and the guard would be untested. It requires
+# the off-thread case to HAVE OCCURRED and been skipped, which is what
+# irq_skipped_offthread counts.
+R=$(qall "SELECT read_calls||' '||meta_calls||' '||data_calls||' '||irq_skipped_offthread
+          FROM xpq_scan('$PQ','$ALL',25,36)")
+set -- $R
+RC="${1:-0}"; MC="${2:-0}"; DC="${3:-0}"; SK="${4:-}"
+if [ -z "$SK" ]; then
+    bad "could not read irq_skipped_offthread: $R"
+else
+    echo "          reads $RC = meta $MC + data $DC; hook skipped off-thread: $SK"
+    [ "$SK" -gt 0 ] && ok "the off-thread case occurs, so the guard is exercised ($SK reads)" \
+                    || bad "no read arrived off-thread -- the guard is untested here, not proven unnecessary"
+    # Every DATA read is pool-dispatched and every METADATA read is not, so the
+    # skip count must equal the data reads exactly. An inequality would mean
+    # some data read ran the hook on a worker, or a footer read did not run it.
+    [ "$SK" = "$DC" ] && ok "skipped exactly the data reads ($SK = $DC), footer reads kept the check" \
+                      || bad "skipped $SK but there were $DC data reads -- the split is not what it should be"
+fi
+
+# A cancel still has to arrive. It does not come from this layer on the data
+# path any more; it comes from the backend thread's own reads and from the
+# per-row-group CHECK_FOR_INTERRUPTS() in the provider. Section 5 measures the
+# latency; this asserts an EXTERNAL signal mid-scan both arrives and does not
+# wedge the backend, which is the failure that was actually observed.
+for MODE in pg_cancel_backend pg_terminate_backend; do
+    rm -f "$TMP/sig.out"
+    "${PSQL[@]}" -c "SET client_min_messages=error; LOAD 'xpb_parquet';
+        SELECT count(*) FROM generate_series(1,40) g,
+               LATERAL xpb_batch_join2_groupby(1,120,'ext:parquet:$PQ') q" >"$TMP/sig.out" 2>&1 &
+    SJ=$!
+    SBP=""
+    for _ in $(seq 1 60); do
+        SBP=$("${PSQL[@]}" -c "SELECT pid FROM pg_stat_activity WHERE state='active'
+              AND query LIKE '%generate_series(1,40)%' AND pid <> pg_backend_pid() LIMIT 1" 2>/dev/null | tail -1)
+        [ -n "$SBP" ] && break
+        sleep 0.05
+    done
+    if [ -z "$SBP" ]; then
+        echo "  skip    $MODE -- the scan finished before it could be signalled"
+        wait $SJ 2>/dev/null
+        continue
+    fi
+    "${PSQL[@]}" -c "SELECT $MODE($SBP)" >/dev/null 2>&1
+    W=0
+    while kill -0 "$SBP" 2>/dev/null && [ $W -lt 40 ]; do sleep 0.25; W=$((W+1)); done
+    wait $SJ 2>/dev/null
+    if kill -0 "$SBP" 2>/dev/null; then
+        bad "$MODE left backend $SBP alive after 10 s (threads=$(ls /proc/$SBP/task 2>/dev/null | wc -l))"
+    else
+        ok "$MODE mid-scan ended the backend in under $((W*250+250)) ms"
+    fi
+done
 
 echo
 echo "############ $pass correct, $fail wrong ############"

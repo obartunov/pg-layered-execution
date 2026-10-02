@@ -597,6 +597,8 @@ int64_t xpq_meta_calls(const XpqReader *r)
 { return (r && r->object) ? r->object->meta_calls() : 0; }
 int64_t xpq_data_calls(const XpqReader *r)
 { return (r && r->object) ? r->object->data_calls() : 0; }
+int64_t xpq_interrupt_skipped_offthread(const XpqReader *r)
+{ return (r && r->object) ? r->object->interrupt_skipped_offthread() : 0; }
 
 /*
  * Controlled failure for the exception boundary.

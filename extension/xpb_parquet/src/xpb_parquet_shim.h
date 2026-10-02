@@ -151,6 +151,17 @@ int64_t     xpq_meta_calls(const XpqReader *r);
 int64_t     xpq_data_calls(const XpqReader *r);
 
 /*
+ * Physical reads whose interrupt check was skipped because the read was on an
+ * Arrow worker thread rather than the backend's.
+ *
+ * Not a diagnostic afterthought: with pre_buffer on, EVERY column-chunk read
+ * arrives on a worker, so this is nonzero for any data scan. A test asserts it
+ * is nonzero precisely so that "the hook never ran off-thread" cannot pass
+ * vacuously in a build where Arrow happened not to use its pool.
+ */
+int64_t     xpq_interrupt_skipped_offthread(const XpqReader *r);
+
+/*
  * Install the interrupt check used between range reads. Called once from the
  * module's _PG_init; the hook may longjmp.
  */

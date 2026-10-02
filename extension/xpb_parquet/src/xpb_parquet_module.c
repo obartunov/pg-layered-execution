@@ -699,7 +699,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(24);
+    tupdesc = CreateTemplateTupleDesc(25);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -725,6 +725,8 @@ xpq_scan(PG_FUNCTION_ARGS)
     TupleDescInitEntry(tupdesc, 22, "bytes_returned",  INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 23, "meta_calls",      INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 24, "data_calls",      INT8OID, -1, 0);
+    /* Reads whose interrupt check was skipped as off-thread; see the shim. */
+    TupleDescInitEntry(tupdesc, 25, "irq_skipped_offthread", INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -734,8 +736,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[24];
-        bool    nulls[24] = {false};
+        Datum   vals[25];
+        bool    nulls[25] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -763,6 +765,7 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[21] = Int64GetDatum(xpq_bytes_returned(st->reader));
         vals[22] = Int64GetDatum(xpq_meta_calls(st->reader));
         vals[23] = Int64GetDatum(xpq_data_calls(st->reader));
+        vals[24] = Int64GetDatum(xpq_interrupt_skipped_offthread(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 
