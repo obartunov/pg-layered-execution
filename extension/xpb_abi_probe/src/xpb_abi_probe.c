@@ -106,6 +106,19 @@ static const XpbSourceProvider badversion_provider = {
     .name        = "abi_badversion",
     .create      = probe_create,
 };
+
+/*
+ * A descriptor shorter than the fixed-offset prefix: it does not even contain
+ * create. Distinct from `minimal`, which stops exactly at the first appended
+ * field and is legitimate. Must be refused, and refused BEFORE name or create is
+ * read, since at this size those fields may not be there at all.
+ */
+static const XpbSourceProvider truncated_provider = {
+    .abi_version = XPB_SOURCE_ABI_VERSION,
+    .struct_size = offsetof(XpbSourceProvider, name),
+    .name        = "abi_truncated",
+    .create      = probe_create,
+};
 #endif
 
 /*
@@ -132,6 +145,16 @@ xpb_abi_register(PG_FUNCTION_ARGS)
         xpb_register_source_provider(&future_provider);
     else if (strcmp(which, "badversion") == 0)
         xpb_register_source_provider(&badversion_provider);
+    else if (strcmp(which, "truncated") == 0)
+        xpb_register_source_provider(&truncated_provider);
+    else if (strcmp(which, "duplicate") == 0)
+    {
+        /* Same descriptor twice in one backend. The second must be refused:
+         * two modules claiming one name would make which provider runs depend
+         * on load order. */
+        xpb_register_source_provider(&current_provider);
+        xpb_register_source_provider(&current_provider);
+    }
 #endif
     else
         ereport(ERROR,

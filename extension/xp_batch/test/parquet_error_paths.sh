@@ -61,9 +61,24 @@ pq.write_table(pa.table({
     "amount_dt":   pa.array([i for i in range(n)],           type=pa.int64()),
 }), sys.argv[1], row_group_size=500, compression="none", write_statistics=True)
 PY
+# A second error SITE, not a second error: this one raises inside next_batch()
+# rather than in an operator above it, so it exercises a different unwind point
+# with the reader open. One row group larger than XPCB_BATCH_CAP.
+python3 - "$TMP/bigrowgroup.parquet" <<'PY'
+import sys
+import pyarrow as pa, pyarrow.parquet as pq
+n = 70000
+pq.write_table(pa.table({
+    "period_key":  pa.array([25 + i % 12 for i in range(n)], type=pa.int32()),
+    "company_key": pa.array([i % 50 for i in range(n)],      type=pa.int32()),
+    "account_key": pa.array([1 + i % 200 for i in range(n)], type=pa.int32()),
+    "amount_dt":   pa.array([i % 1000 for i in range(n)],    type=pa.int32()),
+}), sys.argv[1], row_group_size=n, compression="none", write_statistics=True)
+PY
 chmod -R a+rX "$TMP"
 
-echo "=== 1. descriptors on the Parquet file after 10 failing queries ==="
+for CASE in typemismatch bigrowgroup; do
+echo "=== 1. descriptors on the Parquet file after 10 failing queries  ($CASE) ==="
 # Counted by TARGET, not as a total: a backend opens relation files as it goes,
 # so the total grows by a dozen whatever the provider does -- which is how the
 # first version of this test managed to fail after the leak was fixed. One
@@ -84,7 +99,7 @@ BEGIN
     FOR i IN 1..10 LOOP
         BEGIN
             PERFORM count(*) FROM xpb_batch_join2_groupby(25, 36,
-                'ext:parquet:$TMP/typemismatch.parquet');
+                'ext:parquet:$TMP/\$CASE.parquet');
         EXCEPTION WHEN others THEN NULL;   -- the error is the point
         END;
     END LOOP;
@@ -98,7 +113,7 @@ LEAKED=""
 for _ in $(seq 1 50); do
     if grep -q loopdone "$OUTF" 2>/dev/null; then
         PID=$(head -1 "$OUTF")
-        LEAKED=$(ls -l "/proc/$PID/fd" 2>/dev/null | grep -c "typemismatch.parquet")
+        LEAKED=$(ls -l "/proc/$PID/fd" 2>/dev/null | grep -c "$CASE.parquet")
         break
     fi
     sleep 0.2
@@ -109,9 +124,10 @@ if [ -z "$LEAKED" ]; then
     bad "the probe session never reached the end of the loop"
 else
     echo "          descriptors still open on the file: $LEAKED (after 10 failed queries)"
-    [ "$LEAKED" -eq 0 ] && ok "the reader is released on the error path" \
-                        || bad "$LEAKED readers leaked, one per failed query"
+    [ "$LEAKED" -eq 0 ] && ok "the reader is released on the error path ($CASE)" \
+                        || bad "$LEAKED readers leaked, one per failed query ($CASE)"
 fi
+done
 
 # And the error has to be the one expected, or the loop above proved nothing.
 MSG=$("${PSQL[@]}" -c "LOAD 'xpb_parquet';
