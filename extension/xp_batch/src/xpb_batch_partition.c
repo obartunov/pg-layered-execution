@@ -418,6 +418,10 @@ xpb_partition_join2_groupby(PG_FUNCTION_ARGS)
         nbatches++;
 
         int nrows = batch.nrows;
+
+        /* No NULL branch in either join or the aggregate below. */
+        xpcb_require_all_valid(&batch, batch.ncols, "XpBatchPartition");
+
         int32 *col_pk = xpcb_i32(&batch, 0);  /* period_key  */
         int32 *col_ck = xpcb_i32(&batch, 1);  /* company_key */
         int32 *col_ak = xpcb_i32(&batch, 2);  /* account_key */

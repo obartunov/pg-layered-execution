@@ -101,6 +101,11 @@ batch_aggregate(XpBatchSource *source, BatchAggResult *res)
 
         nbatches++;
         int nrows = batch.nrows;
+
+        /* Generic over sources, and with no NULL branch: refuse a bitmap
+         * rather than group and sum the slot behind it. */
+        xpcb_require_all_valid(&batch, batch.ncols, "BatchGroupAgg");
+
         /* dispatch once per batch, outside the row loop */
         int32 *col_pk = xpcb_i32(&batch, 0);
         int32 *col_ck = xpcb_i32(&batch, 1);

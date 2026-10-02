@@ -230,8 +230,18 @@ static void
 batch_join_probe(BatchJoinState *js, XpColumnBatch *in, XpColumnBatch *out)
 {
     int nrows = in->nrows;
-    int32 *col_pk = xpcb_i32(in, 0);        /* dispatch once, not per row */
+    int32 *col_pk;
     int nsel = 0;
+
+    /*
+     * No NULL branch here or in the aggregate below, and the gather path at the
+     * end sets validity = NULL while compacting values -- so a bitmap arriving
+     * here would be dropped and every row below it would look valid.  Refused
+     * instead.
+     */
+    xpcb_require_all_valid(in, in->ncols, "BatchHashJoin");
+
+    col_pk = xpcb_i32(in, 0);               /* dispatch once, not per row */
 
     /* Probe: lookup each period_key, build selection + year column */
     for (int i = 0; i < nrows; i++)
@@ -551,8 +561,14 @@ batch_join2_probe(Dim2HashTable *dim, int key_col, int payload_col,
                   int32 *payload_buf)
 {
     int nrows = in->nrows;
-    int32 *col_key = xpcb_i32(in, key_col);     /* dispatch once, not per row */
+    int32 *col_key;
     int nout = 0;
+
+    /* Same reason as batch_join_probe: no NULL branch, and the gather path
+     * drops the bitmap. */
+    xpcb_require_all_valid(in, in->ncols, "BatchHashJoin2");
+
+    col_key = xpcb_i32(in, key_col);            /* dispatch once, not per row */
 
     /* Build selection: which input rows matched the dimension */
     uint32 *sel = palloc(nrows * sizeof(uint32));

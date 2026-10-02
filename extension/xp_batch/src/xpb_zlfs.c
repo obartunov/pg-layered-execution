@@ -748,6 +748,34 @@ zlfs_group_sum(PG_FUNCTION_ARGS)
     if (pk_idx < 0 || ck_idx < 0 || dt_idx < 0)
         ereport(ERROR, (errmsg("ZLFS: zone missing required columns")));
 
+    /*
+     * The columns are found by attno above, which is right, and then read as
+     * int32 * with no check that they ARE int32 and no check for NULLs.  Both
+     * were silent: an int8 column came apart into halves, and a NULL was summed
+     * as whatever the zone builder left in the slot and grouped as a value --
+     * measured at 240 groups against PostgreSQL's 252 on a nullable
+     * company_key.  The zone states both facts; consult them.
+     */
+    {
+        const int idx[3] = { pk_idx, ck_idx, dt_idx };
+
+        for (int i = 0; i < 3; i++)
+        {
+            if (zone->col_types[idx[i]] != ZLFS_COL_INT4)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("ZLFS: zone column for attno %d is not int4",
+                                zone->col_attnos[idx[i]]),
+                         errdetail("zlfs_group_sum reads int4; the zone holds a wider type.")));
+            if (zone->col_validity[idx[i]] != NULL)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("ZLFS: zone column for attno %d carries NULLs",
+                                zone->col_attnos[idx[i]]),
+                         errdetail("A NULL would be grouped and summed as the value left in its slot.")));
+        }
+    }
+
     instr_time t0, t1;
     INSTR_TIME_SET_CURRENT(t0);
 

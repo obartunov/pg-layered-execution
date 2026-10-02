@@ -344,6 +344,43 @@ xpcb_reset(XpColumnBatch *b)
  * wrong in both directions: it leaks the gathered buffers or frees memory
  * that belongs to the operator's own scratch space.
  */
+/*
+ * Refuse a batch carrying NULLs.
+ *
+ * The contract lets any source hand over a validity bitmap, and three of the
+ * four sources can: the heap source's deform and projected paths, pgcolumnar,
+ * ZLFS zones and Parquet all produce one when a column has NULLs.  Several
+ * operators have no NULL branch at all -- they read cols[c].data[row] and
+ * group or sum it -- and for those a bitmap is not a slow path, it is a wrong
+ * answer.  Measured on a ZLFS zone over a nullable column:
+ *
+ *     PostgreSQL              252 groups
+ *     xpb_batch_groupby       240 groups    (the NULL key merged into a value)
+ *     zlfs_group_sum          240 groups
+ *
+ * The totals agreed in that case, which is why the group count is the thing to
+ * compare: a sum-only check passes.
+ *
+ * An operator that cannot carry NULLs calls this once per batch and refuses
+ * before reading anything.  That is the policy for the whole contract: a path
+ * either implements the semantics or declines before execution.  It is NOT a
+ * substitute for NULL support where the semantics are wanted -- see
+ * xpb_typed_pipeline.c, which implements them.
+ */
+static inline void
+xpcb_require_all_valid(const XpColumnBatch *b, int ncols, const char *where)
+{
+    for (int c = 0; c < ncols && c < XPCB_MAX_COLS; c++)
+        if (b->cols[c].validity != NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("%s: column %d carries NULLs, which this path does not implement",
+                            where, c),
+                     errdetail("A NULL would be read as whatever the source left in the value slot, "
+                               "changing the group it lands in and the sum it joins."),
+                     errhint("Use a NOT NULL column, or a path that implements NULL semantics.")));
+}
+
 static inline void
 xpcb_release_owned(XpColumnBatch *b)
 {
