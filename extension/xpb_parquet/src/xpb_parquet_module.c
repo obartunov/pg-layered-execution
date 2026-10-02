@@ -116,6 +116,53 @@ xpq_context_cleanup(void *arg)
     xpq_release((XpqSourceState *) arg);
 }
 
+/*
+ * The same protection for a reader that is not behind an XpBatchSource.
+ *
+ * xpq_columns() opens a reader and closes it at the end of the function, with
+ * CStringGetTextDatum() and tuplestore_putvalues() in between -- both of which
+ * can ereport. That longjmp skipped the close and leaked the descriptor, the
+ * same defect the source path already had a callback for. One holder, one
+ * callback, so the two paths release a reader the same way.
+ */
+typedef struct XpqReaderHolder
+{
+    XpqReader              *reader;
+    MemoryContextCallback   cb;
+} XpqReaderHolder;
+
+static void
+xpq_holder_cleanup(void *arg)
+{
+    XpqReaderHolder *h = (XpqReaderHolder *) arg;
+
+    if (h->reader != NULL)
+    {
+        xpq_close(h->reader);
+        h->reader = NULL;
+    }
+}
+
+/*
+ * Open a reader owned by CurrentMemoryContext. Returns NULL with errbuf filled;
+ * the caller decides whether that is an ERROR. The holder is embedded-callback
+ * for the reason given on XpqSourceState.cb.
+ */
+static XpqReaderHolder *
+xpq_open_held(const char *path, char *errbuf, size_t errbuflen)
+{
+    XpqReaderHolder *h = (XpqReaderHolder *) palloc0(sizeof(XpqReaderHolder));
+
+    h->reader = xpq_open(path, errbuf, errbuflen);
+    if (h->reader == NULL)
+        return NULL;
+
+    h->cb.func = xpq_holder_cleanup;
+    h->cb.arg  = h;
+    MemoryContextRegisterResetCallback(CurrentMemoryContext, &h->cb);
+    return h;
+}
+
 /* ────────────────────────────────────────────────────────── next_batch ── */
 
 static bool
@@ -743,6 +790,7 @@ xpq_columns(PG_FUNCTION_ARGS)
     TupleDesc       tupdesc;
     Tuplestorestate *store;
     MemoryContext   oldcxt;
+    XpqReaderHolder *h;
     XpqReader      *r;
     char            errbuf[XPQ_ERRBUF];
 
@@ -752,12 +800,13 @@ xpq_columns(PG_FUNCTION_ARGS)
                  errmsg("xpq_columns: set-valued context required")));
 
     errbuf[0] = '\0';
-    r = xpq_open(path, errbuf, sizeof(errbuf));
-    if (r == NULL)
+    h = xpq_open_held(path, errbuf, sizeof(errbuf));
+    if (h == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_FILE),
                  errmsg("xpb_parquet: cannot open \"%s\"", path),
                  errdetail("%s", errbuf[0] ? errbuf : "no detail")));
+    r = h->reader;
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
     tupdesc = CreateTemplateTupleDesc(4);
@@ -792,6 +841,6 @@ xpq_columns(PG_FUNCTION_ARGS)
     }
 
     MemoryContextSwitchTo(oldcxt);
-    xpq_close(r);
+    xpq_holder_cleanup(h);
     return (Datum) 0;
 }
