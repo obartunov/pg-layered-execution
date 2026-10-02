@@ -67,10 +67,56 @@ typedef struct XpbSourceRequest
     int64               pred_hi;
 } XpbSourceRequest;
 
+/*
+ * ABI version of XpbSourceProvider.
+ *
+ * This descriptor crosses a module boundary: xp_batch.so defines the struct, a
+ * provider .so fills one in, and NOTHING IN THE BUILD SYSTEM REBUILDS THEM
+ * TOGETHER. The first version of this header had no version field and put a new
+ * bool in the middle of the struct, which is a silent wrong answer rather than a
+ * failed load: a provider built before that change presents its `describe`
+ * pointer where `filters_rows` now sits, the low bytes of a pointer are not
+ * zero, so the field reads true, so the caller believes the provider applied the
+ * predicate and skips applying it. Demonstrated in a live backend --
+ * test/provider_abi.sh, case `legacy`, which reported filters_rows=true from a
+ * stale descriptor.
+ *
+ * The value is deliberately not a small integer. It sits at offset 0, which in
+ * every earlier layout held `name` -- a pointer -- so a distinctive constant is
+ * what makes "this is a stale descriptor" detectable instead of plausible. Bump
+ * it only for a change that is NOT a field appended at the end.
+ */
+#define XPB_SOURCE_ABI_VERSION      0x58500001u     /* 'X','P' + revision 1 */
+
 typedef struct XpbSourceProvider
 {
+    /*
+     * Both set by XPB_SOURCE_PROVIDER_HEADER. struct_size is sizeof() AS THE
+     * PROVIDER SAW IT, which is how a provider that predates an appended field
+     * stays usable: the registry copies that many bytes into a zero-filled
+     * descriptor, so every field the provider does not have reads as zero.
+     */
+    uint32          abi_version;
+    uint32          struct_size;
+
     const char     *name;
     XpBatchSource  *(*create)(const XpbSourceRequest *req);
+
+    /*
+     * Optional. Lets a caller ask what the provider will produce before
+     * constructing it -- which is what projection pushdown needs in order to
+     * type the batch. A provider that cannot answer leaves this NULL and the
+     * caller must construct first.
+     */
+    bool            (*describe)(const XpbSourceRequest *req,
+                                XpbColType *types, int *ncols_out);
+
+    /* ─────────── APPEND ONLY BELOW THIS LINE ───────────
+     * A field added here is invisible to an older provider, which simply
+     * reports a smaller struct_size and gets zero. A field inserted ABOVE this
+     * line changes the meaning of every older provider's bytes and requires a
+     * version bump. Keep XPB_SOURCE_PROVIDER_MIN_SIZE pointing at the first
+     * appended field. */
 
     /*
      * Does this provider APPLY req->has_pred as a row filter, or only use it
@@ -84,23 +130,30 @@ typedef struct XpbSourceProvider
      * reads. A caller that assumed the first behaviour and got the second
      * would return rows outside the predicate.
      *
-     * false (the zero value, so the default for a provider that does not think
-     * about this) means the CALLER must apply the predicate. That direction is
-     * the safe one: a redundant filter over already-filtered rows costs a pass
-     * and changes no answer, whereas the opposite default would turn a
-     * forgotten field into silently wrong output.
+     * false means the CALLER must apply the predicate. That direction is the
+     * safe one: a redundant filter over already-filtered rows costs a pass and
+     * changes no answer. It is now actually the default in both ways a provider
+     * can fail to set it -- a zero initialiser, and a descriptor that predates
+     * the field -- which was the point of the two header fields above.
      */
     bool            filters_rows;
-
-    /*
-     * Optional. Lets a caller ask what the provider will produce before
-     * constructing it -- which is what projection pushdown needs in order to
-     * type the batch. A provider that cannot answer leaves this NULL and the
-     * caller must construct first.
-     */
-    bool            (*describe)(const XpbSourceRequest *req,
-                                XpbColType *types, int *ncols_out);
 } XpbSourceProvider;
+
+/*
+ * The smallest descriptor a provider of this ABI version may present: every
+ * field up to the first appended one. Offsets below it are fixed for the life of
+ * the version.
+ */
+#define XPB_SOURCE_PROVIDER_MIN_SIZE    offsetof(XpbSourceProvider, filters_rows)
+
+/*
+ * Every provider's descriptor starts with this. Spelled as a macro so a
+ * provider cannot fill in the version by hand and get it wrong, and so
+ * struct_size is sizeof() at the PROVIDER's compile time rather than a literal.
+ */
+#define XPB_SOURCE_PROVIDER_HEADER                      \
+    .abi_version = XPB_SOURCE_ABI_VERSION,              \
+    .struct_size = sizeof(XpbSourceProvider)
 
 /*
  * PGDLLEXPORT on all four is load-bearing, not decoration.

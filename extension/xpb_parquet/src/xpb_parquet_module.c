@@ -379,6 +379,13 @@ xpq_describe(const XpbSourceRequest *req, XpbColType *types, int *ncols_out)
 }
 
 static const XpbSourceProvider parquet_provider = {
+    /*
+     * ABI version and struct_size, so a mismatch between this module and the
+     * loaded xp_batch.so is refused at registration instead of being read as a
+     * silently wrong field. Must be first; see xpb_source.h.
+     */
+    XPB_SOURCE_PROVIDER_HEADER,
+
     .name     = "parquet",
     .create   = xpq_create,
     .describe = xpq_describe,

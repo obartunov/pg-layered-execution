@@ -21,26 +21,73 @@
  * startup and read-only afterwards. No locking: a backend only ever sees its
  * own copy.
  *
- * The provider descriptors themselves are NOT copied. A provider passes a
- * pointer to its own static descriptor, which lives as long as its module is
- * loaded -- and PostgreSQL never unloads a module once loaded.
+ * Descriptors are COPIED, by value, and that is load-bearing in two ways.
+ *
+ * The copy is zero-filled first and only struct_size bytes are taken from the
+ * caller, so a provider built against an earlier minor version of this ABI --
+ * one that predates an appended field -- reads as zero in every field it does
+ * not have, instead of this file reading past the end of the provider's object.
+ *
+ * And the stored descriptor no longer depends on the provider's static object
+ * staying put. It never moved in practice, because PostgreSQL does not unload a
+ * module, but a table of pointers made the layout of someone else's struct this
+ * file's problem at every read rather than once at registration.
  */
-static const XpbSourceProvider *xpb_providers[XPB_SOURCE_MAX_PROVIDERS];
-static int                      xpb_nproviders = 0;
+static XpbSourceProvider    xpb_providers[XPB_SOURCE_MAX_PROVIDERS];
+static int                  xpb_nproviders = 0;
 
 void
 xpb_register_source_provider(const XpbSourceProvider *p)
 {
-    if (p == NULL || p->name == NULL || p->create == NULL)
+    XpbSourceProvider   local;
+
+    if (p == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xp_batch: source provider descriptor is NULL")));
+
+    /*
+     * Version and size BEFORE anything else, because every other field's offset
+     * is only meaningful once these two agree. A descriptor from a module built
+     * against a different revision of xpb_source.h has its fields somewhere
+     * else, and reading its name or create pointer first is reading whatever
+     * happens to sit at those offsets.
+     */
+    if (p->abi_version != XPB_SOURCE_ABI_VERSION)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xp_batch: source provider has ABI version 0x%08X, this build expects 0x%08X",
+                        p->abi_version, XPB_SOURCE_ABI_VERSION),
+                 errdetail("The provider module was built against a different "
+                           "xpb_source.h than the loaded xp_batch."),
+                 errhint("Rebuild and reinstall both modules from the same tree.")));
+
+    if (p->struct_size < XPB_SOURCE_PROVIDER_MIN_SIZE ||
+        p->struct_size > sizeof(XpbSourceProvider))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("xp_batch: source provider declares struct_size %u, outside the accepted range %zu..%zu",
+                        p->struct_size,
+                        (size_t) XPB_SOURCE_PROVIDER_MIN_SIZE,
+                        sizeof(XpbSourceProvider)),
+                 errdetail("A larger descriptor than this build knows about "
+                           "carries fields whose meaning is unknown here, which "
+                           "is refused rather than ignored."),
+                 errhint("Rebuild and reinstall both modules from the same tree.")));
+
+    memset(&local, 0, sizeof(local));
+    memcpy(&local, p, p->struct_size);
+
+    if (local.name == NULL || local.create == NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                  errmsg("xp_batch: source provider must have a name and a create function")));
 
-    if (xpb_find_source_provider(p->name) != NULL)
+    if (xpb_find_source_provider(local.name) != NULL)
         ereport(ERROR,
                 (errcode(ERRCODE_DUPLICATE_OBJECT),
                  errmsg("xp_batch: source provider \"%s\" is already registered",
-                        p->name),
+                        local.name),
                  errdetail("Two modules claiming one provider name would make "
                            "the winner depend on load order.")));
 
@@ -50,9 +97,10 @@ xpb_register_source_provider(const XpbSourceProvider *p)
                  errmsg("xp_batch: too many source providers (%d)",
                         XPB_SOURCE_MAX_PROVIDERS)));
 
-    xpb_providers[xpb_nproviders++] = p;
+    xpb_providers[xpb_nproviders++] = local;
 
-    elog(DEBUG1, "xp_batch: registered source provider \"%s\"", p->name);
+    elog(DEBUG1, "xp_batch: registered source provider \"%s\" (struct_size %u, filters_rows %d)",
+         local.name, local.struct_size, (int) local.filters_rows);
 }
 
 const XpbSourceProvider *
@@ -62,8 +110,8 @@ xpb_find_source_provider(const char *name)
         return NULL;
 
     for (int i = 0; i < xpb_nproviders; i++)
-        if (strcmp(xpb_providers[i]->name, name) == 0)
-            return xpb_providers[i];
+        if (strcmp(xpb_providers[i].name, name) == 0)
+            return &xpb_providers[i];
 
     return NULL;
 }
@@ -79,7 +127,7 @@ xpb_source_provider_name(int i)
 {
     if (i < 0 || i >= xpb_nproviders)
         return NULL;
-    return xpb_providers[i]->name;
+    return xpb_providers[i].name;
 }
 
 /*
@@ -119,8 +167,8 @@ xpb_source_providers(PG_FUNCTION_ARGS)
         Datum   vals[2];
         bool    nulls[2] = {false, false};
 
-        vals[0] = CStringGetTextDatum(xpb_providers[i]->name);
-        vals[1] = BoolGetDatum(xpb_providers[i]->describe != NULL);
+        vals[0] = CStringGetTextDatum(xpb_providers[i].name);
+        vals[1] = BoolGetDatum(xpb_providers[i].describe != NULL);
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 
