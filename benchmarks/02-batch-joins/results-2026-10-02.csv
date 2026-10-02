@@ -1,0 +1,8 @@
+dataset,path,median_total_ms,source_ms,filter_ms,join1_ms,join2_ms,agg_ms,runs,groups,checksum
+reconstructed-v1,vanilla,892.1,,,,,,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,native_columnar,433.7,,,,,,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,xpb_heap,144.5,136.0,,2.2,2.9,3.1,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,xpb_zlfs,8.7,0.0,,2.3,2.9,3.6,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,xpb_pgcolumnar,58.7,46.9,,3.4,3.4,4.4,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,xpb_parquet,39.2,27.8,1.8,2.5,3.0,3.7,5,200,09e54f9a0108ff447c05f2cf63ca63da
+reconstructed-v1,duckdb_parquet,43.1,,,,,,5,200,09e54f9a0108ff447c05f2cf63ca63da
