@@ -21,33 +21,78 @@
 /* -----------------------------------------------------------------------
  * Shared heap attribute walker.
  *
- * Walks the fixed-width attribute chain up to attno, then reads
- * the value as int32 or int64 depending on attlen.
- * NULL -> returns 0 (checked at plan time: no nulls in fast-path columns).
+ * Locates attno in a heap tuple and reads it as int32 or int64.
+ *
+ * R1-15.  The previous version computed the offset itself, as
+ *
+ *     tp += att_align_nominal(attr->attlen, attr->attalign);
+ *
+ * which aligns the attribute's LENGTH rather than the running offset, so the
+ * padding before an attribute was never counted.  For every column of equal
+ * length and alignment -- (int4, int4, int4) -- the two happen to agree, which
+ * is why the benchmark schema never showed it.  One byte of padding anywhere
+ * before a fast-path column and every key and aggregate read is off:
+ *
+ *     CREATE TABLE t (flag bool NOT NULL, k1 int NOT NULL,
+ *                     k2 int NOT NULL, v int NOT NULL);
+ *     SELECT k1, k2, sum(v) FROM t GROUP BY 1, 2;
+ *
+ *     PostgreSQL   2400 groups, sum 11 519 175
+ *     XpGroupAgg2  2400 groups, sum 193 259 687 116 800
+ *
+ * Nothing about alignment, short or external varlena headers, or NULL bitmap
+ * interpretation is computed here any more.  It is delegated to the same
+ * inline helpers from access/tupmacs.h that heap_deform_tuple() uses, which is
+ * what xpb_src_heap.c's projected path already does -- align_fetch_then_add()
+ * aligns the running offset, fetches, and steps past, in that order.
+ *
+ * A NULL in a preceding attribute occupies no space and is skipped.  A NULL in
+ * the target attribute returns 0, which is only correct because the planner
+ * refuses this path when any column it reads is nullable (xpga2_add_path):
+ * before R1-14 that gate covered the grouping and aggregate columns but not
+ * the predicate columns, and a NULL there was read as a zero that passed the
+ * predicate.
  * ----------------------------------------------------------------------- */
 static XpbVal
 xpb_getattr_scalar(HeapTupleHeader htup, AttrNumber attno, TupleDesc tupdesc)
 {
-    uint8  *bp      = htup->t_bits;
-    bool    hasnull = (htup->t_infomask & HEAP_HASNULL) != 0;
+    uint8              *bp      = htup->t_bits;
+    bool                hasnull = (htup->t_infomask & HEAP_HASNULL) != 0;
+    CompactAttribute   *target  = TupleDescCompactAttr(tupdesc, attno - 1);
+    const char         *tp      = (const char *) htup + htup->t_hoff;
+    uint32              off     = 0;
+    Datum               d       = (Datum) 0;
 
     if (hasnull && att_isnull(attno - 1, bp))
         return 0;
 
-    char *tp = (char *) htup + htup->t_hoff;
-    for (int i = 0; i < attno - 1; i++)
+    /*
+     * The descriptor's cached offset is PostgreSQL's own answer, valid while
+     * the tuple has no NULLs at all -- the same condition heap_getattr()
+     * applies before using it.
+     */
+    if (!hasnull && target->attcacheoff >= 0)
     {
-        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
-        if (hasnull && att_isnull(i, bp)) continue;
-        if (attr->attlen > 0)
-            tp += att_align_nominal(attr->attlen, attr->attalign);
-        else
-            tp += att_addlength_pointer(0, attr->attlen, tp);
+        d = fetch_att_noerr(tp + target->attcacheoff,
+                            target->attbyval, target->attlen);
+    }
+    else
+    {
+        for (int i = 0; i < attno; i++)
+        {
+            CompactAttribute *a = TupleDescCompactAttr(tupdesc, i);
+
+            if (hasnull && att_isnull(i, bp))
+                continue;       /* a NULL occupies no space */
+
+            d = align_fetch_then_add(tp, &off, a->attbyval, a->attlen,
+                                     a->attalignby);
+        }
     }
 
-    if (TupleDescAttr(tupdesc, attno - 1)->attlen == 8)
-        return (XpbVal) *((int64 *) tp);
-    return (XpbVal) *((int32 *) tp);
+    if (target->attlen == 8)
+        return (XpbVal) DatumGetInt64(d);
+    return (XpbVal) DatumGetInt32(d);
 }
 
 /* ------- INT4 ------- */

@@ -210,9 +210,26 @@ xpb_qual_resolve_cached(XpbQual *pq, TupleDesc tupdesc)
                 all_fixed = false;
                 break;
             }
-            /* Accumulate offset with alignment */
+
+            /*
+             * R1-15, second site.  This said
+             *
+             *     offset += att->attlen;
+             *
+             * under a comment claiming alignment, and the reachability map
+             * carried it as a known hole ("Unaligned fixed_offset"): for
+             * (int4, int8) a predicate on the int8 read bytes 4..11.  Align
+             * the RUNNING offset, then add the length -- and align once more
+             * for the target attribute itself, whose own padding is equally
+             * real.
+             */
             if (c < pp->attno - 1)
+            {
+                offset = att_align_nominal(offset, att->attalign);
                 offset += att->attlen;
+            }
+            else
+                offset = att_align_nominal(offset, att->attalign);
         }
         if (all_fixed)
             pp->fixed_offset = offset;

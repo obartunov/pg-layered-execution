@@ -1,7 +1,7 @@
 # Silent-Drop Reachability — the map
 
-Status: **reopened 2026-10-02 for R1-13, then closed again. SILENT_DROP = 0,
-AMBIGUOUS = 0.**
+Status: **reopened 2026-10-02 for R1-14 and R1-15, then closed again.
+SILENT_DROP = 0, AMBIGUOUS = 0.**
 
 Phase 4 mapped the space and phase 5 closed it at 11 defects. The map has been
 reopened twice since.
@@ -18,12 +18,22 @@ same key range. Not a capacity limit and not an ordering assumption — an
 identity assumption about which column is which. The map's question did not
 reach it either.
 
-Three surveys, three questions, three different answers. A future survey asks
-all of:
+The source-contract hardening audit then found two more, both in XpGroupAgg2 and
+both reachable from ordinary SQL: R1-15, heap attribute offsets computed by
+aligning the attribute's LENGTH instead of the running offset, so any padding
+before a fast-path column corrupted every key and aggregate read; and R1-14, a
+pushed predicate on a nullable column tested as if NULL were zero, because the
+NULL scope guard ran before the predicates were extracted.
+
+Five surveys, five questions, five different answers. A future survey asks all
+of:
 
 > can a local capacity limit silently change the answer?     (phase 4)
 > can an unproven assumption about physical row order?        (R1-11)
 > can an unverified assumption about column identity?         (R1-13)
+> is the byte offset of what we read actually where we think? (R1-15)
+> does every column a path READS have its NULLs accounted,
+>   not just the columns it groups and aggregates?            (R1-14)
 
 `test/reproducers/silent_drop_map.sh` passes 10/10 and
 `test/reproducers/groupagg2_desc_stream_exit.sh` passes 14/14; the wrong result
@@ -60,17 +70,19 @@ new defects found:            2   (R1-9, R1-10)
                              +1   (A4, found by analysing an AMBIGUOUS site)
                              +1   (R1-11, found after the map was closed)
                              +1   (R1-13, found by the provider-contract audit)
-fixed:                       13
+                             +2   (R1-14, R1-15, found by the hardening audit)
+fixed:                       15
 remaining:                    0
 ```
 
-The count went from 8 to 13 rather than staying at a tidy 8: fixing the
+The count went from 8 to 15 rather than staying at a tidy 8: fixing the
 page-skip exposed two more, resolving the AMBIGUOUS four turned one of them
-into a real silent drop, the cost-gate audit added a twelfth, and the
-provider-contract audit a thirteenth. All are recorded at full weight.
+into a real silent drop, the cost-gate audit added a twelfth, the
+provider-contract audit a thirteenth, and the hardening audit two more. All are
+recorded at full weight.
 
-R1-11 and R1-13 are not in the bounded-state table above because neither is
-bounded state. Each has its own section at the end.
+R1-11, R1-13, R1-14 and R1-15 are not in the bounded-state table above because
+none of them is bounded state. Each has its own section at the end.
 
 Neither column sums to 31. The rows are classification entries, not distinct
 sites — R1-3 is two instances in one row — and R1-5…R1-10 are semantic defects
@@ -361,10 +373,12 @@ Recorded so they are not lost. Each is a candidate for its own reproducer.
   `zlfs_build_zone` happened to have been called.
 - **`totals[i] == 0` means both "no group" and "sums to zero"**,
   `xpb_columnar_pipeline.c:177-178`; the sibling experiment emits every period.
-- **Unaligned `fixed_offset`.** `xpb_qual.c:213-215` accumulates `att->attlen`
-  without `att_align_nominal`, though its own comment says alignment. For
-  `(int4, int8)` a predicate on the int8 reads bytes 4..11. Compare
-  `xpb_src_heap.c:1008`, which aligns.
+- ~~**Unaligned `fixed_offset`.**~~ **FIXED** as the second site of R1-15.
+  `xpb_qual.c` accumulated `att->attlen` without `att_align_nominal` though its
+  own comment said alignment; for `(int4, int8)` a predicate on the int8 read
+  bytes 4..11. It sat on this list as a known hole for two phases while the same
+  arithmetic in `xpb_typeops.c` -- which every key and aggregate read goes
+  through -- was not on any list at all.
 - **The heap fixed path has no tuple-length bound** (`xpb_src_heap.c:716-729`).
   `ALTER TABLE ADD COLUMN NOT NULL DEFAULT` does not rewrite; the layout check
   passes but pre-ALTER tuples are short, and the read lands past the tuple. The
@@ -656,3 +670,100 @@ this path reaches into a provider's private structure at all. ZLFS and
 pgcolumnar are still linked into `xp_batch.so` and constructed by name; only
 Parquet goes through the registry. The contract document
 (`docs/EXTERNAL_SOURCE_PROVIDER_CONTRACT.md`) states the boundary this violates.
+
+## R1-15 - heap attribute offsets aligned the length, not the running offset
+
+Found 2026-10-02 by the source-contract hardening audit, in the one place no
+previous survey had looked: the shared attribute walker every XpGroupAgg2 key
+and aggregate read goes through.
+
+`xpb_typeops.c`, `xpb_getattr_scalar()`:
+
+```c
+tp += att_align_nominal(attr->attlen, attr->attalign);
+```
+
+`att_align_nominal(cur_offset, align)` aligns its FIRST argument. Passing the
+attribute's length aligns the length -- which for a fixed-width type is a no-op
+-- and never counts the padding before the attribute. The correct form aligns
+the running offset and then adds the length, in that order.
+
+For a schema whose columns all have equal length and alignment the two agree
+exactly. `reg_buh` is `(int, int, int, int, int, int, int, int)`, so every
+benchmark, every contract test and every reproducer this project has ever run
+agreed with PostgreSQL. One byte of padding is enough to break it:
+
+```sql
+CREATE TABLE t (flag bool NOT NULL, k1 int NOT NULL, k2 int NOT NULL, v int NOT NULL);
+INSERT INTO t SELECT true, i/2000+1, i%20, i%97 FROM generate_series(0,239999) i;
+SELECT k1, k2, sum(v) FROM t GROUP BY 1, 2;
+```
+
+| | groups | sum |
+|---|---|---|
+| PostgreSQL | 2400 | 11 519 175 |
+| XpGroupAgg2 | 2400 | **193 259 687 116 800** |
+
+The group count survives by coincidence -- garbage keys still produce 2400
+distinct pairs -- which is worth noting because a count-only check would have
+passed. The same applies to `(int4, int4, int8)`, where the 8-byte aggregate sits
+4 bytes past where the walk put it.
+
+Fixed by delegating to the inline helpers from `access/tupmacs.h` that
+`heap_deform_tuple()` uses, which is what `xpb_src_heap.c`'s projected path
+already did: `align_fetch_then_add()` aligns the running offset, fetches and
+steps past, and `attcacheoff` is used when the tuple has no NULLs, exactly as
+`heap_getattr()` does. No offset arithmetic is written by hand any more.
+
+Second site, same arithmetic, same commit: `xpb_qual.c`'s `fixed_offset`, which
+this document had carried as a known hole ("Unaligned fixed_offset") since phase
+4 without anyone noticing that the identical bug in `xpb_typeops.c` was on the
+hot path of every read rather than one fast reject.
+
+The lesson, which is not about alignment: a defect listed as known and left
+unfixed stops being read as a defect. It was easier to see the duplicate in
+`xpb_qual.c` -- it was written down -- than the original.
+
+`test/reproducers/groupagg2_attr_offset_and_null_pred.sh` passes 10/10 and
+asserts the node still runs on the padded schema, so the agreement is a
+correction and not a decline.
+
+Classification: **fixed.**
+
+## R1-14 - a pushed predicate on a nullable column tested NULL as zero
+
+Found by the same audit, in the gate that exists specifically to prevent it.
+
+`xpga2_add_path()` has a NULL scope guard whose own comment says "XpGroupAgg2
+treats NULL as 0 in getattr_fn ... Decline for nullable columns". It checks
+`k1att`, `k2att` and `vatt`. It runs BEFORE `xpb_qual_extract()`, so the
+predicate columns do not exist yet when it runs, and nothing checked them
+afterwards. `getattr_fn` returns 0 for a NULL; the predicate was then evaluated
+against that zero.
+
+```sql
+CREATE TABLE t (k1 int NOT NULL, k2 int NOT NULL, v int NOT NULL, a int);
+INSERT INTO t SELECT i/2000+1, i%20, i%97,
+       CASE WHEN i%7 = 0 THEN NULL ELSE i%100 END FROM generate_series(0,239999) i;
+SELECT k1, k2, sum(v) FROM t WHERE a < 10 GROUP BY 1, 2;
+```
+
+| | groups | sum |
+|---|---|---|
+| PostgreSQL | 1200 | 985 461 |
+| XpGroupAgg2 | **2400** | **2 631 012** |
+
+Every NULL row passed `a < 10`. SQL says a NULL operand makes the comparison
+unknown and an unknown WHERE clause rejects the row.
+
+Fixed by extending the same guard to the extracted predicates, which means the
+check moved to after extraction. The path is DECLINED rather than taught NULL
+semantics: it has no NULL branch anywhere, and a three-valued comparison
+implemented in one of its five read loops would be worse than none. Explicit
+refusal before execution is the policy; assuming NOT NULL is what produced the
+wrong answer.
+
+The reproducer asserts the refusal is about nullability and not about pushdown:
+the same query shape on a NOT NULL predicate column must still reach the node.
+
+Classification: **fixed.**

@@ -1731,6 +1731,56 @@ xpga2_add_path(PlannerInfo *root, RelOptInfo *input_rel,
         }
     }
     xpb_qual_extract(base_quals, &pqfrag_tmp, k1att);
+
+    /*
+     * R1-14.  The NULL scope guard above covers the grouping and aggregate
+     * columns, which were the only columns it knew about -- the predicates are
+     * not extracted until here.  A pushed predicate on a NULLABLE column read
+     * its value through the same getattr_fn, which returns 0 for a NULL, so
+     * every NULL row was tested as if it held zero:
+     *
+     *     CREATE TABLE t (k1 int NOT NULL, k2 int NOT NULL,
+     *                     v int NOT NULL, a int);          -- a nullable
+     *     SELECT k1, k2, sum(v) FROM t WHERE a < 10 GROUP BY 1, 2;
+     *
+     *     PostgreSQL   1200 groups, sum   985 461
+     *     XpGroupAgg2  2400 groups, sum 2 631 012
+     *
+     * SQL says a NULL operand makes the comparison unknown and the row is
+     * rejected; this accepted every one of them. Declined rather than given
+     * NULL semantics, for the reason the guard above states: this path has no
+     * NULL branch anywhere, and inventing one here would leave the three-valued
+     * logic half-implemented. An explicit refusal before execution is the
+     * policy; assuming NOT NULL is what produced the wrong answer.
+     */
+    if (xpb_qual_npreds(&pqfrag_tmp) > 0)
+    {
+        Relation    rel_pred = table_open((Oid) reloid, AccessShareLock);
+        TupleDesc   td_pred  = RelationGetDescr(rel_pred);
+        bool        pred_nullable = false;
+        AttrNumber  bad_att = 0;
+
+        for (int i = 0; i < xpb_qual_npreds(&pqfrag_tmp); i++)
+        {
+            AttrNumber att = pqfrag_tmp.preds[i].attno;
+
+            if (att > 0 && att <= td_pred->natts &&
+                !TupleDescAttr(td_pred, att - 1)->attnotnull)
+            {
+                pred_nullable = true;
+                bad_att = att;
+                break;
+            }
+        }
+        table_close(rel_pred, AccessShareLock);
+
+        if (pred_nullable)
+        {
+            elog(DEBUG2, "xp_batch: XpGroupAgg2 declined -- pushed predicate on nullable attno=%d (NULL semantics not supported)",
+                 bad_att);
+            return;
+        }
+    }
     /* C4: qual floor — update total_cost now that preds are known */
     if (xpb_qual_npreds(&pqfrag_tmp) > 0)
     {
