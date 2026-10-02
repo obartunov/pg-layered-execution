@@ -152,6 +152,7 @@ xpb_zlfs_source_create(ZlfsZone *zone, int16 *requested_attnos, int ncols)
 
     XpBatchSource *src = palloc(sizeof(XpBatchSource));
     src->ops = &zlfs_batch_ops;
+    src->caps.supports_rescan = true;        /* the zone is already in memory */
     src->private_state = st;
     return src;
 }

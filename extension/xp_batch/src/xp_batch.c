@@ -107,6 +107,8 @@ extern void xpbs_add_path(PlannerInfo *root,
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+#include "xpb_source.h"   /* xpb_register_builtin_providers */
+
 PG_MODULE_MAGIC;
 
 /* ---------- tunables ---------- */
@@ -257,6 +259,12 @@ void _PG_fini(void);
 void
 _PG_init(void)
 {
+    /*
+     * Before any GUC: the registry is what an operator asks for a source, so
+     * the built-in providers must be there for the whole life of the backend.
+     */
+    xpb_register_builtin_providers();
+
     DefineCustomBoolVariable(
         "xp_batch.enabled",
         "Enable XP batch execution provider",

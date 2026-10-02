@@ -88,8 +88,11 @@ static void
 append_rescan(XpBatchSource *src)
 {
     XpAppendState *st = src->private_state;
+
+    /* Through the checked helper: a child that cannot rewind now says so
+     * instead of being called anyway. */
     for (int i = 0; i < st->nchildren; i++)
-        st->children[i]->ops->rescan(st->children[i]);
+        xpcb_source_rescan(st->children[i]);
     st->current = 0;
 }
 
@@ -111,8 +114,15 @@ static XpBatchSource *
 batch_append_create(void)
 {
     XpAppendState *st = palloc0(sizeof(XpAppendState));
-    XpBatchSource *src = palloc(sizeof(XpBatchSource));
+    XpBatchSource *src = palloc0(sizeof(XpBatchSource));
     src->ops = &append_ops;
+    /*
+     * palloc0, not palloc: caps is read by the checked rescan helper, and an
+     * uninitialised byte there would answer that question at random.
+     *
+     * No children yet, so nothing can be rewound yet; each added child ANDs
+     * its own answer in.
+     */
     src->private_state = st;
     return src;
 }
@@ -123,6 +133,12 @@ batch_append_add_child(XpBatchSource *append, XpBatchSource *child, const char *
     XpAppendState *st = append->private_state;
     if (st->nchildren >= APPEND_MAX_CHILDREN)
         ereport(ERROR, (errmsg("BatchAppend: too many children")));
+    /* Append rewinds exactly as far as its weakest child. */
+    if (st->nchildren == 0)
+        append->caps.supports_rescan = child->caps.supports_rescan;
+    else if (!child->caps.supports_rescan)
+        append->caps.supports_rescan = false;
+
     st->children[st->nchildren] = child;
     st->child_labels[st->nchildren] = label;
     st->nchildren++;

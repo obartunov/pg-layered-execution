@@ -76,10 +76,17 @@ n=$(nm -D --undefined-only "$XPBATCH" 2>/dev/null | grep -icE "arrow|parquet" ||
 check "arrow/parquet symbols in xp_batch.so" "0" "$n"
 echo
 
-echo "=== 2. registry is empty with nothing optional loaded ==="
+echo "=== 2. only the built-in providers with nothing optional loaded ==="
 restart
-n=$(q "SET client_min_messages=warning; SELECT count(*) FROM xpb_source_providers()" | tail -1)
-check "providers registered in a fresh backend" "0" "$n"
+# xp_batch registers heap, zlfs and pgcolumnar from its own _PG_init so that the
+# LOOKUP is uniform; they are linked into xp_batch.so and are not optional. This
+# used to assert an empty registry, which was true only while Parquet was the
+# only provider. The property that matters is unchanged and is asserted below:
+# nothing ARROW-dependent appears until its module is loaded.
+n=$(q "SET client_min_messages=warning; SELECT string_agg(name, ',' ORDER BY name) FROM xpb_source_providers()" | tail -1)
+check "built-in providers in a fresh backend" "heap,pgcolumnar,zlfs" "$n"
+n=$(q "SET client_min_messages=warning; SELECT count(*) FROM xpb_source_providers() WHERE name = 'parquet'" | tail -1)
+check "parquet absent until its module is loaded" "0" "$n"
 echo
 
 echo "=== 3. module REMOVED: server starts, existing paths work ==="

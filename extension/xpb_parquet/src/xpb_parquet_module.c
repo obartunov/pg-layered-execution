@@ -392,6 +392,9 @@ xpq_create(const XpbSourceRequest *req)
 
     src = (XpBatchSource *) palloc0(sizeof(XpBatchSource));
     src->ops = &xpq_ops;
+    /* The row-group cursor goes back to 0 and the reader is still open; the
+     * file is not reopened, so this says nothing about a remote reader. */
+    src->caps.supports_rescan = true;
     src->private_state = st;
     return src;
 }

@@ -183,4 +183,11 @@ PGDLLEXPORT extern const XpbSourceProvider *xpb_find_source_provider(const char 
 PGDLLEXPORT extern int  xpb_source_provider_count(void);
 PGDLLEXPORT extern const char *xpb_source_provider_name(int i);
 
+/*
+ * heap, zlfs and pgcolumnar, registered from xp_batch's own _PG_init. They are
+ * linked into xp_batch.so -- registering them makes the LOOKUP uniform, not the
+ * dependency optional. See xpb_builtin_providers.c.
+ */
+extern void xpb_register_builtin_providers(void);
+
 #endif  /* XPB_SOURCE_H */

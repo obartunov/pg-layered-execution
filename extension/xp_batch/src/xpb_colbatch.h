@@ -153,11 +153,74 @@ typedef struct XpBatchSourceOps
     void    (*end)(XpBatchSource *src);
 } XpBatchSourceOps;
 
+/*
+ * What a source declares about itself, as opposed to what it produces.
+ *
+ * Deliberately one field. The audit asked which properties a caller actually
+ * varies its behaviour on, and the answer was shorter than expected:
+ *
+ *   supports_rescan     ADDED. ops->rescan is implemented by all five sources
+ *                       and called from exactly one place -- append_rescan(),
+ *                       forwarding to its children -- which nothing calls. So
+ *                       rescan is an unexercised path, and "the callback is
+ *                       non-NULL" was standing in for "rescan works". An
+ *                       external provider that cannot rewind its reader has no
+ *                       way to say so, and leaving ops->rescan NULL would be a
+ *                       null call through a function pointer.
+ *
+ *   supports_projection NOT ADDED. Every source takes the requested columns and
+ *                       delivers exactly those, refusing what it cannot; no
+ *                       source varies, so the flag would have no reader.
+ *
+ *   borrowed_buffers    NOT ADDED. Already stated per column, per batch, by
+ *                       owns_data/owns_validity -- which is the granularity
+ *                       that matters, since one batch mixes borrowed and owned
+ *                       columns.
+ *
+ *   supports_validity   NOT ADDED, though it was the obvious candidate. What a
+ *                       consumer needs is enforcement, and that is
+ *                       xpcb_require_all_valid() on the batch in hand. A
+ *                       declaration would be an early decline at best and a new
+ *                       thing to get wrong at worst: a source that wrongly said
+ *                       "no NULLs" would be believed. The bitmap itself is the
+ *                       truth, and it is checked where it is read.
+ *
+ *   physical order      NOT ADDED, and not to be added until a provider can
+ *                       prove it. R1-11 was a statistic promoted into an
+ *                       ordering guarantee, and it lost rows. A correlation, a
+ *                       sort hint or an observed prefix is never a semantic
+ *                       capability.
+ *
+ * The zero value of every field is the conservative answer, so a source that
+ * does not fill this in is treated as supporting nothing.
+ */
+typedef struct XpBatchSourceCaps
+{
+    bool    supports_rescan;
+} XpBatchSourceCaps;
+
 struct XpBatchSource
 {
     const XpBatchSourceOps *ops;
     void                   *private_state;
+    XpBatchSourceCaps       caps;
 };
+
+/*
+ * Rescan a source, or refuse. The refusal is the point: before this, a caller
+ * either called a callback that might be NULL or assumed that a present
+ * callback meant a working one.
+ */
+static inline void
+xpcb_source_rescan(XpBatchSource *src)
+{
+    if (!src->caps.supports_rescan || src->ops->rescan == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("batch source does not support rescan"),
+                 errdetail("The source did not declare supports_rescan, so it may not be rewound.")));
+    src->ops->rescan(src);
+}
 
 /* ── Validity helpers ── */
 

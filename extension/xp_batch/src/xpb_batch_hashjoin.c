@@ -752,82 +752,71 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
     INSTR_TIME_SET_CURRENT(tb1);
     double build_ms = INSTR_TIME_GET_MILLISEC(tb1) - INSTR_TIME_GET_MILLISEC(tb0);
 
-    /* Source: 4 columns [period_key, company_key, account_key, amount_dt] */
+    /*
+     * Source: 4 columns [period_key, company_key, account_key, amount_dt].
+     *
+     * One lookup, no source-specific construction. The mode string names a
+     * provider -- heap, zlfs and pgcolumnar are registered by xp_batch itself
+     * (xpb_builtin_providers.c), parquet by its optional module -- and
+     * ext:<provider>:<uri> is the same lookup with a uri attached. What is left
+     * here is the benchmark's own schema: which attnos to project and, for the
+     * columnar arm, which relation holds the same rows.
+     */
     XpBatchSource *source;
-    bool need_range_filter = false;     /* set only by the registry branch */
-    if (strcmp(mode, "zlfs") == 0)
+    bool          need_range_filter = false;
     {
-        zlfs_ensure_registry();
-        zlfs_scan_directory();
-        ZlfsZone *zone = zlfs_lookup_valid_zone(fact_relid, lo, hi);
-        if (!zone)
-            ereport(ERROR, (errmsg("no valid ZLFS zone for [%d..%d]", lo, hi)));
-        int16 req_attnos[4] = { 1, 2, 3, 6 };
-        source = xpb_zlfs_source_create(zone, req_attnos, 4);
-    }
-    else if (strcmp(mode, "heap") == 0)
-    {
-        int16 heap_attnos[4] = { 1, 2, 3, 6 };
-        source = xpb_heap_source_create(fact_relid, heap_attnos, 4, true, lo, hi);
-    }
-    else if (strcmp(mode, "pgcolumnar") == 0)
-    {
-        /*
-         * The columnar arm reads reg_buh_col: the same rows as reg_buh, stored
-         * USING pgcolumnar. Two tables rather than one because the comparison
-         * is between storage layers, and a table has exactly one.
-         */
-        int16 pgcn_attnos[4] = { 1, 2, 3, 6 };
-        Oid   col_relid = RelnameGetRelid("reg_buh_col");
-
-        if (!OidIsValid(col_relid))
-            ereport(ERROR, (errmsg("reg_buh_col not found"),
-                            errhint("Create it with benchmarks/common/schema-columnar.sql.")));
-        source = xpcn_source_create(col_relid, pgcn_attnos, 4, true, lo, hi);
-    }
-    else if (strncmp(mode, "ext:", 4) == 0)
-    {
-        /*
-         * ext:<provider>:<uri> -- a registered source, resolved by name.
-         *
-         * Nothing here names a format. The string names a provider and the
-         * provider interprets the uri; this branch knows only the batch
-         * contract and the registry. That is the whole point of the Parquet
-         * series: a new physical source reaches the same operators without a
-         * branch of its own in them.
-         *
-         * The four column names are this benchmark's fact columns, in the
-         * order the pipeline below reads them. A name-keyed source needs names
-         * where a relation source uses attnos {1,2,3,6}; they denote the same
-         * four columns.
-         */
+        static const int16  fact_attnos[4] = { 1, 2, 3, 6 };
         static const char *const fact_cols[4] = {
             "period_key", "company_key", "account_key", "amount_dt"
         };
-        char       *spec = pstrdup(mode + 4);   /* mode stays intact for the NOTICE */
-        char       *sep  = strchr(spec, ':');
         const XpbSourceProvider *prov;
-        XpbSourceRequest req;
+        XpbSourceRequest         req;
+        char                    *pname = mode;
+        const char              *uri = NULL;
+        Oid                      relid = fact_relid;
 
-        if (sep == NULL || sep == spec || sep[1] == '\0')
-            ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("malformed source mode \"%s\"", mode),
-                     errhint("Expected ext:<provider>:<uri>.")));
-        *sep = '\0';
+        if (strncmp(mode, "ext:", 4) == 0)
+        {
+            char *spec = pstrdup(mode + 4);     /* mode stays intact for the NOTICE */
+            char *sep  = strchr(spec, ':');
 
-        prov = xpb_find_source_provider(spec);
+            if (sep == NULL || sep == spec || sep[1] == '\0')
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("malformed source mode \"%s\"", mode),
+                         errhint("Expected ext:<provider>:<uri>.")));
+            *sep = '\0';
+            pname = spec;
+            uri   = sep + 1;
+            relid = InvalidOid;                 /* the uri is the object */
+        }
+        else if (strcmp(mode, "pgcolumnar") == 0)
+        {
+            /*
+             * The columnar arm reads reg_buh_col: the same rows as reg_buh,
+             * stored USING pgcolumnar. Two tables rather than one because the
+             * comparison is between storage layers, and a table has exactly
+             * one. This is the benchmark's mapping, not the provider's.
+             */
+            relid = RelnameGetRelid("reg_buh_col");
+            if (!OidIsValid(relid))
+                ereport(ERROR, (errmsg("reg_buh_col not found"),
+                                errhint("Create it with benchmarks/common/schema-columnar.sql.")));
+        }
+
+        prov = xpb_find_source_provider(pname);
         if (prov == NULL)
             ereport(ERROR,
                     (errcode(ERRCODE_UNDEFINED_OBJECT),
-                     errmsg("no source provider named \"%s\" is registered", spec),
+                     errmsg("no source provider named \"%s\" is registered", pname),
                      errhint("The module that registers it may not be loaded; "
                              "see xpb_source_providers().")));
 
         memset(&req, 0, sizeof(req));
-        req.relid    = InvalidOid;
-        req.uri      = sep + 1;
-        req.colnames = fact_cols;
+        req.relid    = relid;
+        req.uri      = uri;
+        req.attnos   = uri ? NULL : fact_attnos;
+        req.colnames = uri ? fact_cols : NULL;
         req.ncols    = 4;
         req.has_pred = true;
         req.pred_lo  = lo;
@@ -842,8 +831,6 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
          */
         need_range_filter = !prov->filters_rows;
     }
-    else
-        ereport(ERROR, (errmsg("unknown mode: %s", mode)));
 
     /* Pipeline: source → join1(period→year) → join2(account→group) → agg */
     BatchJoinState *js1 = batch_join_create(&dim1, XPCB_BATCH_CAP);

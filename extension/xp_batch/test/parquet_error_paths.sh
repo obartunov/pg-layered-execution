@@ -152,10 +152,23 @@ case "$OUT" in
     *"canceling statement due to statement timeout"*) ok "the timeout fired" ;;
     *) bad "the timeout did not fire: $OUT" ;;
 esac
-# psql start, connect, LOAD and plan are inside this measurement, so the bound is
-# generous; the full scan it replaces is several hundred ms.
-[ "$MS" -lt 150 ] && ok "cancelled promptly (${MS} ms < 150 ms)" \
-                  || bad "not interruptible inside the provider: ${MS} ms"
+# Calibrated, not a magic constant: the same scan without a timeout is measured
+# here, and cancellation has to be a fraction of it. A fixed 150 ms bound passed
+# at 110 ms on an idle host and failed at 170 ms on a busy one, which says
+# nothing about interruptibility -- the question is whether the timeout ends the
+# scan early or only after it finishes.
+T2=$(date +%s%N)
+"${PSQL[@]}" -c "LOAD 'xpb_parquet'; SET client_min_messages=warning;
+       SELECT count(*) FROM xpb_batch_join2_groupby(1,120,'ext:parquet:$PQ_OK')" >/dev/null 2>&1
+T3=$(date +%s%N)
+FULL=$(( (T3 - T2) / 1000000 ))
+echo "          the same scan uninterrupted: ${FULL} ms"
+if [ "$FULL" -lt 50 ]; then
+    echo "  skip    the scan is too fast here to tell cancellation apart (${FULL} ms)"
+else
+    [ "$MS" -lt $(( FULL / 2 )) ] && ok "cancelled early (${MS} ms against ${FULL} ms uninterrupted)" \
+                                  || bad "not interruptible inside the provider: ${MS} ms against ${FULL} ms"
+fi
 
 echo
 echo "############ $pass correct, $fail wrong ############"

@@ -479,8 +479,17 @@ xpcn_end(XpBatchSource *src)
 {
     XpcnBatchState *st = src->private_state;
 
-    PgColumnarEndRead(st->rs);
-    table_close(st->rel, AccessShareLock);
+    /* Idempotent, for the reason given in xpb_heap_end(). */
+    if (st->rs != NULL)
+    {
+        PgColumnarEndRead(st->rs);
+        st->rs = NULL;
+    }
+    if (st->rel != NULL)
+    {
+        table_close(st->rel, AccessShareLock);
+        st->rel = NULL;
+    }
 }
 
 static const XpBatchSourceOps xpcn_batch_ops = {
@@ -597,6 +606,14 @@ xpcn_source_create(Oid relid, int16 *requested_attnos, int ncols,
 
     src = palloc0(sizeof(XpBatchSource));
     src->ops = &xpcn_batch_ops;
+    /*
+     * FALSE, and this is the capability's first real user: xpcn_rescan() raises
+     * an error -- the fold API has no rescan entry point and reopening would
+     * rebuild the projection from state this source does not keep. Declaring
+     * true here (the first guess, corrected by the conformance harness) made a
+     * caller believe it could rewind a source that cannot.
+     */
+    src->caps.supports_rescan = false;
     src->private_state = st;
     return src;
 }

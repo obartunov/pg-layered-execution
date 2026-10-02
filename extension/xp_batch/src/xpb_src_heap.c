@@ -798,6 +798,15 @@ xpb_heap_end(XpBatchSource *src)
 {
     HeapBatchState *st = src->private_state;
 
+    /*
+     * Idempotent. end() may run more than once: a provider that also releases
+     * through a memory-context callback gets both, and the conformance harness
+     * calls it twice on purpose. The buffer pin and the relation lock are the
+     * two that bite -- releasing a pin twice trips
+     * "buffer is not owned by resource owner Portal", which is how this was
+     * found -- so every handle is cleared as it is released and the second call
+     * finds nothing to do.
+     */
     if (st->path != XPB_HEAP_FIXED)
     {
         if (st->scan)
@@ -808,8 +817,15 @@ xpb_heap_end(XpBatchSource *src)
         st->batch_cxt = NULL;
     }
     if (st->vmbuf != InvalidBuffer)
+    {
         ReleaseBuffer(st->vmbuf);
-    table_close(st->rel, AccessShareLock);
+        st->vmbuf = InvalidBuffer;
+    }
+    if (st->rel != NULL)
+    {
+        table_close(st->rel, AccessShareLock);
+        st->rel = NULL;
+    }
 }
 
 static const XpBatchSourceOps heap_batch_ops = {
@@ -952,6 +968,7 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
 
         XpBatchSource *dsrc = palloc(sizeof(XpBatchSource));
         dsrc->ops = &heap_batch_ops;
+        dsrc->caps.supports_rescan = true;   /* a heap scan restarts at block 0 */
         dsrc->private_state = st;
         return dsrc;
     }
@@ -1020,6 +1037,7 @@ xpb_heap_source_create_ex(Oid relid, int16 *requested_attnos, int ncols,
 
     XpBatchSource *src = palloc(sizeof(XpBatchSource));
     src->ops = &heap_batch_ops;
+    src->caps.supports_rescan = true;        /* a heap scan restarts at block 0 */
     src->private_state = st;
     return src;
 }

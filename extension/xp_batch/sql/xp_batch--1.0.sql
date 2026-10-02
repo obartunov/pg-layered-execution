@@ -143,3 +143,12 @@ CREATE OR REPLACE FUNCTION xpb_source_providers()
 RETURNS TABLE (name text, describes boolean)
 LANGUAGE c STRICT
 AS '$libdir/xp_batch', 'xpb_source_providers';
+
+/* Contract conformance, any registered provider. See xpb_conformance.c. */
+CREATE OR REPLACE FUNCTION xpb_source_conformance(
+    provider text, relname text DEFAULT NULL, uri text DEFAULT NULL,
+    attnos int[] DEFAULT NULL, colnames text[] DEFAULT NULL,
+    lo int DEFAULT NULL, hi int DEFAULT NULL)
+RETURNS TABLE("check" text, status text, detail text)
+LANGUAGE C
+AS '$libdir/xp_batch', 'xpb_source_conformance';
