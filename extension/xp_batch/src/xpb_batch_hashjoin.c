@@ -17,6 +17,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "portability/instr_time.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -860,6 +861,14 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
 
     while (true)
     {
+        /*
+         * The join and aggregate loops below are this module's own code and
+         * reach no interrupt point of their own, so a source that is itself
+         * interruptible is not enough. One check per batch is 65 536 rows of
+         * latency at worst.
+         */
+        CHECK_FOR_INTERRUPTS();
+
         in_batch.nrows = 0;
 
         INSTR_TIME_SET_CURRENT(tp);

@@ -71,7 +71,50 @@ typedef struct XpqSourceState
     int         rg_considered;       /* evaluated against the predicate            */
     int         rg_skipped;          /* excluded by declared bounds                */
     int         rg_read;             /* handed to the operators                    */
+
+    /*
+     * Closes the reader when the context this source was created in goes away,
+     * including on transaction abort. Embedded rather than palloc'd because the
+     * context's callback list holds a POINTER to it: a separately allocated
+     * callback that got pfree'd before the reset would leave the list pointing
+     * at freed memory. Nothing pfrees this struct, which is what makes
+     * embedding safe here.
+     */
+    MemoryContextCallback cb;
 } XpqSourceState;
+
+/*
+ * Close the reader, once. Every path that disposes of it goes through here, so
+ * end() and the context callback cannot double-close and an error path cannot
+ * forget.
+ */
+static void
+xpq_release(XpqSourceState *st)
+{
+    if (st->reader != NULL)
+    {
+        xpq_close(st->reader);
+        st->reader = NULL;
+    }
+}
+
+/*
+ * The reader is a C++ object holding an OS file descriptor. It is NOT in a
+ * PostgreSQL memory context, so an ereport anywhere in the pipeline longjmps
+ * past end() and leaks it for the life of the backend -- measured at ~1.3
+ * descriptors per failed query before this existed
+ * (test/parquet_error_paths.sh).
+ *
+ * The context registered on is the one the source was created in, which is the
+ * same context the state struct itself lives in: a caller that resets it while
+ * still using the source has already lost the state, so this cannot free the
+ * reader too early without the caller being broken anyway.
+ */
+static void
+xpq_context_cleanup(void *arg)
+{
+    xpq_release((XpqSourceState *) arg);
+}
 
 /* ────────────────────────────────────────────────────────── next_batch ── */
 
@@ -82,6 +125,16 @@ xpq_next_batch(XpBatchSource *src, XpColumnBatch *batch)
     XpqColumn       cols[XPCB_MAX_COLS];
     char            errbuf[XPQ_ERRBUF];
     int             rg;
+
+    /*
+     * Arrow's call stack has no CHECK_FOR_INTERRUPTS, so without this one a
+     * scan is uninterruptible for its whole duration: a statement_timeout of
+     * 10 ms took 389 ms to fire on a 200-row-group file before it was added
+     * (test/parquet_error_paths.sh). Row-group granularity is the finest this
+     * layer can offer -- one xpq_read_row_group() call is atomic from here --
+     * and that is 50 000 rows, not 10 000 000.
+     */
+    CHECK_FOR_INTERRUPTS();
 
     /* Skip row groups the metadata excluded. */
     /* Skipping happens here, BEFORE any page is decoded: a skipped row group
@@ -156,13 +209,7 @@ xpq_rescan(XpBatchSource *src)
 static void
 xpq_end(XpBatchSource *src)
 {
-    XpqSourceState *st = (XpqSourceState *) src->private_state;
-
-    if (st->reader)
-    {
-        xpq_close(st->reader);
-        st->reader = NULL;
-    }
+    xpq_release((XpqSourceState *) src->private_state);
 }
 
 static const XpBatchSourceOps xpq_ops = {
@@ -231,6 +278,14 @@ xpq_create(const XpbSourceRequest *req)
                  errmsg("xpb_parquet: cannot open \"%s\"", st->path),
                  errdetail("%s", errbuf[0] ? errbuf : "no detail")));
 
+    /*
+     * Registered the moment the reader exists and before anything below can
+     * raise, because from here on an ereport unwinds past end().
+     */
+    st->cb.func = xpq_context_cleanup;
+    st->cb.arg  = st;
+    MemoryContextRegisterResetCallback(CurrentMemoryContext, &st->cb);
+
     /* Resolve the projection by name, and refuse an unknown column rather than
      * silently producing fewer columns than asked for. */
     st->ncols = req->ncols;
@@ -241,7 +296,7 @@ xpq_create(const XpbSourceRequest *req)
 
         if (idx < 0)
         {
-            xpq_close(st->reader);
+            xpq_release(st);
             ereport(ERROR,
                     (errcode(ERRCODE_UNDEFINED_COLUMN),
                      errmsg("xpb_parquet: \"%s\" has no column named \"%s\"",
@@ -256,7 +311,7 @@ xpq_create(const XpbSourceRequest *req)
         for (int p = 0; p < c; p++)
             if (st->cols[p] == idx)
             {
-                xpq_close(st->reader);
+                xpq_release(st);
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("xpb_parquet: column \"%s\" named twice in the projection",
