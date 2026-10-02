@@ -23,7 +23,7 @@
 ARROW_HOME ?= /home/claude/arrow-cpp
 
 MODULE_big = xpb_parquet
-OBJS = src/xpb_parquet_module.o src/xpb_parquet_shim.o
+OBJS = src/xpb_parquet_module.o src/xpb_parquet_shim.o src/xpb_object_reader.o
 
 PG_CPPFLAGS = -I../xp_batch/src -Isrc
 
@@ -38,7 +38,13 @@ include $(PGXS)
 
 # PGXS has no C++ rule. One explicit rule, with the Arrow include path applied
 # here and nowhere else.
-src/xpb_parquet_shim.o: src/xpb_parquet_shim.cpp src/xpb_parquet_shim.h
+src/xpb_parquet_shim.o: src/xpb_parquet_shim.cpp src/xpb_parquet_shim.h src/xpb_object_reader.h
 	g++ -std=c++20 -O2 -fPIC -fvisibility=hidden -Wall \
 	    -I$(ARROW_HOME)/include -Isrc \
 	    -c -o $@ $<
+
+# The byte-range boundary. No Arrow include path: it must not need one, and
+# leaving it out is how that stays true.
+src/xpb_object_reader.o: src/xpb_object_reader.cpp src/xpb_object_reader.h
+	g++ -std=c++20 -O2 -fPIC -fvisibility=hidden -Wall \
+	    -Isrc -c -o $@ $<

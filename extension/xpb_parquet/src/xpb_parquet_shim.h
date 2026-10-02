@@ -107,7 +107,8 @@ int         xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
  * This is PROJECTED COMPRESSED BYTES ATTRIBUTABLE FROM PARQUET METADATA. It is
  * what projection and pruning move, and it is not a measurement of I/O: no
  * syscall is counted, and the page cache is not consulted. Real byte-range
- * accounting belongs in 0005, by wrapping the Arrow file reader.
+ * accounting is xpq_read_calls/xpq_data_bytes below, counted in the
+ * ObjectReader.
  */
 int64_t     xpq_attributed_bytes(const XpqReader *r);
 
@@ -122,10 +123,10 @@ double      xpq_open_ms(const XpqReader *r);          /* footer read + parse    
 double      xpq_decode_ms(const XpqReader *r);        /* cumulative decode         */
 
 /*
- * Real byte-range accounting, counted at the arrow::io::RandomAccessFile
- * wrapper: metadata and data are split at the first column-chunk read, and
- * read_calls counts ReadAt() calls because a hundred small ranges and one large
- * one are different economics at equal bytes.
+ * Real byte-range accounting, counted in the ObjectReader -- the only layer
+ * that sees a physical read. Metadata and data are split at the first
+ * column-chunk read, and read_calls counts physical reads because a hundred
+ * small ranges and one large one are different economics at equal bytes.
  *
  * These three were defined in the shim and never declared here, so the C module
  * called them under C's implicit-declaration rule -- which assumes they return
@@ -135,7 +136,25 @@ double      xpq_decode_ms(const XpqReader *r);        /* cumulative decode      
  */
 int64_t     xpq_meta_bytes(const XpqReader *r);       /* footer + schema bytes     */
 int64_t     xpq_data_bytes(const XpqReader *r);       /* column-chunk bytes read   */
-int64_t     xpq_read_calls(const XpqReader *r);       /* ReadAt() calls            */
+int64_t     xpq_read_calls(const XpqReader *r);       /* physical reads            */
+
+/*
+ * Straight from the ObjectReader, which is the only layer that sees a physical
+ * read. bytes_requested and bytes_returned differ when Arrow coalesces across a
+ * gap: it asks for the span and gets the span, including the chunk in between
+ * that the projection did not want. meta/data calls are counted now, not
+ * derived from byte totals.
+ */
+int64_t     xpq_bytes_requested(const XpqReader *r);
+int64_t     xpq_bytes_returned(const XpqReader *r);
+int64_t     xpq_meta_calls(const XpqReader *r);
+int64_t     xpq_data_calls(const XpqReader *r);
+
+/*
+ * Install the interrupt check used between range reads. Called once from the
+ * module's _PG_init; the hook may longjmp.
+ */
+void        xpq_set_interrupt_hook(void (*hook)(void));
 
 /*
  * Controlled failure for the C/C++ boundary, used by test/parquet_cxx_boundary.sh.

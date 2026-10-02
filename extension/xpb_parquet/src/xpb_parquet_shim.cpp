@@ -10,6 +10,7 @@
  * resources: the provider calls elog only after this layer has returned.
  */
 #include "xpb_parquet_shim.h"
+#include "xpb_object_reader.h"
 
 #include <chrono>
 #include <cstring>
@@ -29,80 +30,100 @@
 namespace {
 
 /*
- * Counting wrapper over the file.
+ * ObjectReader presented as the input Arrow's Parquet reader wants.
  *
- * Deliberately small: it forwards every call and records what was asked for.
- * The point is to separate the bytes read to parse the footer and schema from
- * the bytes read for column chunks -- otherwise open overhead and data volume
- * mix and neither can be explained. read_calls matters on its own: for an
- * object store, a hundred small ranges and one large one are different
- * economics even at equal bytes.
+ * This replaces the former CountingFile, which wrapped an
+ * arrow::io::ReadableFile and counted what Arrow asked it for. The counting
+ * moved down into ObjectReader, which is the only layer that sees a physical
+ * read; what is left here is the adapter, and it is the ONLY Arrow-shaped code
+ * in the byte path.
  *
- * Not an investigation of Arrow internals. It measures what Arrow ASKS the file
- * for, which is one layer above the page cache and one below the OS.
+ * The direction matters. ObjectReader does not inherit from
+ * arrow::io::RandomAccessFile -- Arrow's interface carries Tell/Seek, a stream
+ * position and a Status vocabulary that a byte-range object store has no
+ * opinion about, and inheriting would mean a future S3Reader is written
+ * against Arrow instead of against our contract. So the Arrow shape is
+ * satisfied HERE, by translation, and the position-bearing half of it is
+ * emulated: Arrow's sequential Read() is implemented as read_at(pos_) and a
+ * cursor bump, because the Parquet reader uses it for the footer probe.
  */
-class CountingFile : public arrow::io::RandomAccessFile
+class ArrowObjectInput : public arrow::io::RandomAccessFile
 {
 public:
-    explicit CountingFile(std::shared_ptr<arrow::io::RandomAccessFile> inner)
-        : inner_(std::move(inner)) {}
+    explicit ArrowObjectInput(xpb::ObjectReader *obj) : obj_(obj) {}
 
-    /* Everything read before the first column chunk is open/metadata. */
-    void start_data_phase() { data_phase_ = true; }
+    /* Everything read before the first column chunk is metadata. */
+    void start_data_phase() { obj_->set_phase(xpb::ReadPhase::kData); }
 
-    int64_t meta_bytes()  const { return meta_bytes_; }
-    int64_t data_bytes()  const { return data_bytes_; }
-    int64_t read_calls()  const { return read_calls_; }
+    arrow::Status Close() override { obj_->close(); closed_ = true; return arrow::Status::OK(); }
+    bool closed() const override { return closed_; }
 
-    arrow::Status Close() override { return inner_->Close(); }
-    bool closed() const override { return inner_->closed(); }
-    arrow::Result<int64_t> Tell() const override { return inner_->Tell(); }
-    arrow::Status Seek(int64_t position) override { return inner_->Seek(position); }
-    arrow::Result<int64_t> GetSize() override { return inner_->GetSize(); }
+    arrow::Result<int64_t> Tell() const override { return pos_; }
 
-    arrow::Result<int64_t> Read(int64_t nbytes, void *out) override
+    arrow::Status Seek(int64_t position) override
     {
-        auto res = inner_->Read(nbytes, out);
-        if (res.ok()) account(*res);
-        return res;
+        if (position < 0)
+            return arrow::Status::Invalid("negative seek");
+        pos_ = position;
+        return arrow::Status::OK();
     }
 
-    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override
+    arrow::Result<int64_t> GetSize() override
     {
-        auto res = inner_->Read(nbytes);
-        if (res.ok()) account((*res)->size());
-        return res;
+        int64_t n = obj_->size();
+        if (n < 0)
+            return arrow::Status::IOError(obj_->last_error());
+        return n;
     }
 
     arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void *out) override
     {
-        auto res = inner_->ReadAt(position, nbytes, out);
-        if (res.ok()) account(*res);
-        return res;
+        int64_t got = obj_->read_at(position, nbytes, out);
+        if (got < 0)
+            return arrow::Status::IOError(obj_->last_error());
+        return got;
     }
 
     arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position,
                                                         int64_t nbytes) override
     {
-        auto res = inner_->ReadAt(position, nbytes);
-        if (res.ok()) account((*res)->size());
-        return res;
+        ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
+        int64_t got = obj_->read_at(position, nbytes, buf->mutable_data());
+        if (got < 0)
+            return arrow::Status::IOError(obj_->last_error());
+        if (got < nbytes)
+            ARROW_RETURN_NOT_OK(buf->Resize(got));
+        return std::shared_ptr<arrow::Buffer>(std::move(buf));
+    }
+
+    /* The sequential half, which is what the footer probe uses. */
+    arrow::Result<int64_t> Read(int64_t nbytes, void *out) override
+    {
+        ARROW_ASSIGN_OR_RAISE(int64_t got, ReadAt(pos_, nbytes, out));
+        pos_ += got;
+        return got;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override
+    {
+        ARROW_ASSIGN_OR_RAISE(auto buf, ReadAt(pos_, nbytes));
+        pos_ += buf->size();
+        return buf;
     }
 
 private:
-    void account(int64_t n)
-    {
-        read_calls_++;
-        if (data_phase_) data_bytes_ += n;
-        else             meta_bytes_ += n;
-    }
-
-    std::shared_ptr<arrow::io::RandomAccessFile> inner_;
-    bool    data_phase_ = false;
-    int64_t meta_bytes_ = 0;
-    int64_t data_bytes_ = 0;
-    int64_t read_calls_ = 0;
+    xpb::ObjectReader  *obj_;       /* borrowed; XpqReader owns it */
+    int64_t             pos_ = 0;
+    bool                closed_ = false;
 };
+
+/*
+ * The interrupt hook, injected by the C side (xpq_set_interrupt_hook) so that
+ * this file still includes no PostgreSQL header. Called before each physical
+ * read; it may longjmp, which is why ObjectReader touches nothing before
+ * calling it.
+ */
+xpb::InterruptHook g_interrupt_hook = nullptr;
 
 double now_ms()
 {
@@ -137,8 +158,15 @@ struct XpqReader
 {
     std::unique_ptr<parquet::arrow::FileReader>     arrow_reader;
     std::shared_ptr<parquet::FileMetaData>          md;
-    std::shared_ptr<arrow::io::ReadableFile>        file;
-    std::shared_ptr<CountingFile>                  counted;
+
+    /*
+     * The byte source, and the Arrow-shaped view of it. Order matters for
+     * destruction: the adapter borrows the reader, and Arrow may hold the
+     * adapter, so the reader is released last -- it is declared first and
+     * members are destroyed in reverse.
+     */
+    std::unique_ptr<xpb::ObjectReader>              object;
+    std::shared_ptr<ArrowObjectInput>               input;
 
     /*
      * Holds the decoded row group alive for exactly as long as the provider is
@@ -167,19 +195,33 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
     try
     {
         double t0 = now_ms();
-        auto r = new XpqReader();
 
-        auto fres = arrow::io::ReadableFile::Open(path);
-        if (!fres.ok())
+        /*
+         * unique_ptr, not a raw new: ParquetFileReader::Open() throws
+         * ParquetException on a truncated or corrupt footer, and that throw
+         * lands in the catch handlers below, which cannot see a pointer
+         * declared in here. A raw pointer therefore leaked the reader -- and
+         * with it the open file descriptor -- on every bad file. Ownership is
+         * handed to the caller by release() on the success path only.
+         */
+        std::unique_ptr<XpqReader> r(new XpqReader());
+
+        /*
+         * No pathname below this line. open_file_reader() is the only thing in
+         * the module that touches a local file, and swapping it is the whole
+         * point of the boundary.
+         */
+        std::string oerr;
+        r->object.reset(xpb::open_file_reader(path, &oerr));
+        if (!r->object)
         {
-            set_err(errbuf, errbuflen, fres.status().ToString());
-            delete r;
+            set_err(errbuf, errbuflen, oerr);
             return nullptr;
         }
-        r->file = *fres;
-        r->counted = std::make_shared<CountingFile>(r->file);
+        r->object->set_interrupt_hook(g_interrupt_hook);
+        r->input = std::make_shared<ArrowObjectInput>(r->object.get());
 
-        auto preader = parquet::ParquetFileReader::Open(r->counted);
+        auto preader = parquet::ParquetFileReader::Open(r->input);
         r->md = preader->metadata();
 
         auto st = parquet::arrow::FileReader::Make(
@@ -187,18 +229,15 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
         if (!st.ok())
         {
             set_err(errbuf, errbuflen, st.ToString());
-            delete r;
             return nullptr;
         }
 
-        /* The footer is all that has been read so far; record it so "bytes
-         * read" starts from a true baseline rather than from zero. */
-        auto sz = r->file->GetSize();
-        if (sz.ok())
-            r->attributed_bytes = 0;   /* column-chunk bytes only */
+        /* attributed_bytes counts column-chunk bytes the footer accounts for,
+         * and starts at zero by construction. */
+        r->attributed_bytes = 0;
 
         r->open_ms = now_ms() - t0;
-        return r;
+        return r.release();
     }
     catch (const std::exception &e)
     {
@@ -210,6 +249,12 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
         set_err(errbuf, errbuflen, "unknown C++ exception in xpq_open");
         return nullptr;
     }
+}
+
+void
+xpq_set_interrupt_hook(void (*hook)(void))
+{
+    g_interrupt_hook = hook;
 }
 
 void
@@ -341,7 +386,7 @@ xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
         }
 
         /* Everything read from here on is column-chunk data, not metadata. */
-        r->counted->start_data_phase();
+        r->input->start_data_phase();
 
         double t0 = now_ms();
 
@@ -532,12 +577,26 @@ int64_t xpq_chunks_seen(const XpqReader *r)     { return r ? r->chunks_seen : 0;
 double  xpq_open_ms(const XpqReader *r)         { return r ? r->open_ms : 0.0; }
 double  xpq_decode_ms(const XpqReader *r)       { return r ? r->decode_ms : 0.0; }
 
+/*
+ * Straight from the ObjectReader: it is the only layer that sees a physical
+ * read, so nothing here is derived. meta_calls/data_calls in particular are
+ * now COUNTED -- the previous note that metadata_calls was "derived, not
+ * measured" no longer applies.
+ */
 int64_t xpq_meta_bytes(const XpqReader *r)
-{ return (r && r->counted) ? r->counted->meta_bytes() : 0; }
+{ return (r && r->object) ? r->object->meta_bytes() : 0; }
 int64_t xpq_data_bytes(const XpqReader *r)
-{ return (r && r->counted) ? r->counted->data_bytes() : 0; }
+{ return (r && r->object) ? r->object->data_bytes() : 0; }
 int64_t xpq_read_calls(const XpqReader *r)
-{ return (r && r->counted) ? r->counted->read_calls() : 0; }
+{ return (r && r->object) ? r->object->read_calls() : 0; }
+int64_t xpq_bytes_requested(const XpqReader *r)
+{ return (r && r->object) ? r->object->bytes_requested() : 0; }
+int64_t xpq_bytes_returned(const XpqReader *r)
+{ return (r && r->object) ? r->object->bytes_returned() : 0; }
+int64_t xpq_meta_calls(const XpqReader *r)
+{ return (r && r->object) ? r->object->meta_calls() : 0; }
+int64_t xpq_data_calls(const XpqReader *r)
+{ return (r && r->object) ? r->object->data_calls() : 0; }
 
 /*
  * Controlled failure for the exception boundary.

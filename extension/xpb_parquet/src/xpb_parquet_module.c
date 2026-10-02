@@ -457,9 +457,22 @@ static const XpbSourceProvider parquet_provider = {
     .filters_rows = false,
 };
 
+/*
+ * Between range reads, which is the finest granularity this layer can offer:
+ * a pread() already in the kernel is not interruptible, and the check in
+ * xpq_next_batch() fires once per row group -- 50 000 rows apart in the
+ * benchmark file, and whatever the writer chose in any other.
+ */
+static void
+xpq_interrupt_check(void)
+{
+    CHECK_FOR_INTERRUPTS();
+}
+
 void
 _PG_init(void)
 {
+    xpq_set_interrupt_hook(xpq_interrupt_check);
     xpb_register_source_provider(&parquet_provider);
 }
 
@@ -639,7 +652,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(20);
+    tupdesc = CreateTemplateTupleDesc(24);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -660,6 +673,11 @@ xpq_scan(PG_FUNCTION_ARGS)
     TupleDescInitEntry(tupdesc, 18, "data_bytes",     INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 19, "read_calls",     INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 20, "decode_ms",      FLOAT8OID, -1, 0);
+    /* From the ObjectReader: counted, not derived. */
+    TupleDescInitEntry(tupdesc, 21, "bytes_requested", INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 22, "bytes_returned",  INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 23, "meta_calls",      INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 24, "data_calls",      INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -669,8 +687,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[20];
-        bool    nulls[20] = {false};
+        Datum   vals[24];
+        bool    nulls[24] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -694,6 +712,10 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[17] = Int64GetDatum(xpq_data_bytes(st->reader));
         vals[18] = Int64GetDatum(xpq_read_calls(st->reader));
         vals[19] = Float8GetDatum(xpq_decode_ms(st->reader));
+        vals[20] = Int64GetDatum(xpq_bytes_requested(st->reader));
+        vals[21] = Int64GetDatum(xpq_bytes_returned(st->reader));
+        vals[22] = Int64GetDatum(xpq_meta_calls(st->reader));
+        vals[23] = Int64GetDatum(xpq_data_calls(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 
