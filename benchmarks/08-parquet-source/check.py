@@ -222,7 +222,9 @@ def main():
          "nulls_first_col bigint, row_groups_total int, row_groups_read int, "
          "row_groups_skipped int, decoded_values bigint, attributed_bytes bigint, "
          "copy_bytes bigint, arrow_chunks bigint, "
-         "row_groups_stats_available int, row_groups_considered int) "
+         "row_groups_stats_available int, row_groups_considered int, "
+         "min_last_col bigint, max_last_col bigint, null_key_sum bigint, "
+         "meta_bytes bigint, data_bytes bigint, read_calls bigint, decode_ms float8) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
     npass = nfail = 0
@@ -532,6 +534,140 @@ def main():
         ]:
             if xcheck(f"no statistics: {nm}", w, gg): npass_x += 1
             else: nfail_x += 1
+
+    # ─────────────────────────── the milestone's actual contract (0005) ──
+    print()
+    print("=== the contract this milestone had to prove ===")
+    print("Parquet -> projected columns -> decoded typed buffers -> XpBatchColumn")
+    print("-> existing operators. Everything else is secondary.")
+    print()
+
+    def one(sql):
+        return psql("LOAD 'xpb_parquet'; " + sql)
+
+    # (2) int32/int64 arrive undistorted. min/max catch a width or sign error
+    #     that a sum could absorb.
+    r = one(f"SELECT min_last_col||'|'||max_last_col FROM "
+            f"xpq_scan('{PARQUET}','order_id,amount')")
+    pg = psql("SELECT min(amount)||'|'||max(amount) FROM pq_orders")
+    if xcheck("int values undistorted (min|max of amount)", pg, r): npass_x += 1
+    else: nfail_x += 1
+
+    r = one(f"SELECT min_last_col||'|'||max_last_col FROM "
+            f"xpq_scan('{PARQUET}','order_id,quantity')")
+    pg = psql("SELECT min(quantity)||'|'||max(quantity) FROM pq_orders")
+    if xcheck("int32 extremes undistorted (INT32_MIN/MAX present)", pg, r): npass_x += 1
+    else: nfail_x += 1
+
+    # (3) NULL validity is correct POSITIONALLY, not just in count. This sums
+    #     order_id at every row where amount is NULL: a validity bitmap off by
+    #     one bit gives a different total, which a null COUNT would not notice.
+    #     The shim does pointer arithmetic on that bitmap, so this is the test
+    #     that matters.
+    r = one(f"SELECT null_key_sum FROM xpq_scan('{PARQUET}','order_id,amount')")
+    pg = psql("SELECT sum(order_id)::text FROM pq_orders WHERE amount IS NULL")
+    if xcheck("validity aligned (sum of keys at NULL rows)", pg, r): npass_x += 1
+    else: nfail_x += 1
+
+    # (6) no extra copies, and no tuple materialization anywhere in the path.
+    r = one(f"SELECT copy_bytes FROM xpq_scan('{PARQUET}','order_date_key,customer_id,amount')")
+    if xcheck("no copies: every column borrowed", "0", r): npass_x += 1
+    else: nfail_x += 1
+
+    import subprocess as sp
+    src = os.path.join(HERE, "..", "..", "extension")
+    def grep_count(pattern, path):
+        out = sp.run(["grep", "-rIl", "-e", pattern, path],
+                     capture_output=True, text=True)
+        return [l for l in out.stdout.strip().splitlines() if l]
+
+    # (5) the generic operators must not know the source is Parquet.
+    #
+    # Grepping for the WORD was the first attempt and it was wrong twice over:
+    # it flagged xpb_source.h and xpb_source_registry.c, which mention Parquet
+    # in comments as the motivation for the registry and contain no dependency,
+    # and it matched "arrow" inside "narrow". The property is a DEPENDENCY, not
+    # a vocabulary, so test the dependency:
+    #
+    #   no Arrow/Parquet header is included anywhere in xp_batch
+    #   no symbol from the shim (xpq_ prefix) is referenced
+    #
+    # The decisive machine-level check lives in optional_module.sh, which
+    # asserts xp_batch.so has zero undefined arrow/parquet symbols.
+    hits = grep_count("#include.*arrow\\|#include.*parquet",
+                      os.path.join(src, "xp_batch", "src"))
+    if xcheck("xp_batch includes no Arrow/Parquet header", "0", str(len(hits))):
+        npass_x += 1
+    else:
+        print(f"            hits: {hits}"); nfail_x += 1
+
+    hits = grep_count("xpq_", os.path.join(src, "xp_batch", "src"))
+    if xcheck("xp_batch references no shim symbol", "0", str(len(hits))):
+        npass_x += 1
+    else:
+        print(f"            hits: {hits}"); nfail_x += 1
+
+    # no HeapTuple built in the provider path
+    hits = grep_count("heap_form_tuple\|ExecStoreVirtualTuple\|heap_deform_tuple",
+                      os.path.join(src, "xpb_parquet", "src"))
+    if xcheck("no tuple materialization in the Parquet path", "0", str(len(hits))):
+        npass_x += 1
+    else:
+        print(f"            hits: {hits}")
+        nfail_x += 1
+
+    # ── physical work: the control Oleg asked for ──
+    print()
+    print("=== pruning removes PHYSICAL work, not just downstream rows ===")
+    allp = one(f"SELECT rows||'|'||row_groups_read||'|'||decoded_values||'|'"
+               f"||data_bytes||'|'||meta_bytes||'|'||read_calls "
+               f"FROM xpq_scan('{PARQUET}','order_date_key,amount',20990101,20990201)")
+    k = allp.split("|")
+    for nm, w, g in [("rows", "0", k[0]), ("row groups read", "0", k[1]),
+                     ("decoded values", "0", k[2]), ("DATA bytes read", "0", k[3])]:
+        if xcheck(f"all pruned: {nm}", w, g): npass_x += 1
+        else: nfail_x += 1
+    print(f"            metadata still read: {k[4]} bytes in {k[5]} call(s) -- open cost is real")
+
+    # ── two timing pictures, kept apart on purpose ──
+    print()
+    print("=== timing: internal stages and end-to-end, NOT mixed ===")
+    print("Keeping them separate because emit once lived outside total_ms in")
+    print("this project and the number quietly understated the query.")
+    print()
+    for label, cols, pred in [
+        ("full scan, 2 of 10 cols", "order_date_key,amount", ""),
+        ("projected, 3 of 10",      "order_date_key,customer_id,amount", ""),
+        ("pruned to 1 row group",   "order_date_key,amount", ", 20260301, 20260400"),
+        ("pruned to nothing",       "order_date_key,amount", ", 20990101, 20990201"),
+    ]:
+        row = one(f"SELECT round(decode_ms::numeric,2)||'|'||data_bytes||'|'"
+                  f"||decoded_values FROM xpq_scan('{PARQUET}','{cols}'{pred})")
+        dec, db, dv = row.split("|")
+        t0 = __import__("time").time()
+        one(f"SELECT rows FROM xpq_scan('{PARQUET}','{cols}'{pred})")
+        wall = (__import__("time").time() - t0) * 1000
+        print(f"  {label:<26} decode {dec:>7} ms   data {db:>9} B   "
+              f"decoded {dv:>8}   end-to-end ~{wall:.0f} ms (incl. psql+connect)")
+    print()
+    print("  decode_ms is inside the provider; end-to-end includes process start,")
+    print("  connection and the probe's own row loop. They are different numbers")
+    print("  and are not to be subtracted from one another.")
+
+    print()
+    print("=== multi-chunk fallback: implemented, NOT exercised ===")
+    print("  Arrow returned ONE chunk per column per row group in every case")
+    print("  measured, including a single row group of 400 000 rows written with")
+    print("  4 KB data pages. The reader concatenates pages into one contiguous")
+    print("  array per column, and the provider reads one row group at a time, so")
+    print("  neither route to a fragmented column is reachable here.")
+    print()
+    print("  The concatenate-and-count-copy_bytes branch therefore remains")
+    print("  unexercised code. It was kept rather than removed because a varlena")
+    print("  or binary column can chunk on size limits, and because the")
+    print("  alternative was a fragmented-column abstraction in the batch")
+    print("  contract for a case that does not arise. Stated as untested rather")
+    print("  than claimed as working.")
 
     print()
     print(f"############ postgres/pyarrow: {npass} agree, {nfail} differ ############")

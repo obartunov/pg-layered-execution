@@ -27,6 +27,82 @@
 
 namespace {
 
+/*
+ * Counting wrapper over the file.
+ *
+ * Deliberately small: it forwards every call and records what was asked for.
+ * The point is to separate the bytes read to parse the footer and schema from
+ * the bytes read for column chunks -- otherwise open overhead and data volume
+ * mix and neither can be explained. read_calls matters on its own: for an
+ * object store, a hundred small ranges and one large one are different
+ * economics even at equal bytes.
+ *
+ * Not an investigation of Arrow internals. It measures what Arrow ASKS the file
+ * for, which is one layer above the page cache and one below the OS.
+ */
+class CountingFile : public arrow::io::RandomAccessFile
+{
+public:
+    explicit CountingFile(std::shared_ptr<arrow::io::RandomAccessFile> inner)
+        : inner_(std::move(inner)) {}
+
+    /* Everything read before the first column chunk is open/metadata. */
+    void start_data_phase() { data_phase_ = true; }
+
+    int64_t meta_bytes()  const { return meta_bytes_; }
+    int64_t data_bytes()  const { return data_bytes_; }
+    int64_t read_calls()  const { return read_calls_; }
+
+    arrow::Status Close() override { return inner_->Close(); }
+    bool closed() const override { return inner_->closed(); }
+    arrow::Result<int64_t> Tell() const override { return inner_->Tell(); }
+    arrow::Status Seek(int64_t position) override { return inner_->Seek(position); }
+    arrow::Result<int64_t> GetSize() override { return inner_->GetSize(); }
+
+    arrow::Result<int64_t> Read(int64_t nbytes, void *out) override
+    {
+        auto res = inner_->Read(nbytes, out);
+        if (res.ok()) account(*res);
+        return res;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override
+    {
+        auto res = inner_->Read(nbytes);
+        if (res.ok()) account((*res)->size());
+        return res;
+    }
+
+    arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void *out) override
+    {
+        auto res = inner_->ReadAt(position, nbytes, out);
+        if (res.ok()) account(*res);
+        return res;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position,
+                                                        int64_t nbytes) override
+    {
+        auto res = inner_->ReadAt(position, nbytes);
+        if (res.ok()) account((*res)->size());
+        return res;
+    }
+
+private:
+    void account(int64_t n)
+    {
+        read_calls_++;
+        if (data_phase_) data_bytes_ += n;
+        else             meta_bytes_ += n;
+    }
+
+    std::shared_ptr<arrow::io::RandomAccessFile> inner_;
+    bool    data_phase_ = false;
+    int64_t meta_bytes_ = 0;
+    int64_t data_bytes_ = 0;
+    int64_t read_calls_ = 0;
+};
+
 double now_ms()
 {
     using namespace std::chrono;
@@ -61,6 +137,7 @@ struct XpqReader
     std::unique_ptr<parquet::arrow::FileReader>     arrow_reader;
     std::shared_ptr<parquet::FileMetaData>          md;
     std::shared_ptr<arrow::io::ReadableFile>        file;
+    std::shared_ptr<CountingFile>                  counted;
 
     /*
      * Holds the decoded row group alive for exactly as long as the provider is
@@ -99,8 +176,9 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
             return nullptr;
         }
         r->file = *fres;
+        r->counted = std::make_shared<CountingFile>(r->file);
 
-        auto preader = parquet::ParquetFileReader::Open(r->file);
+        auto preader = parquet::ParquetFileReader::Open(r->counted);
         r->md = preader->metadata();
 
         auto st = parquet::arrow::FileReader::Make(
@@ -246,6 +324,9 @@ xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
             set_err(errbuf, errbuflen, "xpq_read_row_group: bad arguments");
             return -1;
         }
+
+        /* Everything read from here on is column-chunk data, not metadata. */
+        r->counted->start_data_phase();
 
         double t0 = now_ms();
 
@@ -435,5 +516,12 @@ int     xpq_row_groups_read(const XpqReader *r) { return r ? r->row_groups_read 
 int64_t xpq_chunks_seen(const XpqReader *r)     { return r ? r->chunks_seen : 0; }
 double  xpq_open_ms(const XpqReader *r)         { return r ? r->open_ms : 0.0; }
 double  xpq_decode_ms(const XpqReader *r)       { return r ? r->decode_ms : 0.0; }
+
+int64_t xpq_meta_bytes(const XpqReader *r)
+{ return (r && r->counted) ? r->counted->meta_bytes() : 0; }
+int64_t xpq_data_bytes(const XpqReader *r)
+{ return (r && r->counted) ? r->counted->data_bytes() : 0; }
+int64_t xpq_read_calls(const XpqReader *r)
+{ return (r && r->counted) ? r->counted->read_calls() : 0; }
 
 }   /* extern "C" */

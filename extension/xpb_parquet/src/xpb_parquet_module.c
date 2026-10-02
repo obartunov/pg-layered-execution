@@ -433,6 +433,19 @@ xpq_scan(PG_FUNCTION_ARGS)
     int64           rows = 0, nbatches = 0, nulls_col0 = 0;
     int64           sum_last = 0;
     bool            sum_overflow = false;
+    /*
+     * Per-value fidelity, not just aggregates.
+     *
+     * min/max of the last projected column catch a width or sign error that a
+     * sum could absorb. null_key_sum is the sharp one: it sums the FIRST
+     * column's value at every row where the LAST column is NULL, so a validity
+     * bitmap that is off by even one bit gives a different total. Counting
+     * nulls alone would not notice a shifted bitmap, and the shim does
+     * pointer arithmetic on that bitmap.
+     */
+    int64           min_last = PG_INT64_MAX, max_last = PG_INT64_MIN;
+    int64           null_key_sum = 0;
+    bool            saw_value = false;
 
     if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
         ereport(ERROR,
@@ -499,6 +512,13 @@ xpq_scan(PG_FUNCTION_ARGS)
             if (xpcb_isnull(&batch, 0, rr))
                 nulls_col0++;
 
+            if (xpcb_isnull(&batch, last, rr))
+            {
+                int64 key = c0_i32 ? (int64) c0_i32[rr] : c0_i64[rr];
+
+                null_key_sum += key;
+            }
+
             /* Sum the LAST projected column, skipping NULLs -- SQL sum()
              * semantics, so the harness can compare against PostgreSQL. */
             if (!xpcb_isnull(&batch, last, rr))
@@ -510,6 +530,9 @@ xpq_scan(PG_FUNCTION_ARGS)
                     sum_overflow = true;
                     sum_last = 0;
                 }
+                if (v < min_last) min_last = v;
+                if (v > max_last) max_last = v;
+                saw_value = true;
             }
         }
         (void) c0_i32; (void) c0_i64;
@@ -517,7 +540,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(13);
+    tupdesc = CreateTemplateTupleDesc(20);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -531,6 +554,13 @@ xpq_scan(PG_FUNCTION_ARGS)
     TupleDescInitEntry(tupdesc, 11, "arrow_chunks",    INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 12, "row_groups_stats_available", INT4OID, -1, 0);
     TupleDescInitEntry(tupdesc, 13, "row_groups_considered",      INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 14, "min_last_col",   INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 15, "max_last_col",   INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 16, "null_key_sum",   INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 17, "meta_bytes",     INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 18, "data_bytes",     INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 19, "read_calls",     INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 20, "decode_ms",      FLOAT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -540,9 +570,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[13];
-        bool    nulls[13] = {false, false, false, false, false, false, false,
-                             false, false, false, false, false, false};
+        Datum   vals[20];
+        bool    nulls[20] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -558,6 +587,14 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[10] = Int64GetDatum(xpq_chunks_seen(st->reader));
         vals[11] = Int32GetDatum(st->rg_stats_available);
         vals[12] = Int32GetDatum(st->rg_considered);
+        if (saw_value) { vals[13] = Int64GetDatum(min_last);
+                         vals[14] = Int64GetDatum(max_last); }
+        else           { nulls[13] = true; nulls[14] = true; }
+        vals[15] = Int64GetDatum(null_key_sum);
+        vals[16] = Int64GetDatum(xpq_meta_bytes(st->reader));
+        vals[17] = Int64GetDatum(xpq_data_bytes(st->reader));
+        vals[18] = Int64GetDatum(xpq_read_calls(st->reader));
+        vals[19] = Float8GetDatum(xpq_decode_ms(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 
