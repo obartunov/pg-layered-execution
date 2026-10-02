@@ -1,6 +1,11 @@
 # XpGroupAgg2 STREAM page-skip is unsound on non-monotonic data
 
-**Status: open blocker. Found 2026-10-01 auditing the correlation cost gate.**
+**Status: FIXED in `a3a6ba5`. Found 2026-10-01 auditing the correlation cost
+gate; closed the same day.** Regression:
+`test/reproducers/groupagg2_desc_stream_exit.sh`, 14/14. What was done and what
+was deliberately not done is recorded in R1-11 of
+`docs/roadmap/silent-drop-reachability.md`; this file is kept as the account of
+the defect itself.
 Reproducer: `extension/xp_batch/test/reproducers/groupagg2_desc_stream_exit.sh`
 (fails on purpose: 7 correct, 5 wrong). Full analysis:
 `docs/GROUPAGG2_COST_GATE_AUDIT.md`.
@@ -49,14 +54,14 @@ nearly-sorted table, plus a `<=` or `BETWEEN` predicate on the group key.
 the wrong answer is returned. The feature is not production-ready while the
 correctness of its main mechanism depends on an unverified statistical property.
 
-## Why it was not fixed in the session that found it
+## Why it was not fixed in the session that found it (historical)
 
 The minimal correct fix is inside the cost gate, and the brief that produced
 this finding forbids touching the cost gate (§12) and forbids fixing the
 correlation dependency (§15). The choice between the options below is
 architectural, not mechanical, so it belongs to @obe / @yoda.
 
-## Options, increasing cost and increasing honesty
+## Options considered (option 3 was taken: remove the skip)
 
 1. **Narrow the gate.** `correlation >= threshold` instead of `fabs(...)`.
    Closes the descending zero-row case only. The nearly-sorted row loss survives
@@ -96,7 +101,11 @@ SELECT count(*), sum(s)  FROM (SELECT k1,k2,sum(v) AS s FROM t WHERE ... GROUP B
 
 ## `EXPLAIN (ANALYZE, VERBOSE)` on XpGroupAgg2 hangs uninterruptibly
 
-**Status: open blocker, separate from the one above.**
+**Status: FIXED in `7a75164`, separate defect from the one above.**
+Regression: `test/reproducers/groupagg2_explain_verbose.sh`, 3/3, with every
+psql call wrapped in a client-side timeout because statement_timeout provably
+cannot end this failure mode. Recorded as R1-12 in
+`docs/roadmap/silent-drop-reachability.md`.
 
 ```sql
 -- returns in 0.04 ms

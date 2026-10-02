@@ -278,27 +278,32 @@ Per the project rule, this is stated as a blocker rather than fixed here: the
 brief forbids touching the cost gate (§12) and the minimal correct fix lives
 inside it.
 
-## Possible next experiment
+## Resolution
 
-Not an experiment — a correctness decision, for @obe / @yoda. Three shapes, in
-increasing cost and increasing honesty:
+Option 3 was taken: the predicate-driven page skip is gone (`a3a6ba5`), and the
+`EXPLAIN (VERBOSE)` hang was a separate defect with a separate fix (`7a75164`).
+Both are recorded as R1-11 and R1-12 in
+`docs/roadmap/silent-drop-reachability.md`, with regressions at 14/14 and 3/3.
 
-1. **Narrow the gate to what the mechanism needs.** Replace
-   `fabs(correlation) >= 0.8` with `correlation >= <threshold>` so descending
-   data is refused. This closes the zero-row case and nothing else; the
-   nearly-sorted row loss remains at any threshold below 1.0.
-2. **Make the early exit verify instead of assume.** Keep the gate as a
-   performance heuristic, and make the Class-1 skip/exit sound at runtime —
-   track the leading key across pages and abandon the skip (not the scan) the
-   moment order is violated. This is the only option that makes correctness
-   independent of a statistic.
-3. **Drop the predicate-driven page skip until (2) exists**, keeping STREAM only
-   as an output-ordering claim validated over tuples actually seen.
+The correlation gate was left byte-identical. It is no longer load-bearing for
+correctness, so it is now what its name always claimed: a performance heuristic
+choosing between STREAM and hash. That it has never been *validated* as a
+performance heuristic is a separate, open question — the 0.8 threshold and the
+`fabs` are still unexamined on that axis, and nothing here measured whether the
+node actually loses to `HashAggregate` below 0.8.
 
-Whichever is chosen, `groupagg2_desc_stream_exit.sh` converts from reproducer to
-regression, and the reachability map gains these two cases.
+The open question this audit raised about `can_skip_prefix` — sound or merely
+lucky — was settled while fixing: **unsound**. It compared only the first and
+last tuple on the page, so a middle tuple inside the range on an unordered page
+was skipped. It is removed, not repaired.
 
-Before any of them, one question is worth settling because it may change the
-scope: the Class-1 skip logic also exists for the lower bound
-(`can_skip_prefix`), and it was *not* observed to lose rows here. Whether that
-is soundness or luck has not been established.
+## Still open, not blockers
+
+- The 0.8 gate as a *performance* heuristic is unmeasured. A path that is
+  refused is never costed, so the planner cannot be said to have compared
+  anything.
+- `SELECT sum(v) FROM t WHERE k1 <= 500` is refused although `XpPageAgg` covers
+  it semantically. Coverage is not the gap there; selection is.
+- A sound page skip would need real per-page bounds, which means visiting every
+  tuple on the page. Whether that is worth it is a measurement question that
+  nothing in this phase answers.
