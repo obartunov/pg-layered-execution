@@ -18,11 +18,16 @@ the file is reproducible byte for byte.
 
 PostgreSQL over imported rows, plus pyarrow over the same Parquet file.
 
-**DuckDB was the task's suggested third party and is not available in this
-container** — no distribution package, no binary. It was not added merely to
-satisfy the original wording. The substitution is two independent
-implementations, one of which reads the actual Parquet file, and it is recorded
-in the harness output itself rather than only here.
+DuckDB was the task's suggested third party. This README previously said it was
+unavailable in this container; that was wrong — no distribution package or binary
+exists, but `pip install duckdb` provides the full engine through its Python
+binding, and benchmark 02 now runs a `duckdb_parquet` arm over the same file as
+the `xpb_parquet` arm.
+
+This harness is left on PostgreSQL + pyarrow, which is what it was built and
+verified against. Both are independent implementations and one reads the actual
+Parquet file; the third-party comparison lives in benchmark 02, where there is a
+shared query to compare on.
 
 ## Dataset shape
 
