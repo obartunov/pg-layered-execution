@@ -23,10 +23,41 @@ set -uo pipefail
 
 PORT="${1:-5432}"
 PGHOST_ARG="${2:-}"
-DB="${3:-sdaudit}"
 
-PSQL=(psql -p "$PORT" -d "$DB" -X -qAt)
-[ -n "$PGHOST_ARG" ] && PSQL+=(-h "$PGHOST_ARG")
+#
+# Fixture isolation.  This script builds reg_buh, dim_period, dim_account,
+# pt_parent, pa_t and ga_t -- the benchmark's own names, because several of the
+# C entry points resolve those names themselves -- and drops them unqualified.
+# It used to take the database as $3, so pointing it at a populated database
+# destroyed the 10M-row benchmark dataset.  That happened.
+#
+# It now creates and drops its own database, which is the pattern
+# heap_layout_guard.sh already uses for the same reason.  A third argument is
+# still accepted and WARNED about, for the rare case of reproducing against a
+# specific database by hand.
+#
+DB="${3:-}"
+OWN_DB=no
+if [ -z "$DB" ]; then
+    DB="xpb_sdmap_$$"
+    OWN_DB=yes
+else
+    echo "!! using the database you named ($DB): this script DROPS reg_buh," >&2
+    echo "!! dim_period, dim_account, pt_parent, pa_t and ga_t in it." >&2
+fi
+
+PSQLBASE=(psql -p "$PORT" -X -qAt)
+[ -n "$PGHOST_ARG" ] && PSQLBASE+=(-h "$PGHOST_ARG")
+
+if [ "$OWN_DB" = yes ]; then
+    "${PSQLBASE[@]}" -d postgres -c "CREATE DATABASE $DB" >/dev/null || {
+        echo "cannot create database $DB" >&2; exit 2; }
+    trap '"${PSQLBASE[@]}" -d postgres -c "DROP DATABASE IF EXISTS $DB" >/dev/null 2>&1' EXIT
+    "${PSQLBASE[@]}" -d "$DB" -c "CREATE EXTENSION xp_batch" >/dev/null || {
+        echo "cannot create extension xp_batch in $DB" >&2; exit 2; }
+fi
+
+PSQL=("${PSQLBASE[@]}" -d "$DB")
 
 # The shared ZLFS directory accumulates zone files from dropped relations and
 # warns about each one; that is environment noise, not part of any result.
