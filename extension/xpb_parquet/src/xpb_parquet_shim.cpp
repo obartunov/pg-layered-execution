@@ -250,12 +250,26 @@ xpq_column_index(const XpqReader *r, const char *name)
     return -1;
 }
 
+/*
+ * Guarded although it looks like the trivial accessors above it:
+ * FileMetaData::RowGroup() returns a unique_ptr and therefore allocates, so a
+ * std::bad_alloc could escape where the others cannot throw at all -- they
+ * bounds-check and then read parsed footer structures, with
+ * SchemaDescriptor::Column() returning a borrowed pointer and num_*() returning
+ * a member. An exception crossing this ABI is undefined behaviour, so the rule
+ * is that no entry point may throw; the ones without a try block are the ones
+ * where that holds by construction.
+ */
 int64_t
 xpq_row_group_rows(const XpqReader *r, int rg)
 {
-    if (!r || !r->md || rg < 0 || rg >= r->md->num_row_groups())
-        return 0;
-    return r->md->RowGroup(rg)->num_rows();
+    try
+    {
+        if (!r || !r->md || rg < 0 || rg >= r->md->num_row_groups())
+            return 0;
+        return r->md->RowGroup(rg)->num_rows();
+    }
+    catch (...) { return 0; }
 }
 
 int
