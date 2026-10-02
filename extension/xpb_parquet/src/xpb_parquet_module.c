@@ -382,6 +382,14 @@ static const XpbSourceProvider parquet_provider = {
     .name     = "parquet",
     .create   = xpq_create,
     .describe = xpq_describe,
+
+    /*
+     * Stated, not left to the zero value: this provider uses req->has_pred to
+     * exclude whole row groups and does NOT drop individual rows, so the caller
+     * owns the predicate. xpq_next_batch() hands back every row of every row
+     * group it reads.
+     */
+    .filters_rows = false,
 };
 
 void

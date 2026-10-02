@@ -73,6 +73,26 @@ typedef struct XpbSourceProvider
     XpBatchSource  *(*create)(const XpbSourceRequest *req);
 
     /*
+     * Does this provider APPLY req->has_pred as a row filter, or only use it
+     * to skip work?
+     *
+     * This is not an optimisation hint. It decides who is responsible for the
+     * predicate, and getting it wrong is a wrong answer, not a slow one: the
+     * heap and zlfs sources drop non-matching rows themselves
+     * (xpb_src_heap.c:329), while the Parquet provider uses the range only to
+     * exclude whole row groups and hands back every row of the row groups it
+     * reads. A caller that assumed the first behaviour and got the second
+     * would return rows outside the predicate.
+     *
+     * false (the zero value, so the default for a provider that does not think
+     * about this) means the CALLER must apply the predicate. That direction is
+     * the safe one: a redundant filter over already-filtered rows costs a pass
+     * and changes no answer, whereas the opposite default would turn a
+     * forgotten field into silently wrong output.
+     */
+    bool            filters_rows;
+
+    /*
      * Optional. Lets a caller ask what the provider will produce before
      * constructing it -- which is what projection pushdown needs in order to
      * type the batch. A provider that cannot answer leaves this NULL and the

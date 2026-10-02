@@ -22,6 +22,7 @@
 #include "utils/snapmgr.h"
 
 #include "xpb_colbatch.h"
+#include "xpb_source.h"
 #include "xpb_zlfs.h"
 #include "utils/tuplestore.h"
 
@@ -618,6 +619,94 @@ typedef struct J2GroupEntry
     bool    occupied;
 } J2GroupEntry;
 
+/*
+ * ── Generic range select ──
+ *
+ * Keep the rows of a batch whose column `col` lies in the closed range
+ * [lo, hi]. This is an operator over the batch contract and nothing else: it
+ * names no source, no format and no relation, and it is the same shape as the
+ * two join probes above -- borrow when every row survives, gather through a
+ * selection vector when they do not.
+ *
+ * It exists because the predicate in XpbSourceRequest is a REQUEST, and a
+ * provider may answer it by filtering rows (heap, zlfs) or only by skipping
+ * work (Parquet row-group pruning). XpbSourceProvider.filters_rows says which,
+ * and when it is false this operator is what applies the predicate. Without it
+ * a pruning-only source returns the rows of every row group that overlaps the
+ * range, including the ones outside it.
+ */
+typedef struct BatchRangeSel
+{
+    int      col;
+    int64    lo;
+    int64    hi;
+    uint32  *sel;
+    int      capacity;
+} BatchRangeSel;
+
+static void
+batch_range_select(BatchRangeSel *rs, XpColumnBatch *in, XpColumnBatch *out)
+{
+    int     nrows = in->nrows;
+    int32  *key;
+    int     nsel = 0;
+
+    if (nrows > rs->capacity)
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("batch_range_select: batch of %d rows exceeds selection capacity %d",
+                        nrows, rs->capacity)));
+
+    /*
+     * Refused, not ignored. Compacting a column with a validity bitmap means
+     * rebuilding the bitmap at the new row positions, and this operator does
+     * not. Dropping the bitmap instead would turn a NULL into whatever the
+     * source left in the data slot -- the hazard already recorded for the four
+     * operator files that never call xpcb_isnull()
+     * (docs/roadmap/silent-drop-reachability.md, "validity is ignored by four
+     * operator files"). Refusing keeps this operator from adding a fifth.
+     */
+    for (int c = 0; c < in->ncols; c++)
+        if (in->cols[c].validity != NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("batch_range_select: column %d carries a validity bitmap", c),
+                     errdetail("Row compaction would have to rebuild the bitmap; this operator does not.")));
+
+    key = xpcb_i32(in, rs->col);        /* type-checked dispatch, once */
+
+    for (int i = 0; i < nrows; i++)
+        if (key[i] >= rs->lo && key[i] <= rs->hi)
+            rs->sel[nsel++] = i;
+
+    out->nrows = nsel;
+    out->ncols = in->ncols;
+
+    if (nsel == nrows)
+    {
+        /* Whole batch inside the range -- borrow, copy nothing. */
+        for (int c = 0; c < in->ncols; c++)
+            xpcb_col_borrow(&out->cols[c], in->cols[c].type,
+                            (void *) in->cols[c].data, NULL);
+        return;
+    }
+
+    for (int c = 0; c < in->ncols; c++)
+    {
+        int32 *src = xpcb_i32(in, c);
+        int32 *buf = palloc(nsel * sizeof(int32));
+
+        for (int i = 0; i < nsel; i++)
+            buf[i] = src[rs->sel[i]];
+
+        out->cols[c].type = XPB_COL_INT4;
+        out->cols[c].data = buf;
+        out->cols[c].validity = NULL;
+        out->cols[c].owns_data = true;
+        out->cols[c].owns_validity = false;
+    }
+}
+
 PG_FUNCTION_INFO_V1(xpb_batch_join2_groupby);
 
 Datum
@@ -648,6 +737,7 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
 
     /* Source: 4 columns [period_key, company_key, account_key, amount_dt] */
     XpBatchSource *source;
+    bool need_range_filter = false;     /* set only by the registry branch */
     if (strcmp(mode, "zlfs") == 0)
     {
         zlfs_ensure_registry();
@@ -678,6 +768,63 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
                             errhint("Create it with benchmarks/common/schema-columnar.sql.")));
         source = xpcn_source_create(col_relid, pgcn_attnos, 4, true, lo, hi);
     }
+    else if (strncmp(mode, "ext:", 4) == 0)
+    {
+        /*
+         * ext:<provider>:<uri> -- a registered source, resolved by name.
+         *
+         * Nothing here names a format. The string names a provider and the
+         * provider interprets the uri; this branch knows only the batch
+         * contract and the registry. That is the whole point of the Parquet
+         * series: a new physical source reaches the same operators without a
+         * branch of its own in them.
+         *
+         * The four column names are this benchmark's fact columns, in the
+         * order the pipeline below reads them. A name-keyed source needs names
+         * where a relation source uses attnos {1,2,3,6}; they denote the same
+         * four columns.
+         */
+        static const char *const fact_cols[4] = {
+            "period_key", "company_key", "account_key", "amount_dt"
+        };
+        char       *spec = pstrdup(mode + 4);   /* mode stays intact for the NOTICE */
+        char       *sep  = strchr(spec, ':');
+        const XpbSourceProvider *prov;
+        XpbSourceRequest req;
+
+        if (sep == NULL || sep == spec || sep[1] == '\0')
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("malformed source mode \"%s\"", mode),
+                     errhint("Expected ext:<provider>:<uri>.")));
+        *sep = '\0';
+
+        prov = xpb_find_source_provider(spec);
+        if (prov == NULL)
+            ereport(ERROR,
+                    (errcode(ERRCODE_UNDEFINED_OBJECT),
+                     errmsg("no source provider named \"%s\" is registered", spec),
+                     errhint("The module that registers it may not be loaded; "
+                             "see xpb_source_providers().")));
+
+        memset(&req, 0, sizeof(req));
+        req.relid    = InvalidOid;
+        req.uri      = sep + 1;
+        req.colnames = fact_cols;
+        req.ncols    = 4;
+        req.has_pred = true;
+        req.pred_lo  = lo;
+        req.pred_hi  = hi;
+
+        source = prov->create(&req);
+
+        /*
+         * The predicate is the caller's unless the provider says it applied it.
+         * See XpbSourceProvider.filters_rows: false is the safe default, and a
+         * redundant pass over already-filtered rows changes no answer.
+         */
+        need_range_filter = !prov->filters_rows;
+    }
     else
         ereport(ERROR, (errmsg("unknown mode: %s", mode)));
 
@@ -690,15 +837,24 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
     int64 total_rows = 0;
     int nbatches = 0;
 
-    XpColumnBatch in_batch, j1_out, j2_out;
+    XpColumnBatch in_batch, f_out, j1_out, j2_out;
     memset(&in_batch, 0, sizeof(in_batch));
     in_batch.ncols = 4;
     in_batch.capacity = XPCB_BATCH_CAP;
+    memset(&f_out, 0, sizeof(f_out));
     memset(&j1_out, 0, sizeof(j1_out));
     memset(&j2_out, 0, sizeof(j2_out));
 
+    BatchRangeSel rsel;
+    rsel.col = 0;                       /* period_key */
+    rsel.lo = lo;
+    rsel.hi = hi;
+    rsel.capacity = XPCB_BATCH_CAP;
+    rsel.sel = need_range_filter ? palloc(XPCB_BATCH_CAP * sizeof(uint32)) : NULL;
+
     instr_time t0, t1, tp;
-    double src_ms = 0, j1_ms = 0, j2_ms = 0, agg_ms = 0;
+    double src_ms = 0, filt_ms = 0, j1_ms = 0, j2_ms = 0, agg_ms = 0;
+    int64 filt_in = 0, filt_out = 0;
 
     INSTR_TIME_SET_CURRENT(t0);
 
@@ -716,12 +872,26 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
 
         /*
          * Input batch columns: [0]=period_key, [1]=company_key, [2]=account_key, [3]=amount_dt
-         *
+         */
+        XpColumnBatch *probe_in = &in_batch;
+
+        if (need_range_filter)
+        {
+            INSTR_TIME_SET_CURRENT(tp);
+            batch_range_select(&rsel, &in_batch, &f_out);
+            { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
+              filt_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
+            filt_in  += in_batch.nrows;
+            filt_out += f_out.nrows;
+            probe_in = &f_out;
+        }
+
+        /*
          * Join 1: period_key(col0) → year
          * Output: [0]=year, [1]=company_key, [2]=account_key, [3]=amount_dt
          */
         INSTR_TIME_SET_CURRENT(tp);
-        batch_join_probe(js1, &in_batch, &j1_out);
+        batch_join_probe(js1, probe_in, &j1_out);
         { instr_time tn; INSTR_TIME_SET_CURRENT(tn);
           j1_ms += INSTR_TIME_GET_MILLISEC(tn) - INSTR_TIME_GET_MILLISEC(tp); }
 
@@ -777,6 +947,12 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
          */
         xpcb_release_owned(&j2_out);
         xpcb_release_owned(&j1_out);
+        /*
+         * Last, and after j1_out: on the all-matched path j1_out's pass-through
+         * columns BORROW from f_out, so f_out's buffers must outlive it.
+         */
+        if (need_range_filter)
+            xpcb_release_owned(&f_out);
     }
 
     INSTR_TIME_SET_CURRENT(t1);
@@ -813,6 +989,18 @@ xpb_batch_join2_groupby(PG_FUNCTION_ARGS)
             snprintf(srcinfo, sizeof(srcinfo),
                      "  rowgroups=%ld copied=%ld copied_bytes=%ld",
                      (long) g, (long) gc, (long) bc);
+        }
+        else if (need_range_filter)
+        {
+            /*
+             * Reported because it is work the other arms do not do here: a
+             * pruning-only source hands over whole row groups and the predicate
+             * is applied one layer up. filter_in/filter_out is the amplification
+             * the pruning granularity leaves behind.
+             */
+            snprintf(srcinfo, sizeof(srcinfo),
+                     "  filter=%.1f ms  filter_in=%ld filter_out=%ld",
+                     filt_ms, (long) filt_in, (long) filt_out);
         }
 
         elog(NOTICE, "batch_join2_groupby [%d..%d] mode=%s: "
