@@ -1,0 +1,6 @@
+# Generated, not stored. gen_data.py is deterministic -- no randomness, every
+# value a closed-form function of the row index -- so the file is reproducible
+# byte for byte and committing 12 MB of it would buy nothing.
+*.parquet
+*.csv
+schema.sql
