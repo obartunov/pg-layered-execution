@@ -20,6 +20,11 @@
 #   regression_guards.sh     CREATE TEMP TABLE, shadowing via the temp schema
 #   reproducers (groupagg2*) own fixture names (r13_*, r14_*, r15_*), dropped
 #   provider_* / parquet_*   read-only against the dataset, or own temp files
+#   source_conformance.sh    read-only; CREATE TEMP TABLE for its own fixtures
+#   object_reader.sh         read-only against the Parquet file; own temp dir,
+#                            and it terminates its own probe backend -- a
+#                            leftover idle session blocks a smart shutdown,
+#                            which stalled optional_module.sh once
 set -uo pipefail
 
 PORT="${1:?port}"; PGHOST_ARG="${2:-}"; DB="${3:-testdb}"
@@ -72,6 +77,9 @@ run reproducers/local_ht_silent_drop.sh                "$PORT" "$PGHOST_ARG"
 run provider_abi.sh                     "$PORT" "$PGHOST_ARG" "$DB"
 run provider_negative.sh                "$PORT" "$PGHOST_ARG" "$DB"
 run parquet_error_paths.sh              "$PORT" "$PGHOST_ARG" "$DB"
+run parquet_cxx_boundary.sh             "$PORT" "$PGHOST_ARG" "$DB"
+run source_conformance.sh               "$PORT" "$PGHOST_ARG" "$DB"
+run object_reader.sh                    "$PORT" "$PGHOST_ARG" "$DB"
 
 AFTER=$(census)
 echo "after:  $AFTER"
