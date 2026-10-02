@@ -38,6 +38,12 @@ PGHOST_ARG="${2:-}"
 DB="${3:-testdb}"
 LO=25
 HI=36
+# The boundary-comparable pair (xpb_parquet whole statement vs DuckDB whole
+# query) gets more samples than the stage decompositions: it is the only
+# cross-engine number here, and the DuckDB arm is the most sensitive to what else
+# the host just did -- 5 runs inside this harness gave a median 40% above 15 runs
+# measured quiet.
+WALL_RUNS=15
 
 PSQL=(psql -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -X -qAt)
 [ -n "$PGHOST_ARG" ] && PSQL+=(-h "$PGHOST_ARG")
@@ -84,6 +90,12 @@ SQL_BODY="SELECT d.year, a.account_group, r.company_key,
           JOIN dim_account a ON a.account_key = r.account_key
           WHERE r.period_key BETWEEN $LO AND $HI
           GROUP BY d.year, a.account_group, r.company_key"
+
+# What gets timed, for every arm. sum(total_amt) and not count(*): count(*) lets
+# both PostgreSQL and DuckDB plan the inner sum(amount_dt) away, so the arms that
+# compute it were being compared against arms that did not. The outer sum is 200
+# rows of work and forces the inner one to exist.
+TIMED_SQL="SELECT sum(total_amt) FROM (%s) s"
 
 echo "=== setup: ZLFS zone [$LO..$HI] ==="
 "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS xp_batch" >/dev/null
@@ -169,16 +181,50 @@ SQL
 fi
 
 echo "=== EXPLAIN: each SQL path takes the plan it is named for ==="
-# same GUCs as the timed runs, or the plan shown is not the plan measured
+# The EXACT query that gets timed, with the same GUCs, or the plan shown is not
+# the plan measured. It used to be the bare body, which is why the defect below
+# survived three runs: the bare body computes the sum, the timed wrapper did not.
 for tbl in reg_buh reg_buh_col; do
     [ "$tbl" = "reg_buh_col" ] && [ "$HAVE_COL" != "t" ] && continue
     echo "-- $tbl"
     "${PSQL[@]}" <<SQL | grep -E "Scan|Aggregate|Join" | head -6
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
-EXPLAIN (COSTS OFF) $(printf "$SQL_BODY" $tbl);
+EXPLAIN (COSTS OFF) $(printf "$TIMED_SQL" "$(printf "$SQL_BODY" $tbl)");
 SQL
 done
+
+echo "=== the timed query must actually compute the aggregate ==="
+# The defect this guards against, found 2026-10-02: the timed query was
+# count(*) over the grouped subquery, and BOTH engines dropped the inner
+# sum(amount_dt) -- PostgreSQL replaced it with NULL::bigint in the
+# HashAggregate target list, DuckDB left amount_dt out of the scan entirely.
+# Three result sets compared arms that summed against arms that did not. An
+# aggregate that is planned away is invisible in a timing, so it gets asserted
+# on the plan rather than trusted.
+for tbl in reg_buh reg_buh_col; do
+    [ "$tbl" = "reg_buh_col" ] && [ "$HAVE_COL" != "t" ] && continue
+    PLAN=$("${PSQL[@]}" <<SQL
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+EXPLAIN (VERBOSE, COSTS OFF) $(printf "$TIMED_SQL" "$(printf "$SQL_BODY" $tbl)");
+SQL
+)
+    case "$PLAN" in
+        *"NULL::bigint"*) echo "!! $tbl: the planner dropped sum(amount_dt)"; exit 1 ;;
+    esac
+    case "$PLAN" in
+        *"sum(r.amount_dt)"*) echo "   $tbl: sum(amount_dt) is in the plan" ;;
+        *) echo "!! $tbl: sum(amount_dt) is not in the plan"; exit 1 ;;
+    esac
+done
+if [ "$HAVE_DUCK" = "t" ]; then
+    DPLAN=$(python3 "$HERE/duckdb-arm.py" plan "$PQ_DIR")
+    case "$DPLAN" in
+        *"amount_dt"*) echo "   duckdb: amount_dt is in the plan" ;;
+        *) echo "!! duckdb: the timed query does not read amount_dt"; exit 1 ;;
+    esac
+fi
 
 echo "=== 5 warm runs per xp_batch path ==="
 MODES="heap zlfs"
@@ -191,14 +237,34 @@ for mode in $MODES; do
     case "$mode" in ext:*) LOADPQ="LOAD 'xpb_parquet';" ;; esac
     for i in 1 2 3 4 5; do
         "${PSQL[@]}" -c "SET max_parallel_workers_per_gather=0; SET jit=off; $LOADPQ
-                         SELECT count(*) FROM xpb_batch_join2_groupby($LO,$HI,'$mode')" 2>&1 >/dev/null \
+                         SELECT sum(total_amt) FROM xpb_batch_join2_groupby($LO,$HI,'$mode')" 2>&1 >/dev/null \
         | sed -n 's/^NOTICE:  batch_join2_groupby //p'
     done
 done
 
+if [ "$HAVE_PQ" = "t" ]; then
+    # total_ms starts after the source is constructed and stops before emit, so
+    # it is not the same boundary as DuckDB's wall clock around execute+fetch.
+    # This is: server-side elapsed for the whole statement, including plan, the
+    # provider's open (footer parse, 200 row-group statistics) and the
+    # tuplestore. The only arm-to-arm comparison with DuckDB that holds is this
+    # one against the next block.
+    echo "=== $WALL_RUNS warm runs, xpb_parquet, client-side wall clock (whole statement) ==="
+    for i in $(seq 1 $WALL_RUNS); do
+        "${PSQL[@]}" <<SQL | grep -i '^time' | sed 's/^/xpb_parquet     /'
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+LOAD 'xpb_parquet';
+SET client_min_messages = warning;
+\\timing on
+SELECT sum(total_amt) FROM xpb_batch_join2_groupby($LO,$HI,'ext:parquet:$PQ_FILE');
+SQL
+    done
+fi
+
 if [ "$HAVE_DUCK" = "t" ]; then
-    echo "=== 5 warm runs, DuckDB over the same Parquet file (threads=1) ==="
-    python3 "$HERE/duckdb-arm.py" time "$PQ_DIR" 5 | sed 's/^/duckdb_parquet  total=/;s/$/ ms/'
+    echo "=== $WALL_RUNS warm runs, DuckDB over the same Parquet file (threads=1) ==="
+    python3 "$HERE/duckdb-arm.py" time "$PQ_DIR" $WALL_RUNS | sed 's/^/duckdb_parquet  total=/;s/$/ ms/'
 fi
 
 echo "=== 5 warm runs per SQL path ==="
@@ -210,7 +276,7 @@ for tbl in reg_buh reg_buh_col; do
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
 \\timing on
-SELECT count(*) FROM ($(printf "$SQL_BODY" $tbl)) s;
+$(printf "$TIMED_SQL" "$(printf "$SQL_BODY" $tbl)");
 SQL
     done
 done

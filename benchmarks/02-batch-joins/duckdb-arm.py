@@ -4,6 +4,7 @@ DuckDB/Parquet arm of benchmark 02.
 
   duckdb-arm.py check <datadir>        -> "<md5>|<groups>"
   duckdb-arm.py time  <datadir> <n>    -> n lines, one wall-clock ms each
+  duckdb-arm.py plan  <datadir>        -> the timed query's plan, one line
 
 Same logical query as every other arm: the same 12-period slice, the same two
 dimension joins, the same GROUP BY. It reads the SAME reg_buh.parquet that the
@@ -13,10 +14,22 @@ THREADS = 1 is not a handicap, it is the comparison. Every other arm runs with
 max_parallel_workers_per_gather = 0, so a multi-threaded DuckDB would be
 measuring parallelism against four single-threaded pipelines.
 
-The timed query is `count(*)` over the grouped result, exactly as run.sh times
-the SQL arms, so the md5/string_agg of the correctness gate is not inside any
-timing. Wall clock is measured in this process and therefore includes DuckDB's
-own query setup but not interpreter start.
+The timed query is `sum(total_amt)` over the grouped result, the same wrapper
+run.sh times the SQL arms with, so the md5/string_agg of the correctness gate is
+not inside any timing.
+
+It was `count(*)`, and that was wrong in a way a timing cannot show: DuckDB
+planned the inner sum(amount_dt) away entirely -- `EXPLAIN` of the count(*) form
+mentions neither `sum` nor `amount_dt`, and the HASH_GROUP_BY carries only the
+three grouping keys. The arm was reading 3 of 4 columns and adding nothing, while
+every xp_batch arm summed. `plan` exists so run.sh can assert the aggregate is
+still there instead of trusting this comment.
+
+Wall clock is measured in this process and therefore includes DuckDB's own query
+setup -- bind, plan, execute, fetch, and its metadata reads of all three Parquet
+files -- but not interpreter start. The xp_batch arms' total_ms excludes source
+construction and emit, so the two numbers are the same order of magnitude but not
+the same boundary; they support "comparable", not a percentage.
 """
 import sys
 import time
@@ -63,13 +76,19 @@ def main():
         print(f"{ck}|{groups}")
         return
 
+    timed = f"SELECT sum(total_amt) FROM ({body}) s"
+
+    if what == "plan":
+        rows = con.execute(f"EXPLAIN {timed}").fetchall()
+        print(" ".join(" ".join(str(c) for c in r) for r in rows).replace("\n", " "))
+        return
+
     if what == "time":
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-        sql = f"SELECT count(*) FROM ({body}) s"
-        con.execute(sql).fetchone()            # warm the page cache, discard
+        con.execute(timed).fetchone()          # warm the page cache, discard
         for _ in range(n):
             t0 = time.perf_counter()
-            con.execute(sql).fetchone()
+            con.execute(timed).fetchone()
             print(f"{(time.perf_counter() - t0) * 1000:.1f}")
         return
 
