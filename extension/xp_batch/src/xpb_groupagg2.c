@@ -529,6 +529,62 @@ xpga2_exec(CustomScanState *node)
                 int32 zlo = state->pqfrag.has_key_lo ? (int32)state->pqfrag.stream_key_lo : PG_INT32_MIN;
                 int32 zhi = state->pqfrag.has_key_hi ? (int32)state->pqfrag.stream_key_hi : PG_INT32_MAX;
                 ZlfsZone *zz = zlfs_lookup_valid_zone(RelationGetRelid(rel), zlo, zhi);
+
+                /*
+                 * The zone answers THIS query only if its columns are the
+                 * columns this query groups and sums. zlfs_lookup_valid_zone()
+                 * matches on relid and on the predicate bounds, and nothing
+                 * else; the three reads below were positional.
+                 *
+                 * R1-13. Measured on reg_buh with a zone over
+                 * (period_key, company_key, amount_dt) and the predicate
+                 * [25..36] -- the shape benchmark 02 builds:
+                 *
+                 *   sum(amount_dt)   50 004 205 035   = PostgreSQL
+                 *   sum(amount_kt)   50 004 205 035   PostgreSQL: 50 004 441 948
+                 *   sum(payload)     50 004 205 035   PostgreSQL: 500 390 842 330
+                 *
+                 * Every query summing any column of that range got the zone's
+                 * third column, silently, with the right group keys because the
+                 * zone's first two happened to be the query's. Wrong by 10x on
+                 * payload, and no error anywhere.
+                 *
+                 * The checks are the ones the zone already carries the data for:
+                 * enough columns, the right attnos in the right positions, the
+                 * type the reads below assume, and no NULLs -- validity is not
+                 * consulted by the loop, so a nullable column would sum
+                 * whatever the builder left in a NULL slot. A zone that does not
+                 * match falls through to the heap scan below, which is the
+                 * general path and always correct; this is a narrowing, not a
+                 * refusal.
+                 *
+                 * count(*) (agg_attno == 0) is excluded: the loop sums a column
+                 * unconditionally, so it has nothing to read for that case.
+                 */
+                if (zz != NULL)
+                {
+                    bool usable = (zz->ncols >= 3 &&
+                                   state->k2_attno > 0 &&
+                                   state->agg_attno > 0 &&
+                                   zz->col_attnos[0] == state->k1_attno &&
+                                   zz->col_attnos[1] == state->k2_attno &&
+                                   zz->col_attnos[2] == state->agg_attno);
+
+                    for (int c = 0; usable && c < 3; c++)
+                        if (zz->col_types[c] != ZLFS_COL_INT4 ||
+                            zz->cols[c] == NULL ||
+                            zz->col_validity[c] != NULL)
+                            usable = false;
+
+                    if (!usable)
+                    {
+                        elog(DEBUG1,
+                             "XpGroupAgg2: zone [%d..%d] does not match this query's columns; heap scan",
+                             zz->pred_lo, zz->pred_hi);
+                        zz = NULL;
+                    }
+                }
+
                 if (zz) {
                     /* ZLFS path: scan zone columns directly into hash table */
                     int32 *col_pk = zz->cols[0];

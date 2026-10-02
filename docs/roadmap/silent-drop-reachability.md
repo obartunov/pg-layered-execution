@@ -1,27 +1,37 @@
 # Silent-Drop Reachability — the map
 
-Status: **reopened 2026-10-01 for R1-11, then closed again. SILENT_DROP = 0,
+Status: **reopened 2026-10-02 for R1-13, then closed again. SILENT_DROP = 0,
 AMBIGUOUS = 0.**
 
-Phase 4 mapped the space and phase 5 closed it at 11 defects. The map was then
-reopened: auditing the `XpGroupAgg2` correlation cost gate found a twelfth
-silent drop that phase 4 never examined, because the inventory was a survey of
+Phase 4 mapped the space and phase 5 closed it at 11 defects. The map has been
+reopened twice since.
+
+Auditing the `XpGroupAgg2` correlation cost gate found a twelfth silent drop
+(R1-11) that phase 4 never examined, because the inventory was a survey of
 **bounded state** — capacity limits — and R1-11 is not a capacity limit. It is an
-ordering assumption. The map's original question did not reach it.
+ordering assumption.
+
+Auditing the external source provider contract found a thirteenth (R1-13),
+also outside the original question: `XpGroupAgg2` read a ZLFS zone's columns
+**positionally**, so a zone built for one query answered every query over the
+same key range. Not a capacity limit and not an ordering assumption — an
+identity assumption about which column is which. The map's question did not
+reach it either.
+
+Three surveys, three questions, three different answers. A future survey asks
+all of:
+
+> can a local capacity limit silently change the answer?     (phase 4)
+> can an unproven assumption about physical row order?        (R1-11)
+> can an unverified assumption about column identity?         (R1-13)
 
 `test/reproducers/silent_drop_map.sh` passes 10/10 and
 `test/reproducers/groupagg2_desc_stream_exit.sh` passes 14/14; the wrong result
 each case originally produced is recorded beside it so each test visibly closes
 an observed defect.
 
-The question the map asked of every site, and the one it did not:
-
-> asked:     can a local **capacity** limit silently change the answer?
-> not asked: can an unproven assumption about **physical row order** silently
->            change the answer?
-
-R1-11 was reachable through the second question for as long as the map claimed
-SILENT_DROP = 0 under the first. Any future survey here should ask both.
+R1-11 and R1-13 were each reachable through a question the map had not asked for
+as long as it claimed SILENT_DROP = 0 under the one it had.
 
 Starting point: checkpoint `cf0c891`. Benchmark 05 is a reviewed boundary and is
 not revisited here.
@@ -49,17 +59,18 @@ initial SILENT_DROP:          8
 new defects found:            2   (R1-9, R1-10)
                              +1   (A4, found by analysing an AMBIGUOUS site)
                              +1   (R1-11, found after the map was closed)
-fixed:                       12
+                             +1   (R1-13, found by the provider-contract audit)
+fixed:                       13
 remaining:                    0
 ```
 
-The count went from 8 to 12 rather than staying at a tidy 8: fixing the
+The count went from 8 to 13 rather than staying at a tidy 8: fixing the
 page-skip exposed two more, resolving the AMBIGUOUS four turned one of them
-into a real silent drop, and reopening the map for the cost-gate audit added a
-twelfth. All four are recorded at full weight.
+into a real silent drop, the cost-gate audit added a twelfth, and the
+provider-contract audit a thirteenth. All are recorded at full weight.
 
-R1-11 is not in the bounded-state table above because it is not bounded state.
-It sits in its own section at the end.
+R1-11 and R1-13 are not in the bounded-state table above because neither is
+bounded state. Each has its own section at the end.
 
 Neither column sums to 31. The rows are classification entries, not distinct
 sites — R1-3 is two instances in one row — and R1-5…R1-10 are semantic defects
@@ -571,3 +582,63 @@ because `statement_timeout` provably cannot end this failure mode; a test that
 relied on it would hang the suite meant to detect it.
 
 Classification: **fixed.**
+
+## R1-13 — XpGroupAgg2 read a ZLFS zone that did not answer the query
+
+Found 2026-10-02 by the external source provider contract audit, which asked a
+question the map had not: does a generic operator assume anything about a
+source's columns that the source does not state?
+
+`xpga2_exec()` had a ZLFS fast path taking `zz->cols[0]`, `[1]` and `[2]` as the
+two group keys and the summed column, **positionally**.
+`zlfs_lookup_valid_zone()` matches on `source_relid`, on `pred_lo`/`pred_hi` and
+on freshness — and on nothing else. It does not look at which columns the zone
+holds. Nothing between the lookup and the three reads did either.
+
+So a zone built for one query answered every query over the same key range.
+Measured on `reg_buh` with a zone over `(period_key, company_key, amount_dt)` for
+`[25..36]` — the zone benchmark 02 builds in its own setup:
+
+| query | XpGroupAgg2 | PostgreSQL |
+|---|---|---|
+| `sum(amount_dt)` | 50 004 205 035 | 50 004 205 035 |
+| `sum(amount_kt)` | **50 004 205 035** | 50 004 441 948 |
+| `sum(payload)` | **50 004 205 035** | 500 390 842 330 |
+
+600 groups in every case, the right keys in every case, and the zone's third
+column summed whatever the query asked for. An order of magnitude out on
+`payload`, no error, no warning, and the `NOTICE` it prints says only that a
+zone was used.
+
+The zone carries everything needed to detect this — `ncols`, `col_attnos[]`,
+`col_types[]`, `col_validity[]` — and the path consulted none of it. Two further
+assumptions were equally unchecked and are closed by the same guard: `col_types`
+was assumed `ZLFS_COL_INT4` for all three columns (an int8 column would be read
+as int32), and `col_validity` was ignored, so a nullable column would sum
+whatever the zone builder left in a NULL slot.
+
+Reachability, stated rather than waved at: both `xp_batch.enabled` and
+`xp_batch.groupagg2` default to off; a zone must exist whose bounds match the
+query's range predicate exactly; and the zone registry must have been populated
+in the same backend, which any `zlfs_*` call does. None of that makes it
+unreachable — benchmark 02 builds precisely this zone, and the first query shape
+that hits it is a one-column edit away from a wrong answer.
+
+The fix is a narrowing, not a refusal: the zone is used only when it has at
+least three columns whose attnos are this query's k1, k2 and aggregate, in those
+positions, all `ZLFS_COL_INT4`, all non-NULL and all present. Otherwise the path
+falls through to the heap scan below it, which is the general path and always
+correct. `count(*)` is excluded because the loop sums a column unconditionally.
+
+`test/reproducers/groupagg2_zlfs_zone_mismatch.sh` passes 6/6 and asserts both
+directions, because correctness reached by declining the zone for every query
+would agree with PostgreSQL and prove nothing: the ZLFS path must still run for
+the one query the zone answers, and must not run for the two it does not.
+
+Classification: **fixed.**
+
+What the audit found and did not fix, recorded because it is the same class:
+this path reaches into a provider's private structure at all. ZLFS and
+pgcolumnar are still linked into `xp_batch.so` and constructed by name; only
+Parquet goes through the registry. The contract document
+(`docs/EXTERNAL_SOURCE_PROVIDER_CONTRACT.md`) states the boundary this violates.
