@@ -478,6 +478,32 @@ _PG_init(void)
  * Nothing here is a Parquet-specific operator: it is a test harness that reads
  * the batch contract exactly as an operator would.
  */
+/*
+ * xpq_selftest_throw(kind) -- make the C++ half throw, on purpose.
+ *
+ * Asserts the property the whole shim rests on: an exception raised inside the
+ * C++ half is caught there and arrives here as a return code, never as an
+ * exception crossing the C ABI. A malformed Parquet file does not test this --
+ * Arrow reports those as a Status -- so the throw has to be deliberate.
+ */
+PG_FUNCTION_INFO_V1(xpq_selftest_throw_sql);
+
+Datum
+xpq_selftest_throw_sql(PG_FUNCTION_ARGS)
+{
+    int32   kind = PG_GETARG_INT32(0);
+    char    errbuf[XPQ_ERRBUF];
+
+    errbuf[0] = '\0';
+    if (xpq_selftest_throw(kind, errbuf, sizeof(errbuf)) != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("xpb_parquet: the C++ half threw and the boundary held"),
+                 errdetail("%s", errbuf[0] ? errbuf : "no detail")));
+
+    PG_RETURN_TEXT_P(cstring_to_text("nothing thrown"));
+}
+
 PG_FUNCTION_INFO_V1(xpq_scan);
 
 Datum

@@ -137,6 +137,14 @@ int64_t     xpq_meta_bytes(const XpqReader *r);       /* footer + schema bytes  
 int64_t     xpq_data_bytes(const XpqReader *r);       /* column-chunk bytes read   */
 int64_t     xpq_read_calls(const XpqReader *r);       /* ReadAt() calls            */
 
+/*
+ * Controlled failure for the C/C++ boundary, used by test/parquet_cxx_boundary.sh.
+ * kind 1 throws a std::exception, 2 a parquet::ParquetException, 3 something that
+ * is not a std::exception at all; 0 throws nothing. Returns -1 with errbuf set
+ * when an exception was caught, which is the only way one may leave this ABI.
+ */
+int         xpq_selftest_throw(int kind, char *errbuf, size_t errbuflen);
+
 #ifdef __cplusplus
 }
 #endif

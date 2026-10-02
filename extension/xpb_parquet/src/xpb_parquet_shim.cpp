@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -537,5 +538,47 @@ int64_t xpq_data_bytes(const XpqReader *r)
 { return (r && r->counted) ? r->counted->data_bytes() : 0; }
 int64_t xpq_read_calls(const XpqReader *r)
 { return (r && r->counted) ? r->counted->read_calls() : 0; }
+
+/*
+ * Controlled failure for the exception boundary.
+ *
+ * Every entry point here is wrapped so that no C++ exception reaches the C ABI,
+ * where it would be undefined behaviour rather than an error. That property is
+ * otherwise only arguable from reading the code: Arrow reports most problems as
+ * a Status, so a malformed file exercises the status path and leaves the catch
+ * arms untested. This throws on purpose, through the same shape of wrapper, so
+ * both arms are reached by a test:
+ *
+ *   1  std::exception     -- caught by the typed arm, message preserved
+ *   2  parquet::ParquetException (also a std::exception, but Arrow's own)
+ *   3  not a std::exception at all -- only catch (...) can take it
+ *
+ * Reachable only through xpq_selftest_throw() in the module's SQL surface,
+ * which exists for test/parquet_cxx_boundary.sh. It touches no reader, no file
+ * and no global state.
+ */
+int xpq_selftest_throw(int kind, char *errbuf, size_t errbuflen)
+{
+    try
+    {
+        switch (kind)
+        {
+            case 1: throw std::runtime_error("selftest: std::runtime_error");
+            case 2: throw parquet::ParquetException("selftest: ParquetException");
+            case 3: throw 42;            /* not derived from std::exception */
+            default: return 0;           /* nothing thrown */
+        }
+    }
+    catch (const std::exception &e)
+    {
+        set_err(errbuf, errbuflen, std::string("caught std::exception: ") + e.what());
+        return -1;
+    }
+    catch (...)
+    {
+        set_err(errbuf, errbuflen, "caught non-std exception");
+        return -1;
+    }
+}
 
 }   /* extern "C" */
