@@ -39,8 +39,13 @@ RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, nulls_first_col
   row_groups_stats_available int, row_groups_considered int, min_last_col bigint,
   max_last_col bigint, null_key_sum bigint, meta_bytes bigint, data_bytes bigint,
   read_calls bigint, decode_ms float8, bytes_requested bigint, bytes_returned bigint,
-  meta_calls bigint, data_calls bigint, irq_skipped_offthread bigint)
-LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan';"
+  meta_calls bigint, data_calls bigint, irq_skipped_offthread bigint,
+  short_reads_without_eof bigint, fault_attempts bigint, fault_injected bigint,
+  logical_calls bigint, logical_bytes bigint)
+LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan';
+DROP FUNCTION IF EXISTS xpq_arm_fault(int,bigint,bigint,int);
+CREATE FUNCTION xpq_arm_fault(mode int, at_read bigint, nbytes bigint, retries int)
+RETURNS bool LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_arm_fault';"
 
 pass=0; fail=0
 ok()  { echo "  ok      $1"; pass=$((pass+1)); }
@@ -431,6 +436,170 @@ for MODE in pg_cancel_backend pg_terminate_backend; do
         ok "$MODE mid-scan ended the backend in under $((W*250+250)) ms"
     fi
 done
+
+echo "=== 8. what a read means when the source is unreliable ==="
+#
+# v0 had one read_at() that was "exact except at end of object", so a caller
+# inferred EOF from a short return. That inference is right for a local file --
+# pread() returning 0 means the file ended -- and wrong for anything over a
+# transport, where a ranged GET can come back short while the object continues.
+# Under the v0 contract a dropped connection would therefore have arrived as a
+# clean end of object: for a column store, not a crash but a silently short
+# column.
+#
+# So EOF is no longer inferred, and the faults below are injected underneath the
+# real Parquet reader -- same file, same bytes, same decode path, damaged
+# delivery only -- so every answer stays checkable against the oracle.
+#
+# Modes: 1 short-without-eof, 2 transient-then-retry, 3 fail-after-n-bytes,
+#        4 genuine EOF, 5 chunked delivery.
+ONE=period_key,amount_dt
+arm() { qall "DO \$\$ BEGIN PERFORM xpq_arm_fault($1,$2,$3,$4); END \$\$" >/dev/null 2>&1; }
+
+# The armed fault is a static in the BACKEND, so arming and scanning have to be
+# the same session -- two psql calls are two backends. Arming therefore happens
+# inside a DO block, which returns no rows: an earlier version used a bare
+# SELECT xpq_arm_fault(...) and its "t" became field 1 of the result, shifting
+# every number by one and reporting the product as broken.
+scanf() {   # scanf <mode> <at_read> <nbytes> <retries> <select-list>
+    "${PSQL[@]}" -c "LOAD 'xpb_parquet'; SET client_min_messages=warning;
+        DO \$\$ BEGIN PERFORM xpq_arm_fault($1,$2,$3,$4); END \$\$;
+        SELECT $5 FROM xpq_scan('$PQ','$ONE',25,25)" 2>&1 | tr '\n' ' '
+}
+
+# -- the one that matters: a short read is not an end of object ---------------
+OUT=$(scanf 1 3 1000 0 "rows")
+case "$OUT" in
+    *"short read with no end of object"*)
+        ok "a short read with no EOF is refused, and says so in those words" ;;
+    *ERROR*)
+        bad "refused, but not as a short-read-without-EOF: $OUT" ;;
+    *)
+        bad "a truncated delivery was ACCEPTED -- this is the silent-short-column case: $OUT" ;;
+esac
+
+# -- and a real end of object is still a real end of object -------------------
+# The control. If the fix were "distrust every short read" this would also fail,
+# and the reader would be unable to tell the two apart -- which is the whole
+# point of carrying eof explicitly.
+OUT=$(scanf 4 3 1000 0 "rows")
+case "$OUT" in
+    *"read past end of object"*)
+        ok "a genuine EOF is reported as EOF, distinguishably from a short read" ;;
+    *"short read with no end of object"*)
+        bad "a real EOF was misreported as a truncated transfer -- the two are not distinguished" ;;
+    *ERROR*) bad "refused with the wrong reason: $OUT" ;;
+    *)       bad "a read past the end was accepted: $OUT" ;;
+esac
+
+# -- bytes landing in the buffer before a failure must not be trusted --------
+OUT=$(scanf 3 3 1000 0 "rows")
+case "$OUT" in
+    *"I/O error after"*) ok "a failure after partial delivery is an error, not a short answer" ;;
+    *ERROR*)             bad "refused with the wrong reason: $OUT" ;;
+    *)                   bad "a partly filled range was accepted: $OUT" ;;
+esac
+
+# -- retry: logical request unchanged, physical traffic changed --------------
+BASE=$(scanf 0 0 0 0 "rows||' '||logical_calls||' '||logical_bytes||' '||read_calls||' '||bytes_requested")
+RETRY=$(scanf 2 3 1000 2 "rows||' '||logical_calls||' '||logical_bytes||' '||read_calls||' '||bytes_requested")
+set -- $BASE; BR="$1"; BLC="$2"; BLB="$3"; BPC="$4"; BPB="$5"
+set -- $RETRY; RR="$1"; RLC="$2"; RLB="$3"; RPC="$4"; RPB="$5"
+echo "          no fault: logical $BLC/$BLB B   physical $BPC/$BPB B   rows $BR"
+echo "          retried:  logical $RLC/$RLB B   physical $RPC/$RPB B   rows $RR"
+[ "$RR" = "$BR" ] && ok "a retried read returns the same rows ($RR)" \
+                  || bad "retry changed the answer: $RR against $BR"
+[ "$RLC" = "$BLC" ] && [ "$RLB" = "$BLB" ] \
+    && ok "retry left the LOGICAL request untouched ($RLC calls / $RLB B)" \
+    || bad "retry changed what Arrow asked for: $RLC/$RLB against $BLC/$BLB"
+if [ "${RPC:-0}" -gt "${BPC:-0}" ]; then
+    ok "retry cost physical traffic ($BPC -> $RPC calls, $BPB -> $RPB B)"
+else
+    bad "the retry is invisible in the physical counters ($RPC vs $BPC) -- it was free, so nothing was tested"
+fi
+
+# -- chunked delivery: same bytes, more calls, same answer -------------------
+CH=$(scanf 5 3 1000 0 "rows||' '||logical_calls||' '||logical_bytes||' '||read_calls||' '||bytes_requested||' '||fault_injected")
+set -- $CH; CR="$1"; CLC="$2"; CLB="$3"; CPC="$4"; CPB="$5"; CINJ="$6"
+echo "          chunked:  logical $CLC/$CLB B   physical $CPC/$CPB B   rows $CR  injected $CINJ"
+[ "${CINJ:-0}" -ge 1 ] && ok "the chunking fault fired ($CINJ)" \
+                       || bad "no fault was injected, so this case tested nothing"
+[ "$CR" = "$BR" ] && ok "a range delivered in pieces is reassembled whole ($CR rows)" \
+                  || bad "chunked delivery changed the answer: $CR against $BR"
+if [ "${CPC:-0}" -gt "${BPC:-0}" ] && [ "${CLB:-0}" = "${BLB:-0}" ]; then
+    ok "same logical bytes, more physical calls ($BPC -> $CPC)"
+else
+    bad "chunking did not separate the levels: physical $CPC vs $BPC, logical $CLB vs $BLB"
+fi
+
+# -- corruption must never become a valid shortened column -------------------
+# The query-level form of the same question, against the oracle checksum rather
+# than a row count: under the faults that are recoverable the answer must be
+# BIT-IDENTICAL, and under the faults that are not it must be an error.
+GATE="md5(string_agg(year||','||account_group||','||company_key||','||total_amt,
+       '|' ORDER BY year, account_group, company_key))||'|'||count(*)"
+gate() {
+    "${PSQL[@]}" -c "LOAD 'xpb_parquet'; SET client_min_messages=warning;
+        DO \$\$ BEGIN PERFORM xpq_arm_fault($1,$2,$3,$4); END \$\$;
+        SELECT $GATE FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$PQ')" 2>&1 | tr '\n' ' '
+}
+trim() { echo $1; }
+CLEAN=$(trim "$(gate 0 0 0 0)")
+echo "          clean checksum: $CLEAN"
+for M in 2 5; do
+    G=$(trim "$(gate $M 5 4096 2)")
+    [ "$G" = "$CLEAN" ] && ok "mode $M (recoverable): checksum identical" \
+                        || bad "mode $M changed the answer: $G against $CLEAN"
+done
+for M in 1 3 4; do
+    G=$(gate $M 5 4096 0)
+    case "$G" in
+        *ERROR*) ok "mode $M (unrecoverable): the query fails instead of returning short data" ;;
+        *)       bad "mode $M returned an answer from damaged delivery: ${G##* }" ;;
+    esac
+done
+
+# -- a fault-induced ERROR after open must not leak the descriptor -----------
+# This is a REAL post-open error path, deterministically triggered. Before this
+# phase the only post-open error available was a column name absent from the
+# file, which fails before any data read.
+rm -f "$TMP/fault.out"
+"${PSQL[@]}" >"$TMP/fault.out" 2>&1 <<SQL &
+LOAD 'xpb_parquet';
+SET client_min_messages = notice;
+SELECT pg_backend_pid();
+DO \$\$
+BEGIN
+    FOR i IN 1..3 LOOP
+        PERFORM xpq_arm_fault(1, 3, 1000, 0);
+        BEGIN PERFORM count(*) FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$PQ');
+        EXCEPTION WHEN others THEN RAISE NOTICE 'refused'; END;
+    END LOOP;
+END \$\$;
+SELECT 'faultdone';
+SELECT pg_sleep(4);
+SQL
+FJ=$!
+FBP=""; for _ in $(seq 1 100); do
+    grep -q faultdone "$TMP/fault.out" 2>/dev/null && { FBP=$(head -1 "$TMP/fault.out"); break; }
+    sleep 0.2
+done
+if [ -z "$FBP" ]; then
+    bad "the fault probe session never finished"
+else
+    NREF=$(grep -c refused "$TMP/fault.out" 2>/dev/null); NREF=${NREF:-0}
+    NFD=$(ls -l "/proc/$FBP/fd" 2>/dev/null | grep -c "$(basename "$PQ")" || true)
+    echo "          $NREF fault-induced post-open errors, $NFD descriptors left"
+    [ "$NREF" -eq 3 ] && ok "all three fault-induced post-open errors fired" \
+                      || bad "expected 3 refusals, saw $NREF -- the rest of this case is vacuous"
+    [ "$NFD" -eq 0 ] && ok "a fault-induced post-open ERROR leaks no descriptor" \
+                     || bad "$NFD descriptor(s) left after fault-induced errors"
+fi
+kill "$FJ" 2>/dev/null; wait "$FJ" 2>/dev/null
+[ -n "$FBP" ] && kill -0 "$FBP" 2>/dev/null && "${PSQL[@]}" -c "SELECT pg_terminate_backend($FBP)" >/dev/null 2>&1
+
+# Leave nothing armed for whatever runs next.
+arm 0 0 0 0
 
 echo
 echo "############ $pass correct, $fail wrong ############"
