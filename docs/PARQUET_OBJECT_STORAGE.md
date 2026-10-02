@@ -25,75 +25,106 @@ parsing does not mix with data volume), on
 `meta_bytes` is 65 536 in one call in all four cases, including the last.
 
 `data_bytes` equalled `attributed_bytes` — the compressed size the footer
-attributes to the selected chunks — to the byte. No over-read.
+attributes to the selected chunks — to the byte, for these projections. That is
+not general; see the correction below.
 
-### Correction: the read-call shape, measured on a second file
+### Correction: coalescing is gap-based, and it over-reads
 
 This note first recorded the request shape as
 
     read_calls = 1 (footer) + row_groups_read * projected_columns
 
-which is **wrong in general**. It fits the table above only because every
-projection there selects columns that are not adjacent in the file. The
-benchmark-02 Parquet arm (200 row groups, 8 columns, pruned to 21 row groups)
-separates the two readings:
+then, once benchmark 02 contradicted it, as `row_groups_read × contiguous RUNS of
+selected column chunks`. Both are wrong about the mechanism, the second one
+undetectably so on these two files: every projection measured had either adjacent
+chunks or far-apart ones, which makes "adjacent" and "close enough" the same
+prediction.
 
-| projection | file column indices | read calls |
-|---|---|---|
-| `period_key` | 0 | 23 |
-| `period_key, company_key` | 0,1 | 23 |
-| `period_key, company_key, account_key` | 0,1,2 | 23 |
-| `period_key, amount_dt` | 0,5 | 44 |
-| `period_key, company_key, account_key, amount_dt` | 0,1,2,5 | 44 |
-| `period_key, amount_kt, payload` | 0,6,7 | 44 |
+Measured on `benchmarks/02-batch-joins/data/reg_buh.parquet` (200 row groups,
+8 columns, chunks laid out contiguously, predicate pruning to 21 row groups):
 
-Three adjacent columns cost the same number of requests as one. The shape is
+| projection | intervening bytes | read calls | over-read |
+|---|---|---|---|
+| `period_key` | — | 23 | 0 |
+| `period_key, company_key` | 0 (adjacent) | 23 | 0 |
+| `period_key, account_key` | 2 933 | 23 | 61 593 |
+| `period_key, debit_key` | 7 333 | 23 | 153 993 |
+| `period_key, credit_key` | 51 808 | 44 | 0 |
+| `period_key, amount_dt` | 96 283 | 44 | 0 |
+
+Two ranges separated by a small enough gap are merged into one request **and the
+bytes in between are transferred**: 61 593 = 21 × 2 933, exactly the skipped
+chunk in each selected row group. The mechanism is Arrow's own
+`CacheOptions::hole_size_limit` — "the maximum distance in bytes between two
+consecutive ranges; beyond this value, ranges are not combined"
+(`arrow/io/caching.h`). On this file the threshold is in (7 333, 51 808]; the
+exact default is in Arrow's source and was not measured.
 
     read_calls = metadata_calls
-               + row_groups_read * (contiguous RUNS of selected column chunks)
+               + row_groups_read * (merged ranges, a function of the gaps)
 
-Arrow already coalesces adjacent column chunks within a row group into a single
-range read. `metadata_calls` is 2 for that file and 1 for the one above, because
-its footer is 237 693 bytes and does not fit the reader's initial 64 KiB read.
+Two consequences for everything below, where request count carries the whole
+argument. A layer of coalescing exists already, so it is not a future answer —
+and it is already trading bytes for requests, which is the trade object storage
+cares about. And **projection pushdown is not byte-exact**: it over-reads up to
+the hole limit per gap per row group, 1.1% here, bounded but not zero.
 
-Both facts matter below, where request count carries the whole argument: one
-layer of coalescing exists already, and how many requests a projection costs
-depends on how its columns are laid out in the file — which is a property of the
-writer, not of the query. Raw numbers in
-`benchmarks/02-batch-joins/PARQUET_ARMS.md`.
+`metadata_calls` is 2 for this file and 1 for benchmark 08's. It is **derived, not
+measured**: the shim counts bytes per phase and ReadAt calls in total, never calls
+per phase. 2 is consistent with `meta_bytes` = 65 536 + 172 157 — a 64 KiB probe
+read and then the real footer, which is 172 157 bytes. (Earlier text in this note
+called 237 693 "the footer size". 237 693 is `meta_bytes`, probe included.)
+
+Raw numbers in `benchmarks/02-batch-joins/PARQUET_ARMS.md`.
 
 ## Why that shape is the whole object-storage question
 
 Projection and pruning move **bytes**. The local measurements show they do that
-well: 3 of 10 columns and 1 of 8 row groups cut data bytes from 12 MB of file to
-299 KB of transfer.
+well: 2 of 10 columns and 1 of 8 row groups cut data bytes from a 12 MB file to
+299 493 bytes of transfer. How much of that belongs to the source layer rather
+than to how the file was written is a separate question, answered for the
+benchmark-02 file in `PARQUET_ARMS.md` — pruning is the largest term there and is
+a property of the writer.
 
 Object storage prices a second axis the local file does not: **requests and
 round trips**. 17 reads of a local file are 17 `pread()` calls against the page
-cache and cost nothing worth measuring. 17 sequential `GetObject` range requests
-at a per-request latency of 20–80 ms cost 0.34–1.36 s before a single byte of
-decode — more than the transfer of 3 MB on any plausible link. The byte-optimal
-plan and the request-optimal plan are not the same plan.
+cache and cost nothing worth measuring.
+
+What that costs remotely is a **hypothesis, not a measurement** — nothing here has
+read from an object store. At a per-request latency of 20–80 ms, which is the
+range usually quoted for a small `GetObject` and is not measured here, 17
+sequential requests would cost 0.34–1.36 s before a single byte of decode. For
+3 MB of payload that exceeds the transfer time on a link faster than ~70 Mbit/s
+and does not below it. Strictly sequential is also the worst case, and
+consequence 2 below is that concurrency and coalescing are the obvious answers.
+So the shape of the claim is: the byte-optimal plan and the request-optimal plan
+need not be the same plan, and local measurements cannot tell which one matters
+remotely.
 
 Two consequences follow directly from the measurements above and are worth
 stating before any code:
 
 1. **The footer read is unavoidable and is on the critical path.** The
-   prune-to-nothing case transfers zero data bytes and still costs 65 536 bytes
-   in one request. Pruning cannot remove the open; remotely, a query that reads
-   nothing still pays one round trip. Footer caching is therefore the first
-   thing anyone would want, and it is a correctness question (invalidation), not
-   only a performance one.
+   prune-to-nothing case transfers zero data bytes and still pays for the
+   metadata: 65 536 bytes in one request on benchmark 08's file, 237 693 in two
+   on benchmark 02's, where the footer alone is 172 157 bytes and does not fit
+   the probe read. Pruning cannot remove the open; remotely, a query that reads
+   nothing still pays a round trip or two, and the cost grows with the number of
+   row groups because the footer carries their statistics. Footer caching is
+   therefore the first thing anyone would want, and it is a correctness question
+   (invalidation), not only a performance one.
 
-2. **Request count grows with row groups times column RUNS, not row groups times
-   columns.** Locally that product is free. Remotely it is the dominant term for
+2. **Request count is row groups times merged ranges, and the gaps decide the
+   merging.** Locally that product is free. Remotely it is the dominant term for
    a scattered projection over many row groups, which is a shape a columnar scan
    readily produces — the benchmark-02 arm pays 44 requests for 4 columns in 2
-   runs over 21 row groups, where the same 4 columns laid out adjacently would
-   pay 23. Adjacent-chunk coalescing is therefore not a future answer; Arrow
-   already does it, and what is left is coalescing across a gap (reading an
-   unwanted chunk to turn two requests into one) and issuing requests
-   concurrently. Both are future questions, and neither is implemented.
+   merged ranges over 21 row groups, where three columns adjacent in the file pay
+   23 (measured, not hypothesised). Coalescing is therefore not a future answer:
+   Arrow already merges across small gaps and already pays bytes for it. What is
+   left is choosing that trade deliberately — the hole limit that makes sense for
+   a local `pread()` is not the one that makes sense at 50 ms per request — and
+   issuing requests concurrently. Both are future questions, and neither is
+   implemented.
 
 ## The reader surface
 
@@ -120,8 +151,13 @@ count what it did is enough to carry Parquet, and widening it now would be
 designing for a caller that does not exist.
 
 The instrumentation added in 0005 is counted at this wrapper, not inside the
-provider, so `data_bytes` and `read_calls` keep their meaning unchanged under a
-remote reader. That is one thing that does not have to be redone.
+provider, so the MEASUREMENT POINT does not move under a remote reader — one
+thing that does not have to be redone. The numbers themselves are not portable,
+and `read_calls` least of all: it is counted below Arrow's range cache, so it
+depends on that cache's options as much as on the query. A remote reader
+configured with a different hole limit reports a different request count for an
+identical projection. `data_bytes` moves with it, since merging a gap transfers
+the gap.
 
 ## Prefetch
 
@@ -169,6 +205,12 @@ file.
    `pread()` from the page cache cannot hang. Any S3 work must carry a timeout
    and a cancellation path before it carries a benchmark.
 
+   Since this note was first written the local path checks for interrupts once
+   per row group (`statement_timeout` of 10 ms now fires in 26 ms on a
+   200-row-group scan, against 389 ms before), which bounds the local case at one
+   row group. It does nothing for a remote one: the check is between reads, and
+   the hang would be inside a read.
+
 3. **No retry or timeout policy, and no classification of errors.** The ABI
    reports failure as a string in `errbuf`. Locally that is adequate: a local
    read either works or the file is wrong. Remotely, retryable (throttling,
@@ -202,3 +244,11 @@ What object storage does change is the cost model of arrival — requests and
 latency rather than bytes — and the interruptibility of a backend that is
 waiting. The first is an optimisation question. The second is a safety question
 and has to be answered first.
+
+Since this note was written, the local path has a `CHECK_FOR_INTERRUPTS()` per
+row group and releases the reader through a memory-context callback, so blocker 2
+in the list above is now bounded rather than open: a local read that cannot hang
+is interruptible between row groups, and an error no longer leaks the reader. For
+a remote read neither is sufficient — a single `ReadAt` can block for a long time
+inside Arrow, and row-group granularity is whatever one request takes. The
+blocker stands for object storage; it is no longer also true locally.
