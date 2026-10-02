@@ -121,6 +121,22 @@ int64_t     xpq_chunks_seen(const XpqReader *r);      /* Arrow chunks, summed   
 double      xpq_open_ms(const XpqReader *r);          /* footer read + parse       */
 double      xpq_decode_ms(const XpqReader *r);        /* cumulative decode         */
 
+/*
+ * Real byte-range accounting, counted at the arrow::io::RandomAccessFile
+ * wrapper: metadata and data are split at the first column-chunk read, and
+ * read_calls counts ReadAt() calls because a hundred small ranges and one large
+ * one are different economics at equal bytes.
+ *
+ * These three were defined in the shim and never declared here, so the C module
+ * called them under C's implicit-declaration rule -- which assumes they return
+ * int. The measured numbers happened to be unaffected (65 536, ~3 MB, 17 all
+ * fit in 32 bits), but the instrument would have truncated silently on a larger
+ * file, and the return value is int64_t.
+ */
+int64_t     xpq_meta_bytes(const XpqReader *r);       /* footer + schema bytes     */
+int64_t     xpq_data_bytes(const XpqReader *r);       /* column-chunk bytes read   */
+int64_t     xpq_read_calls(const XpqReader *r);       /* ReadAt() calls            */
+
 #ifdef __cplusplus
 }
 #endif
