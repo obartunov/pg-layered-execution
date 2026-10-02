@@ -135,3 +135,11 @@ AS '$libdir/xp_batch', 'xpb_v2_register_report';
 -- rows, with the source path forced rather than auto-selected.
 -- source_mode: heap | bad[-deform|-fixed] | fixedlayout[-deform|-fixed]
 --            | pgcolumnar | zlfs
+
+-- Source providers registered in THIS backend. Zero rows is the normal state:
+-- the built-in sources are reached by direct call, and only an optional
+-- provider module (loaded with LOAD) registers itself here.
+CREATE OR REPLACE FUNCTION xpb_source_providers()
+RETURNS TABLE (name text, describes boolean)
+LANGUAGE c STRICT
+AS '$libdir/xp_batch', 'xpb_source_providers';
