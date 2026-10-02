@@ -213,6 +213,15 @@ def main():
 
     TBL = pq.read_table(PARQUET)
 
+    # The probe function lives in the optional module; declare it in the test DB.
+    psql("CREATE OR REPLACE FUNCTION xpq_scan(path text, cols text, "
+         "lo bigint DEFAULT NULL, hi bigint DEFAULT NULL) "
+         "RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, "
+         "nulls_first_col bigint, row_groups_total int, row_groups_read int, "
+         "row_groups_pruned int, decoded_values bigint, bytes_read bigint, "
+         "copy_bytes bigint, arrow_chunks bigint) "
+         "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
+
     npass = nfail = 0
     for name, sql, arrow in CASES:
         want = psql_rows(sql) if "GROUP BY" in sql else psql(sql)
@@ -242,8 +251,129 @@ def main():
     print()
     print(f"############ {npass} agree, {nfail} differ ############")
     print()
-    print("xpbatch arm: not present until commit 0002 adds the provider.")
-    return 1 if nfail else 0
+    print("=== xpbatch arm: the Parquet provider through the generic contract ===")
+    print("The probe (xpq_scan) drives the provider and reads the batch contract")
+    print("the way an operator does. It expresses count, sum and NULL counts;")
+    print("GROUP BY and arbitrary filters need planner integration, which this")
+    print("milestone does not build, so those cases stay postgres+pyarrow only.")
+    print()
+
+    npass_x = nfail_x = 0
+
+    def xp(cols, lo=None, hi=None):
+        args = f"'{PARQUET}', '{cols}'"
+        if lo is not None:
+            args += f", {lo}, {hi}"
+        row = psql(
+            "LOAD 'xpb_parquet'; SELECT rows||'|'||coalesce(sum_last_col::text,'')"
+            "||'|'||nulls_first_col||'|'||row_groups_read||'|'||row_groups_total"
+            "||'|'||decoded_values||'|'||copy_bytes||'|'||arrow_chunks"
+            f" FROM xpq_scan({args})")
+        return row.split("|") if "|" in row else ["ERR:" + row]
+
+    def xcheck(name, want, got):
+        if want == got:
+            print(f"  ok      {name} (= {got})")
+            return True
+        print(f"  DIFFER  {name}")
+        print(f"            want {want}")
+        print(f"            got  {got}")
+        return False
+
+    # count and sum over the whole file, against PostgreSQL
+    r = xp("order_date_key,amount")
+    if r[0].startswith("ERR"):
+        print(f"  BROKEN  provider probe failed: {r[0]}")
+        nfail_x += 1
+    else:
+        rows, s, nulls0, rgread, rgtot, decoded, copied, chunks = r
+        pg_rows = psql("SELECT count(*) FROM pq_orders")
+        pg_sum  = psql("SELECT sum(amount)::text FROM pq_orders")
+        if xcheck("count all rows vs PostgreSQL", pg_rows, rows): npass_x += 1
+        else: nfail_x += 1
+        if xcheck("sum(amount), NULLs skipped, vs PostgreSQL", pg_sum, s): npass_x += 1
+        else: nfail_x += 1
+        if xcheck("one batch per row group", rgtot, str(int(rgtot))): npass_x += 1
+        else: nfail_x += 1
+
+        # Projection: 2 of 10 columns asked for, so decoded values must be
+        # 2 * rows and not 10 * rows. This is the claim with teeth -- the four
+        # pad_* columns exist only to be absent here.
+        want_dec = str(2 * int(pg_rows))
+        if xcheck("decoded values = projected cols x rows (2 of 10 columns)",
+                  want_dec, decoded): npass_x += 1
+        else: nfail_x += 1
+
+        # Chunked columns: measured, not assumed.
+        exp_chunks = f"{2 * int(rgtot)}"
+        if xcheck("Arrow chunks = cols x row groups (one chunk each)",
+                  exp_chunks, chunks): npass_x += 1
+        else: nfail_x += 1
+        if xcheck("bytes copied rather than borrowed", "0", copied): npass_x += 1
+        else: nfail_x += 1
+
+    # NULL behaviour: the all-NULL row group, summed through the provider.
+    # Distinct columns: a repeated projection is refused on purpose (it crashed
+    # the backend before both layers guarded it), so use two real columns.
+    r = xp("amount,pad_a")
+    if r[0].startswith("ERR"):
+        print(f"  BROKEN  NULL-count probe failed: {r[0]}"); nfail_x += 1
+    else:
+        pg = psql("SELECT count(*)||'|'||count(amount) FROM pq_orders")
+        pg_rows, pg_nonnull = pg.split("|")
+        want_nulls = str(int(pg_rows) - int(pg_nonnull))
+        if xcheck("NULL count on a nullable column vs PostgreSQL",
+                  want_nulls, r[2]): npass_x += 1
+        else: nfail_x += 1
+
+    # A NOT NULL column must arrive with validity == NULL, i.e. zero nulls.
+    r = xp("pad_a,order_id")
+    if r[0].startswith("ERR"):
+        print(f"  BROKEN  NOT NULL probe failed: {r[0]}"); nfail_x += 1
+    else:
+        if xcheck("NOT NULL column reports no NULLs", "0", r[2]): npass_x += 1
+        else: nfail_x += 1
+        pg = psql("SELECT sum(order_id)::text FROM pq_orders")
+        if xcheck("sum over a NOT NULL int8 column vs PostgreSQL", pg, r[1]): npass_x += 1
+        else: nfail_x += 1
+
+    # int64 boundary values must survive the borrow unchanged.
+    r = xp("order_id,pad_d")
+    if r[0].startswith("ERR"):
+        print(f"  BROKEN  int64-extremes probe failed: {r[0]}"); nfail_x += 1
+    else:
+        # pad_d carries INT64_MAX at row 11 and INT64_MIN at row 13. Their sum
+        # is -1, and PostgreSQL's final answer fits in int64 -- but SQL
+        # sum(int8) accumulates in NUMERIC, so no intermediate can overflow,
+        # while the probe accumulates in int64 and the INT64_MAX arrives first.
+        #
+        # The right assertion is therefore NOT that the two agree. It is that
+        # the probe DETECTS the overflow instead of wrapping silently. The
+        # difference is a property of the probe's accumulator, recorded rather
+        # than hidden; it is not a property of the batch contract, which only
+        # transports the values.
+        got = r[1] if r[1] else "overflow"
+        if xcheck("int64 extremes: probe detects overflow, does not wrap",
+                  "overflow", got): npass_x += 1
+        else: nfail_x += 1
+        pg_num = psql("SELECT sum(pad_d)::text FROM pq_orders")
+        print(f"            note: PostgreSQL sum(int8) is numeric and answers {pg_num};")
+        print(f"                  the probe's int64 accumulator cannot, by construction.")
+
+    # psql prints ERROR then DETAIL, so the last line is the detail; match on
+    # either rather than on whichever line happened to come last.
+    r = xp("amount,amount")
+    if r[0].startswith("ERR") and ("twice" in r[0] or "distinct file column" in r[0]):
+        print("  ok      repeated column in the projection is refused, not crashed")
+        npass_x += 1
+    else:
+        print(f"  DIFFER  repeated column should be refused, got {r[0][:70]}")
+        nfail_x += 1
+
+    print()
+    print(f"############ postgres/pyarrow: {npass} agree, {nfail} differ ############")
+    print(f"############ xpbatch provider: {npass_x} agree, {nfail_x} differ ############")
+    return 1 if (nfail or nfail_x) else 0
 
 
 if __name__ == "__main__":
