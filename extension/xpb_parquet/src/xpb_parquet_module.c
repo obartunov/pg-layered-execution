@@ -469,7 +469,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     TupleDescInitEntry(tupdesc,  6, "row_groups_read", INT4OID, -1, 0);
     TupleDescInitEntry(tupdesc,  7, "row_groups_pruned", INT4OID, -1, 0);
     TupleDescInitEntry(tupdesc,  8, "decoded_values",  INT8OID, -1, 0);
-    TupleDescInitEntry(tupdesc,  9, "bytes_read",      INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc,  9, "attributed_bytes", INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 10, "copy_bytes",      INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 11, "arrow_chunks",    INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
@@ -494,7 +494,7 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[5] = Int32GetDatum(st->rg_read);
         vals[6] = Int32GetDatum(st->rg_pruned);
         vals[7] = Int64GetDatum(xpq_decoded_values(st->reader));
-        vals[8] = Int64GetDatum(xpq_bytes_read(st->reader));
+        vals[8] = Int64GetDatum(xpq_attributed_bytes(st->reader));
         vals[9] = Int64GetDatum(xpq_copy_bytes(st->reader));
         vals[10] = Int64GetDatum(xpq_chunks_seen(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
@@ -502,5 +502,77 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     MemoryContextSwitchTo(oldcxt);
     src->ops->end(src);
+    return (Datum) 0;
+}
+
+/*
+ * xpq_columns(path) -> one row per file column.
+ *
+ * Projection evidence, per column rather than in aggregate: the caller can
+ * show exactly which columns a query's projection covers and what share of the
+ * file the rest accounts for. `compressed_bytes` is from the footer, so it is
+ * attributable size and not measured I/O -- the same caveat as
+ * attributed_bytes.
+ */
+PG_FUNCTION_INFO_V1(xpq_columns);
+
+Datum
+xpq_columns(PG_FUNCTION_ARGS)
+{
+    char           *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc       tupdesc;
+    Tuplestorestate *store;
+    MemoryContext   oldcxt;
+    XpqReader      *r;
+    char            errbuf[XPQ_ERRBUF];
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("xpq_columns: set-valued context required")));
+
+    errbuf[0] = '\0';
+    r = xpq_open(path, errbuf, sizeof(errbuf));
+    if (r == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_FILE),
+                 errmsg("xpb_parquet: cannot open \"%s\"", path),
+                 errdetail("%s", errbuf[0] ? errbuf : "no detail")));
+
+    oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    tupdesc = CreateTemplateTupleDesc(4);
+    TupleDescInitEntry(tupdesc, 1, "col",              INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 2, "name",             TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, 3, "batch_type",       TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, 4, "compressed_bytes", INT8OID, -1, 0);
+    tupdesc = BlessTupleDesc(tupdesc);
+
+    store = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = store;
+    rsinfo->setDesc    = tupdesc;
+
+    for (int c = 0; c < xpq_num_columns(r); c++)
+    {
+        Datum       vals[4];
+        bool        nulls[4] = {false, false, false, false};
+        const char *tn;
+
+        switch (xpq_column_type(r, c))
+        {
+            case XPQ_COL_INT32: tn = "int4"; break;
+            case XPQ_COL_INT64: tn = "int8"; break;
+            default:            tn = "(unsupported)"; break;
+        }
+        vals[0] = Int32GetDatum(c);
+        vals[1] = CStringGetTextDatum(xpq_column_name(r, c));
+        vals[2] = CStringGetTextDatum(tn);
+        vals[3] = Int64GetDatum(xpq_column_compressed_bytes(r, c));
+        tuplestore_putvalues(store, tupdesc, vals, nulls);
+    }
+
+    MemoryContextSwitchTo(oldcxt);
+    xpq_close(r);
     return (Datum) 0;
 }

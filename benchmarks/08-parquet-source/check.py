@@ -214,11 +214,12 @@ def main():
     TBL = pq.read_table(PARQUET)
 
     # The probe function lives in the optional module; declare it in the test DB.
+    psql("DROP FUNCTION IF EXISTS xpq_scan(text,text,bigint,bigint)")
     psql("CREATE OR REPLACE FUNCTION xpq_scan(path text, cols text, "
          "lo bigint DEFAULT NULL, hi bigint DEFAULT NULL) "
          "RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, "
          "nulls_first_col bigint, row_groups_total int, row_groups_read int, "
-         "row_groups_pruned int, decoded_values bigint, bytes_read bigint, "
+         "row_groups_pruned int, decoded_values bigint, attributed_bytes bigint, "
          "copy_bytes bigint, arrow_chunks bigint) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
@@ -369,6 +370,68 @@ def main():
     else:
         print(f"  DIFFER  repeated column should be refused, got {r[0][:70]}")
         nfail_x += 1
+
+    # ─────────────────────────────────────────── projection evidence (0003) ──
+    print()
+    print("=== projection: only the named columns are decoded ===")
+    print("decoded_values must equal (projected columns x rows), and")
+    print("attributed_bytes must equal the SUM OF THOSE COLUMNS' footer sizes")
+    print("exactly -- so an unprojected column contributes zero, provably,")
+    print("rather than just appearing not to.")
+    print()
+
+    psql("CREATE OR REPLACE FUNCTION xpq_columns(path text) "
+         "RETURNS TABLE (col int, name text, batch_type text, compressed_bytes bigint) "
+         "LANGUAGE c STRICT AS '\$libdir/xpb_parquet', 'xpq_columns'")
+
+    colsize = {}
+    for line in psql_rows(f"LOAD 'xpb_parquet'; SELECT name||'|'||compressed_bytes "
+                          f"FROM xpq_columns('{PARQUET}')"):
+        if "|" in line:
+            nm, b = line.rsplit("|", 1)
+            colsize[nm] = int(b)
+
+    nrows = int(psql("SELECT count(*) FROM pq_orders"))
+    ladders = [
+        ["amount"],
+        ["order_date_key", "amount"],
+        ["order_date_key", "customer_id", "amount"],          # the representative query
+        ["order_date_key", "order_id", "customer_id", "amount",
+         "quantity", "status", "pad_a", "pad_b"],
+    ]
+    for cols in ladders:
+        r = xp(",".join(cols))
+        if r[0].startswith("ERR"):
+            print(f"  BROKEN  projection {len(cols)} cols: {r[0]}")
+            nfail_x += 1
+            continue
+        decoded = int(r[5])
+        attributed = int(psql(
+            "LOAD 'xpb_parquet'; SELECT attributed_bytes FROM xpq_scan("
+            f"'{PARQUET}', '{','.join(cols)}')"))
+        want_dec = len(cols) * nrows
+        want_bytes = sum(colsize[c] for c in cols)
+        label = f"{len(cols)} of {len(colsize)} columns"
+        if xcheck(f"{label}: decoded values", str(want_dec), str(decoded)): npass_x += 1
+        else: nfail_x += 1
+        if xcheck(f"{label}: attributed bytes = sum of those columns",
+                  str(want_bytes), str(attributed)): npass_x += 1
+        else: nfail_x += 1
+
+    all_bytes = sum(colsize.values())
+    repr_cols = ["order_date_key", "customer_id", "amount"]
+    repr_bytes = sum(colsize[c] for c in repr_cols)
+    pad_bytes = sum(v for k, v in colsize.items() if k.startswith("pad_"))
+    print()
+    print(f"  representative query reads {repr_bytes} of {all_bytes} column bytes "
+          f"({100.0*repr_bytes/all_bytes:.1f}%)")
+    print(f"  the four pad_* columns are {pad_bytes} bytes ({100.0*pad_bytes/all_bytes:.1f}%) "
+          f"and are never decoded by it")
+    print()
+    print("  note: attributed_bytes is PROJECTED COMPRESSED BYTES ATTRIBUTABLE FROM")
+    print("        PARQUET METADATA -- summed from the footer, not measured I/O. No")
+    print("        syscall is counted and the page cache is not consulted. Real")
+    print("        byte-range accounting is 0005's job.")
 
     print()
     print(f"############ postgres/pyarrow: {npass} agree, {nfail} differ ############")

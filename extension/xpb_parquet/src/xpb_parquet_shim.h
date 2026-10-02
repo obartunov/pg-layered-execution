@@ -100,7 +100,20 @@ int         xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
 
 /* ── Instrumentation. Required to prove projection and pruning. ── */
 
-int64_t     xpq_bytes_read(const XpqReader *r);       /* cumulative, from the file */
+/*
+ * Compressed bytes of the SELECTED column chunks, summed from the footer's
+ * per-chunk total_compressed_size for the row groups actually read.
+ *
+ * This is PROJECTED COMPRESSED BYTES ATTRIBUTABLE FROM PARQUET METADATA. It is
+ * what projection and pruning move, and it is not a measurement of I/O: no
+ * syscall is counted, and the page cache is not consulted. Real byte-range
+ * accounting belongs in 0005, by wrapping the Arrow file reader.
+ */
+int64_t     xpq_attributed_bytes(const XpqReader *r);
+
+/* Whole-file compressed size of one column, all row groups, from the footer.
+ * Lets a caller show what a projection did NOT ask for. */
+int64_t     xpq_column_compressed_bytes(const XpqReader *r, int col);
 int64_t     xpq_decoded_values(const XpqReader *r);   /* values materialised       */
 int64_t     xpq_copy_bytes(const XpqReader *r);       /* copied, not borrowed      */
 int         xpq_row_groups_read(const XpqReader *r);

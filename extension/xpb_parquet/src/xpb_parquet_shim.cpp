@@ -72,7 +72,7 @@ struct XpqReader
      * Parallel to the columns of `held`; empty entries mean "borrowed". */
     std::vector<std::shared_ptr<arrow::Buffer>>     copies;
 
-    int64_t bytes_read      = 0;
+    int64_t attributed_bytes = 0;
     int64_t decoded_values  = 0;
     int64_t copy_bytes      = 0;
     int     row_groups_read = 0;
@@ -116,7 +116,7 @@ xpq_open(const char *path, char *errbuf, size_t errbuflen)
          * read" starts from a true baseline rather than from zero. */
         auto sz = r->file->GetSize();
         if (sz.ok())
-            r->bytes_read = 0;      /* page data only; footer counted separately */
+            r->attributed_bytes = 0;   /* column-chunk bytes only */
 
         r->open_ms = now_ms() - t0;
         return r;
@@ -389,13 +389,13 @@ xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
         }
 
         /*
-         * Bytes attributable to this row group's SELECTED columns, from the
-         * footer's per-chunk compressed sizes. This is read volume, which is
-         * the number projection and pruning are supposed to move; it is not
-         * measured at the syscall level and is labelled accordingly.
+         * Projected compressed bytes attributable from the footer, for this row
+         * group's SELECTED columns only. Not an I/O measurement -- see the
+         * header. 0005 adds real byte-range accounting.
          */
         for (int i = 0; i < ncols; i++)
-            r->bytes_read += r->md->RowGroup(rg)->ColumnChunk(cols[i])->total_compressed_size();
+            r->attributed_bytes +=
+                r->md->RowGroup(rg)->ColumnChunk(cols[i])->total_compressed_size();
 
         r->row_groups_read++;
         r->decode_ms += now_ms() - t0;
@@ -413,7 +413,22 @@ xpq_read_row_group(XpqReader *r, int rg, const int *cols, int ncols,
     }
 }
 
-int64_t xpq_bytes_read(const XpqReader *r)      { return r ? r->bytes_read : 0; }
+int64_t xpq_attributed_bytes(const XpqReader *r) { return r ? r->attributed_bytes : 0; }
+
+int64_t
+xpq_column_compressed_bytes(const XpqReader *r, int col)
+{
+    try
+    {
+        if (!r || !r->md || col < 0 || col >= r->md->num_columns())
+            return 0;
+        int64_t total = 0;
+        for (int rg = 0; rg < r->md->num_row_groups(); rg++)
+            total += r->md->RowGroup(rg)->ColumnChunk(col)->total_compressed_size();
+        return total;
+    }
+    catch (...) { return 0; }
+}
 int64_t xpq_decoded_values(const XpqReader *r)  { return r ? r->decoded_values : 0; }
 int64_t xpq_copy_bytes(const XpqReader *r)      { return r ? r->copy_bytes : 0; }
 int     xpq_row_groups_read(const XpqReader *r) { return r ? r->row_groups_read : 0; }
