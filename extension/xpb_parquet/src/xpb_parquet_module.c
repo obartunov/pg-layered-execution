@@ -62,9 +62,15 @@ typedef struct XpqSourceState
     int64       pred_lo;
     int64       pred_hi;
 
-    /* Observability. */
-    int         rg_pruned;
-    int         rg_read;
+    /*
+     * Row-group accounting. Separate counters rather than one "pruned" number,
+     * because the interesting question is not how many were skipped but
+     * whether any was skipped WITHOUT the file stating its bounds.
+     */
+    int         rg_stats_available;  /* footer declared min/max for the pred column */
+    int         rg_considered;       /* evaluated against the predicate            */
+    int         rg_skipped;          /* excluded by declared bounds                */
+    int         rg_read;             /* handed to the operators                    */
 } XpqSourceState;
 
 /* ────────────────────────────────────────────────────────── next_batch ── */
@@ -78,11 +84,10 @@ xpq_next_batch(XpBatchSource *src, XpColumnBatch *batch)
     int             rg;
 
     /* Skip row groups the metadata excluded. */
+    /* Skipping happens here, BEFORE any page is decoded: a skipped row group
+     * never reaches xpq_read_row_group(). decoded_values is the evidence. */
     while (st->next_rg < st->nrow_groups && !st->rg_wanted[st->next_rg])
-    {
-        st->rg_pruned++;
         st->next_rg++;
-    }
     if (st->next_rg >= st->nrow_groups)
         return false;
 
@@ -145,7 +150,6 @@ xpq_rescan(XpBatchSource *src)
     XpqSourceState *st = (XpqSourceState *) src->private_state;
 
     st->next_rg = 0;
-    st->rg_pruned = 0;
     st->rg_read = 0;
 }
 
@@ -271,12 +275,65 @@ xpq_create(const XpbSourceRequest *req)
     st->pred_hi     = req->pred_hi;
 
     /*
-     * Every row group is wanted at this milestone. Pruning is commit 0004 and
-     * will set these from the footer's declared statistics only.
+     * Row-group pruning, from DECLARED Parquet metadata only.
+     *
+     * The rule, and the only rule:
+     *
+     *     skip  iff  the footer states min/max for the predicate column
+     *                AND the predicate range cannot intersect [min, max]
+     *
+     *     no stats  =>  unknown  =>  READ
+     *
+     * There is no statistical proxy and no "probably skip". The lesson is
+     * R1-11's: XpGroupAgg2 skipped pages on an ordering it inferred from a
+     * statistic, and lost rows. Parquet statistics are different in kind --
+     * they are bounds the writer DECLARED for that chunk, not a correlation
+     * estimated from a sample -- but they are still optional, so their absence
+     * must mean "read", never "assume".
+     *
+     * Parquet min/max exclude NULLs, and a NULL cannot satisfy a range
+     * predicate, so excluding a row group whose declared bounds miss the range
+     * drops no matching row even when the chunk also contains NULLs.
+     *
+     * Deliberately NOT done: a row group with null_count == num_rows could also
+     * be excluded, since no NULL satisfies a range predicate. That is a second,
+     * different rule; one checkable invariant is worth more here than one more
+     * skipped row group, and the all-NULL case is exactly where HasMinMax() is
+     * false, so it currently lands in the conservative branch. Recorded as an
+     * opportunity not taken.
+     *
+     * The predicate's column is the LEADING PROJECTED column, which is how
+     * has_pred is already interpreted by the heap, zlfs and pgcolumnar
+     * providers. Nothing Parquet-specific crosses the provider boundary: the
+     * footer is read here and the operators still see only batches.
      */
     st->rg_wanted = (bool *) palloc(sizeof(bool) * Max(st->nrow_groups, 1));
     for (int i = 0; i < st->nrow_groups; i++)
-        st->rg_wanted[i] = true;
+    {
+        int64   mn = 0, mx = 0, nulls = 0;
+        bool    have;
+
+        st->rg_wanted[i] = true;        /* default is always to read */
+
+        have = xpq_row_group_stats_i64(st->reader, i, st->cols[0],
+                                       &mn, &mx, &nulls) != 0;
+        if (have)
+            st->rg_stats_available++;
+
+        if (!st->has_pred)
+            continue;                   /* nothing to evaluate against */
+
+        st->rg_considered++;
+
+        if (!have)
+            continue;                   /* unknown => read */
+
+        if (mx < st->pred_lo || mn > st->pred_hi)
+        {
+            st->rg_wanted[i] = false;
+            st->rg_skipped++;
+        }
+    }
 
     src = (XpBatchSource *) palloc0(sizeof(XpBatchSource));
     src->ops = &xpq_ops;
@@ -460,18 +517,20 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(11);
+    tupdesc = CreateTemplateTupleDesc(13);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  4, "nulls_first_col", INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  5, "row_groups_total", INT4OID, -1, 0);
     TupleDescInitEntry(tupdesc,  6, "row_groups_read", INT4OID, -1, 0);
-    TupleDescInitEntry(tupdesc,  7, "row_groups_pruned", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc,  7, "row_groups_skipped", INT4OID, -1, 0);
     TupleDescInitEntry(tupdesc,  8, "decoded_values",  INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  9, "attributed_bytes", INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 10, "copy_bytes",      INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 11, "arrow_chunks",    INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 12, "row_groups_stats_available", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 13, "row_groups_considered",      INT4OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -481,8 +540,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[11];
-        bool    nulls[11] = {false, false, false, false, false,
+        Datum   vals[13];
+        bool    nulls[13] = {false, false, false, false, false, false, false,
                              false, false, false, false, false, false};
 
         vals[0] = Int64GetDatum(rows);
@@ -492,11 +551,13 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[3] = Int64GetDatum(nulls_col0);
         vals[4] = Int32GetDatum(st->nrow_groups);
         vals[5] = Int32GetDatum(st->rg_read);
-        vals[6] = Int32GetDatum(st->rg_pruned);
+        vals[6] = Int32GetDatum(st->rg_skipped);
         vals[7] = Int64GetDatum(xpq_decoded_values(st->reader));
         vals[8] = Int64GetDatum(xpq_attributed_bytes(st->reader));
         vals[9] = Int64GetDatum(xpq_copy_bytes(st->reader));
         vals[10] = Int64GetDatum(xpq_chunks_seen(st->reader));
+        vals[11] = Int32GetDatum(st->rg_stats_available);
+        vals[12] = Int32GetDatum(st->rg_considered);
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 

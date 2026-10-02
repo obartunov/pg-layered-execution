@@ -32,6 +32,7 @@ import pyarrow.parquet as pq
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 PARQUET = os.path.join(DATA, "orders.parquet")
+NOSTATS = os.path.join(DATA, "orders_nostats.parquet")
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "5432"
 HOST = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -219,8 +220,9 @@ def main():
          "lo bigint DEFAULT NULL, hi bigint DEFAULT NULL) "
          "RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, "
          "nulls_first_col bigint, row_groups_total int, row_groups_read int, "
-         "row_groups_pruned int, decoded_values bigint, attributed_bytes bigint, "
-         "copy_bytes bigint, arrow_chunks bigint) "
+         "row_groups_skipped int, decoded_values bigint, attributed_bytes bigint, "
+         "copy_bytes bigint, arrow_chunks bigint, "
+         "row_groups_stats_available int, row_groups_considered int) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
     npass = nfail = 0
@@ -432,6 +434,104 @@ def main():
     print("        PARQUET METADATA -- summed from the footer, not measured I/O. No")
     print("        syscall is counted and the page cache is not consulted. Real")
     print("        byte-range accounting is 0005's job.")
+
+    # ────────────────────────────────────── row-group pruning (0004) ──
+    print()
+    print("=== row-group pruning: declared metadata only ===")
+    print("Invariant, and the only rule:")
+    print("    skip iff the footer states min/max AND the predicate range")
+    print("    cannot intersect [min, max];   no stats => unknown => READ")
+    print()
+
+    def scan(path, cols, lo=None, hi=None):
+        args = f"'{path}', '{cols}'" + (f", {lo}, {hi}" if lo is not None else "")
+        row = psql(
+            "LOAD 'xpb_parquet'; SELECT rows||'|'||row_groups_total||'|'"
+            "||row_groups_stats_available||'|'||row_groups_considered||'|'"
+            "||row_groups_skipped||'|'||row_groups_read||'|'||decoded_values||'|'"
+            f"||attributed_bytes FROM xpq_scan({args})")
+        if "|" not in row:
+            return None
+        k = row.split("|")
+        return dict(rows=int(k[0]), total=int(k[1]), stats=int(k[2]),
+                    considered=int(k[3]), skipped=int(k[4]), read=int(k[5]),
+                    decoded=int(k[6]), bytes=int(k[7]))
+
+    RG = 25000
+    pruning_cases = [
+        # label, lo, hi, expected row groups read, expected delivered rows
+        ("no predicate",            None, None, 8, 200000),
+        ("one row group",           RG_LO[2], RG_HI[2], 1, RG),
+        ("three row groups",        RG_LO[1], RG_HI[3], 3, 3 * RG),
+        ("matches nothing",         20990101, 20990201, 0, 0),
+        ("matches everything",      0, 99999999, 8, 200000),
+        # A predicate that cuts INSIDE row groups: two are read, and the source
+        # delivers both in full. Pruning is per row group; the residual filter
+        # is the operators' job, and the probe does not filter at all.
+        ("cuts inside two groups",  20260150, 20260250, 2, 2 * RG),
+    ]
+
+    for label, lo, hi, want_read, want_rows in pruning_cases:
+        g = scan(PARQUET, "order_date_key,amount", lo, hi)
+        if g is None:
+            print(f"  BROKEN  {label}: probe failed"); nfail_x += 1; continue
+
+        oks = []
+        oks.append(("row groups read", str(want_read), str(g["read"])))
+        oks.append(("rows delivered", str(want_rows), str(g["rows"])))
+        # skipped + read must account for every row group
+        oks.append(("skipped + read = total", str(g["total"]),
+                    str(g["skipped"] + g["read"])))
+        # never skip more than the file declared bounds for
+        oks.append(("skipped <= stats available", "True",
+                    str(g["skipped"] <= g["stats"])))
+        # considered is the whole file when there is a predicate, else nothing
+        oks.append(("considered", str(g["total"] if lo is not None else 0),
+                    str(g["considered"])))
+        # decoded values follow rows READ, which is what proves the skip
+        # happened before page decode rather than after it
+        oks.append(("decoded = 2 x rows read", str(2 * g["rows"]),
+                    str(g["decoded"])))
+        allok = all(w == gg for _, w, gg in oks)
+        if allok:
+            print(f"  ok      {label}: read {g['read']}/{g['total']}, "
+                  f"skipped {g['skipped']}, rows {g['rows']}, "
+                  f"decoded {g['decoded']}, bytes {g['bytes']}")
+            npass_x += 1
+        else:
+            print(f"  DIFFER  {label}")
+            for nm, w, gg in oks:
+                if w != gg:
+                    print(f"            {nm}: want {w} got {gg}")
+            nfail_x += 1
+
+    # The predicate that cuts inside row groups must OVER-deliver, not filter.
+    g = scan(PARQUET, "order_date_key,amount", 20260150, 20260250)
+    pg_match = int(psql("SELECT count(*) FROM pq_orders "
+                        "WHERE order_date_key BETWEEN 20260150 AND 20260250"))
+    if g and g["rows"] > pg_match:
+        print(f"  ok      source over-delivers rather than filtering "
+              f"({g['rows']} delivered, {pg_match} match) -- the operators filter")
+        npass_x += 1
+    else:
+        print(f"  DIFFER  expected over-delivery; delivered "
+              f"{g['rows'] if g else '?'} vs {pg_match} matching")
+        nfail_x += 1
+
+    print()
+    print("  negative test: the same rows with statistics ABSENT")
+    ns = scan(NOSTATS, "order_date_key,amount", RG_LO[2], RG_HI[2])
+    if ns is None:
+        print("  BROKEN  nostats probe failed"); nfail_x += 1
+    else:
+        for nm, w, gg in [
+            ("stats available", "0", str(ns["stats"])),
+            ("row groups skipped", "0", str(ns["skipped"])),
+            ("row groups read", str(ns["total"]), str(ns["read"])),
+            ("rows delivered", "200000", str(ns["rows"])),
+        ]:
+            if xcheck(f"no statistics: {nm}", w, gg): npass_x += 1
+            else: nfail_x += 1
 
     print()
     print(f"############ postgres/pyarrow: {npass} agree, {nfail} differ ############")

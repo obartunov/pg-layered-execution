@@ -134,6 +134,22 @@ def main():
         version="2.6",
     )
 
+    # Same rows, same row-group layout, statistics DELIBERATELY ABSENT.
+    #
+    # This is the negative test for the pruning rule: with no declared bounds
+    # the only admissible behaviour is to read every row group. A file like this
+    # is what turns "skip only on explicit metadata" from a comment into
+    # something a test can fail on.
+    nostats_path = os.path.join(outdir, "orders_nostats.parquet")
+    pq.write_table(
+        tbl, nostats_path,
+        row_group_size=RG_ROWS,
+        compression="none",
+        use_dictionary=False,
+        write_statistics=False,
+        version="2.6",
+    )
+
     csv_path = os.path.join(outdir, "orders.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -161,6 +177,10 @@ CREATE TABLE pq_orders (
     pad_d           int8   NOT NULL
 );
 """)
+
+    ns = pq.ParquetFile(nostats_path).metadata
+    print(f"orders_nostats.parquet: rows={ns.num_rows} row_groups={ns.num_row_groups} "
+          f"stats_set={ns.row_group(0).column(0).is_stats_set}")
 
     md = pq.ParquetFile(parquet_path).metadata
     print(f"rows={md.num_rows} row_groups={md.num_row_groups} "
