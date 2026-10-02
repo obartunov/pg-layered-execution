@@ -224,7 +224,9 @@ def main():
          "copy_bytes bigint, arrow_chunks bigint, "
          "row_groups_stats_available int, row_groups_considered int, "
          "min_last_col bigint, max_last_col bigint, null_key_sum bigint, "
-         "meta_bytes bigint, data_bytes bigint, read_calls bigint, decode_ms float8) "
+         "meta_bytes bigint, data_bytes bigint, read_calls bigint, decode_ms float8, "
+         "bytes_requested bigint, bytes_returned bigint, "
+         "meta_calls bigint, data_calls bigint) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
     npass = nfail = 0
