@@ -729,6 +729,10 @@ int64_t xpq_s3_http_attempts(const XpqReader *r)
 { return (r && r->object) ? xpb::s3_http_attempts(r->object.get()) : -1; }
 int64_t xpq_s3_retries(const XpqReader *r)
 { return (r && r->object) ? xpb::s3_retries(r->object.get()) : -1; }
+const char *xpq_s3_identity(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_identity(r->object.get()) : ""; }
+int64_t xpq_s3_identity_conflicts(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_identity_conflicts(r->object.get()) : -1; }
 
 /*
  * Controlled failure for the exception boundary.

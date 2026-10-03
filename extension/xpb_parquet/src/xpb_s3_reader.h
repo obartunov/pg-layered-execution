@@ -90,6 +90,10 @@ class ObjectReader;
  *   XPB_S3_ACCESS_KEY      access key id
  *   XPB_S3_SECRET_KEY      secret access key
  *   XPB_S3_REGION          region, default us-east-1
+ *   XPB_S3_IDENTITY_GUARD  "off" disables the one-version-per-reader guard.
+ *                          It exists so a test can demonstrate what the guard
+ *                          prevents; it is not a tuning knob and must not be
+ *                          off in use.
  *   XPB_S3_MAX_ATTEMPTS    total attempts per request, clamped to 1..5,
  *                          default 3. 1 disables retry, which is what the
  *                          failure tests use to see the raw error.
@@ -151,6 +155,16 @@ int64_t s3_bytes_transferred(const ObjectReader *r);
  * for a remote source. */
 int64_t s3_http_attempts(const ObjectReader *r);
 int64_t s3_retries(const ObjectReader *r);
+
+/*
+ * Range reads refused because the object changed since the reader opened it
+ * (HTTP 412). Nonzero means a mixed-version read was prevented, not that one
+ * happened.
+ */
+int64_t s3_identity_conflicts(const ObjectReader *r);
+
+/* The opaque identity token captured at open. Empty when unguarded. */
+const char *s3_identity(const ObjectReader *r);
 
 }   /* namespace xpb */
 

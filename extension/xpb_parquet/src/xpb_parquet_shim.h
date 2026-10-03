@@ -201,6 +201,19 @@ int64_t     xpq_s3_http_attempts(const XpqReader *r);
 int64_t     xpq_s3_retries(const XpqReader *r);
 
 /*
+ * The object identity pinned at open, and how many range reads were refused
+ * because the object changed under the scan. A nonzero conflict count means a
+ * mixed-version read was PREVENTED.
+ *
+ * The identity is an opaque token (an ETag), never a content hash: the same
+ * bytes have different ETags depending on how they were written -- a 22-part
+ * multipart upload of the benchmark file gives "...-22", a server-side copy of
+ * the identical content gives a single-part value.
+ */
+const char *xpq_s3_identity(const XpqReader *r);
+int64_t     xpq_s3_identity_conflicts(const XpqReader *r);
+
+/*
  * Open with a fault injected underneath the Parquet reader.
  *
  * Same file, same bytes, same decode path; only the delivery is damaged, so the

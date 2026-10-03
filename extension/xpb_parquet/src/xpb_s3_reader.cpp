@@ -185,11 +185,21 @@ parse_endpoint(const char *url, Endpoint *out, std::string *err)
 std::string
 s3_canonical_request(const char *method, const std::string &uri,
                      const std::string &host, const std::string &range,
-                     const std::string &amz_date)
+                     const std::string &amz_date, const std::string &if_match)
 {
     std::string canon_headers = "host:" + host + "\n";
     std::string signed_headers = "host;";
 
+    /*
+     * Canonical headers are sorted by name, so if-match goes between host and
+     * range. Getting this order wrong produces a signature the server rejects,
+     * which is at least loud -- unlike the identity bug it is here to prevent.
+     */
+    if (!if_match.empty())
+    {
+        canon_headers += "if-match:" + if_match + "\n";
+        signed_headers += "if-match;";
+    }
     if (!range.empty())
     {
         canon_headers += "range:" + range + "\n";
@@ -210,22 +220,25 @@ s3_canonical_request(const char *method, const std::string &uri,
 /* Forward: the canonical request, built by the same code that signs it. */
 std::string s3_canonical_request(const char *method, const std::string &uri,
                                  const std::string &host, const std::string &range,
-                                 const std::string &amz_date);
+                                 const std::string &amz_date,
+                                 const std::string &if_match);
 
 std::string
 build_signed_request(const char *method, const std::string &uri,
                      const std::string &host, const std::string &range,
                      const std::string &amz_date, const std::string &datestamp,
                      const std::string &region, const std::string &access,
-                     const std::string &secret)
+                     const std::string &secret, const std::string &if_match)
 {
     std::string signed_headers = "host;";
+    if (!if_match.empty())
+        signed_headers += "if-match;";
     if (!range.empty())
         signed_headers += "range;";
     signed_headers += "x-amz-content-sha256;x-amz-date";
 
     std::string canonical_request =
-        s3_canonical_request(method, uri, host, range, amz_date);
+        s3_canonical_request(method, uri, host, range, amz_date, if_match);
 
     std::string sig = sigv4_signature(canonical_request, amz_date, datestamp,
                       region, "s3", secret);
@@ -234,6 +247,8 @@ build_signed_request(const char *method, const std::string &uri,
     std::string req;
     req += std::string(method) + " " + uri + " HTTP/1.1\r\n";
     req += "Host: " + host + "\r\n";
+    if (!if_match.empty())
+        req += "If-Match: " + if_match + "\r\n";
     if (!range.empty())
         req += "Range: " + range + "\r\n";
     req += std::string("x-amz-content-sha256: ") + kEmptyPayloadSha256 + "\r\n";
@@ -258,6 +273,9 @@ public:
 
     void set_max_attempts(int n) { max_attempts_ = n; }
     void set_io_timeout_ms(int n) { io_timeout_ms_ = n; }
+    void set_require_identity(bool b) { require_identity_ = b; }
+    const std::string &identity() const { return identity_; }
+    int64_t identity_conflicts() const { return identity_conflicts_; }
     void set_connect_timeout_ms(int n) { connect_timeout_ms_ = n; }
 
     ~S3Reader() override { close(); }
@@ -304,9 +322,47 @@ public:
         std::string cl = header_value(headers, "Content-Length");
         if (cl.empty())
             return fail("HEAD " + path() + ": no Content-Length");
-        size_ = strtoll(cl.c_str(), nullptr, 10);
-        if (size_ < 0)
+        int64_t sz = strtoll(cl.c_str(), nullptr, 10);
+        if (sz < 0)
             return fail("HEAD " + path() + ": bad Content-Length");
+
+        /*
+         * SIZE AND IDENTITY ARE ONE SNAPSHOT.
+         *
+         * They come from the same HEAD response and are stored together, so
+         * there is no state in which the reader holds a length from one
+         * incarnation of the object and reads ranges from another. That pair
+         * is the whole of what this reader knows about "which object".
+         *
+         * The ETag is an OPAQUE IDENTITY TOKEN, not a content hash, and this
+         * code must never treat it as one. The same bytes get different ETag
+         * shapes depending on how they were written: a 22-part multipart
+         * upload of the benchmark file gives
+         * "c7333b8e11884cda65957f5f6e7e62c4-22", while a server-side copy of
+         * the same content gives a single-part "5492fdb1...". Comparing an
+         * ETag with a checksum we computed, or across objects, would be wrong.
+         * It is only ever echoed back in If-Match.
+         */
+        std::string etag = header_value(headers, "ETag");
+
+        if (etag.empty() && require_identity_)
+        {
+            /*
+             * Refused rather than read unguarded. Without an identity token
+             * there is no way to notice the object changing underneath a scan,
+             * and that is a wrong-answer class: a footer from one incarnation
+             * and data from another. A reader that cannot be made safe should
+             * not silently become unsafe.
+             */
+            return fail("HEAD " + path() + ": the server returned no ETag, so "
+                        "object identity cannot be pinned for the life of this "
+                        "read; refusing rather than risking a mixed-version "
+                        "scan (set XPB_S3_IDENTITY_GUARD=off to override, which "
+                        "is for testing the unguarded behaviour and not for use)");
+        }
+
+        size_ = sz;
+        identity_ = require_identity_ ? etag : std::string();
         return size_;
     }
 
@@ -409,6 +465,27 @@ public:
             http_errors_++;
             fail("GET " + path() + ": server ignored Range and returned the "
                  "whole object (HTTP 200); refusing rather than slicing it");
+            return ReadResult::failure();
+        }
+
+        /*
+         * 412: the object is no longer the one this reader opened.
+         *
+         * An explicit, final error. No retry -- another attempt asks the same
+         * question and gets the same answer. No re-HEAD, no adopting the new
+         * ETag, no reopening: one ObjectReader reads exactly one incarnation
+         * of the object or it fails. Silently continuing is the mixed-version
+         * read this guard exists to prevent, and it is reachable: without the
+         * guard, replacing the object mid-scan made a scan whose footer came
+         * from A fail at row group 53 on a page header from B.
+         */
+        if (status == 412)
+        {
+            http_errors_++;
+            identity_conflicts_++;
+            fail("GET " + path() + " " + range + ": the object changed since this "
+                 "read began (If-Match " + identity_ + " -> HTTP 412). One reader "
+                 "reads one object version; not retrying and not reopening");
             return ReadResult::failure();
         }
 
@@ -822,8 +899,16 @@ private:
         strftime(datestamp, sizeof(datestamp), "%Y%m%d", &tmv);
 
         std::string host = ep_.host + ":" + std::to_string(ep_.port);
+
+        /*
+         * Every RANGE read carries the identity captured at open. The HEAD
+         * that establishes it sends none -- it is what defines identity, so
+         * conditioning it on itself would be circular.
+         */
+        const std::string cond = range.empty() ? std::string() : identity_;
+
         return build_signed_request(method, path(), host, range, amz_date,
-                                    datestamp, region_, access_, secret_);
+                                    datestamp, region_, access_, secret_, cond);
     }
 
 
@@ -836,6 +921,9 @@ private:
     int64_t     http_errors_ = 0;
     int64_t     bytes_transferred_ = 0; /* bytes off the wire, retries included */
     int64_t     http_attempts_ = 0;     /* physical exchanges, retries included */
+    std::string identity_;              /* opaque ETag captured with size_     */
+    bool        require_identity_ = true;
+    int64_t     identity_conflicts_ = 0;
     int64_t     retries_done_ = 0;
     int         max_attempts_ = 3;
     int         io_timeout_ms_ = 15000;
@@ -873,7 +961,7 @@ s3_test_authorization(const char *method, const char *uri, const char *host,
     std::string req = build_signed_request(method, uri, host,
                                            range ? range : "",
                                            amz_date, datestamp, region,
-                                           access, secret);
+                                           access, secret, std::string());
     /* Return just the Authorization line's value, which is what the oracle
      * produces too. */
     const std::string tag = "Authorization: ";
@@ -888,7 +976,8 @@ std::string
 s3_test_canonical_request(const char *method, const char *uri, const char *host,
                           const char *range, const char *amz_date)
 {
-    return s3_canonical_request(method, uri, host, range ? range : "", amz_date);
+    return s3_canonical_request(method, uri, host, range ? range : "", amz_date,
+                                std::string());
 }
 
 bool
@@ -966,6 +1055,14 @@ open_s3_reader(const char *uri, std::string *error)
             if (n > 300000) n = 300000;
             r->set_io_timeout_ms(n);
         }
+        /*
+         * Off exists so the negative control is reproducible -- a test has to
+         * be able to show what the guard prevents. It is not a tuning knob.
+         */
+        const char *ig = getenv("XPB_S3_IDENTITY_GUARD");
+        if (ig != nullptr && (strcmp(ig, "off") == 0 || strcmp(ig, "0") == 0))
+            r->set_require_identity(false);
+
         const char *ct = getenv("XPB_S3_CONNECT_TIMEOUT_MS");
         if (ct != nullptr)
         {
@@ -994,5 +1091,9 @@ int64_t s3_http_attempts(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->http_attempts() : -1; }
 int64_t s3_retries(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->retries() : -1; }
+int64_t s3_identity_conflicts(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->identity_conflicts() : -1; }
+const char *s3_identity(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->identity().c_str() : ""; }
 
 }   /* namespace xpb */
