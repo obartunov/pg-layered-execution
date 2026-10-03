@@ -604,6 +604,68 @@ kill "$FJ" 2>/dev/null; wait "$FJ" 2>/dev/null
 # Leave nothing armed for whatever runs next.
 arm 0 0 0 0
 
+# ---- 9. one reader, one incarnation -- the LOCAL transport ----------------
+echo
+echo "=== 9. local object identity ==="
+#
+# v0.5 proved the mixed-incarnation wrong-answer class is not S3-specific: one
+# FileReader returned PAR1 and then XXXX from the same offset across an
+# in-place overwrite. This section is that class closed, and the controls that
+# keep the guard honest -- an atomic rename replacement is the CORRECT way to
+# publish a new file, and a reader already holding a descriptor on the old
+# inode can finish safely. A guard that refused everything would pass the
+# detections and be useless.
+PQT_SRC="$REPO/extension/xpb_parquet/src"
+PQT_TEST="$REPO/extension/xpb_parquet/test"
+if ! command -v g++ >/dev/null 2>&1; then
+    echo "  skip    no g++"
+elif [ ! -f "$PQT_SRC/xpb_object_reader.o" ]; then
+    echo "  skip    xpb_object_reader.o not built; run make in extension/xpb_parquet"
+else
+    # The matrix first: the token must be chosen from measurement, and the
+    # measurement is cheap enough to re-run as part of the suite. It is
+    # reported rather than asserted -- it is what the choice RESTS on, and if
+    # it ever changes the choice has to be revisited, not patched.
+    if g++ -std=c++20 -O1 -Wno-unused-result -o "$TMP/identmatrix" \
+           "$PQT_TEST/local_identity_matrix.cpp" 2>"$TMP/m.build"; then
+        "$TMP/identmatrix" "$TMP/matrix" 2>&1 | sed -n '/^scenario/,/^$/p' | sed 's/^/          /'
+        MT=$("$TMP/identmatrix" "$TMP/matrix2" 2>&1 | grep -c "back-to-back writes left st_mtim UNCHANGED" || true)
+        UNCH=$("$TMP/identmatrix" "$TMP/matrix3" 2>&1 \
+               | grep -oP '^timestamp resolution probe: \d+' | grep -oP '\d+' || echo "?")
+        echo "          writes that left st_mtim unchanged: ${UNCH:-?} (of 200)"
+        if [ "${UNCH:-1}" = "0" ]; then
+            ok "mtime moves on every write here, so it can serve as the change detector"
+        else
+            bad "${UNCH} writes left st_mtim unchanged -- a timestamp token is unsound on this filesystem"
+        fi
+    else
+        bad "building the identity matrix: $(tail -1 "$TMP/m.build")"
+    fi
+
+    # Then the guard itself, detections and controls together.
+    if g++ -std=c++20 -O1 -Wno-unused-result -I "$PQT_SRC" -o "$TMP/identguard" \
+           "$PQT_TEST/local_identity_guard.cpp" "$PQT_SRC/xpb_object_reader.o" \
+           2>"$TMP/g.build"; then
+        if "$TMP/identguard" "$TMP/guard" > "$TMP/g.out" 2>&1; then
+            grep "^  ok" "$TMP/g.out" | sed 's/^/  /'
+            N=$(grep -c "^  ok" "$TMP/g.out"); pass=$((pass + ${N:-0}))
+        else
+            cat "$TMP/g.out"
+            P2=$(grep -c "^  ok" "$TMP/g.out"); pass=$((pass + ${P2:-0}))
+            F2=$(grep -c "^  FAIL" "$TMP/g.out"); fail=$((fail + ${F2:-1}))
+        fi
+    else
+        bad "building the identity guard: $(tail -1 "$TMP/g.build")"
+    fi
+
+    # And the cost, as a syscall count rather than a wall-clock difference:
+    # the effect is ~50 us against several ms of run-to-run noise, so a timing
+    # comparison cannot resolve it and reporting one would be misleading.
+    if g++ -std=c++20 -O2 -o "$TMP/fstatcost" "$PQT_TEST/local_identity_cost.cpp" 2>/dev/null; then
+        "$TMP/fstatcost" "$PQ" 2>&1 | sed 's/^/          /'
+    fi
+fi
+
 echo
 echo "############ $pass correct, $fail wrong ############"
 [ "$fail" -eq 0 ]

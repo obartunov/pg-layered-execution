@@ -34,6 +34,9 @@ Modes:
   hang                  accept, promise a body, send nothing, never close
   hang_get:N            the same for GETs after the Nth -- a stall arriving
                         mid-scan on whatever thread Arrow is reading from
+  replace_at_get:N      replace the object, then serve GET N -- so the read
+                        whose If-Match names the opened incarnation is the one
+                        refused. Deterministic: a read ordinal, not a clock.
   fail_then_replace:N   fail GET N transiently AND replace the object before
                         the retry arrives -- the retry must still carry the
                         identity captured at open and be refused
@@ -210,6 +213,23 @@ class Handler(BaseHTTPRequestHandler):
         # Keyed on the GET ordinal, so the HEAD never absorbs them.
         if name == "fail_get_first" and method == "GET" and g <= int(arg or 1):
             return self._error(503, f"injected transient GET failure {g}")
+
+        if name == "replace_at_get" and method == "GET" and g == int(arg or 1):
+            # Replace the object and then serve this very request. The client's
+            # If-Match still names the incarnation it opened, so this GET is
+            # the one that must be refused -- deterministically, at a read
+            # ordinal, with no clock in it.
+            #
+            # The first version of this test slept two seconds and then ran the
+            # replacement, which is a server-side copy taking ~4.4 s against a
+            # ~9.5 s scan: the replacement became visible anywhere between row
+            # group 50 and the end of the scan, and sometimes after the last
+            # read. It passed, then it did not. A wall-clock trigger was the
+            # defect, not the guard.
+            try:
+                _replace_object(self.server)
+            except Exception as e:                      # noqa: BLE001
+                return self._error(500, f"replacement FAILED: {e}")
 
         if name == "fail_then_replace" and method == "GET" and g == int(arg or 1):
             # THE PHASE 6 CASE. Fail this GET transiently AND replace the

@@ -521,16 +521,21 @@ else
     # ---- the replacement test ------------------------------------------
     # A and B differ by one byte in total length and have the same 200 row
     # groups, so without a guard a read can technically continue into B.
+    # Triggered on a READ ORDINAL, through the proxy, not on a clock. A
+    # sleep-then-swap version of this test was timing-dependent: the swap is a
+    # server-side copy taking ~4.4 s against a ~9.5 s scan, so the replacement
+    # became visible anywhere from row group 50 to past the last read, and the
+    # test passed or failed by luck.
     replace_midscan() {   # replace_midscan <sql-file> -> output
-        local sqlf="$1" out j
-        out="$TMP/mid.out"
-        rm -f "$out"
-        timeout 500 "${PSQL[@]}" -f "$sqlf" > "$out" 2>&1 &
-        j=$!
-        sleep 2
-        timeout 200 python3 "$ADMIN" swap B >/dev/null 2>&1
-        wait $j 2>/dev/null
-        tr '\n' ' ' < "$out"
+        local sqlf="$1"
+        if [ ! -w "$CONTROL" ]; then
+            echo "NOPROXY"
+            return
+        fi
+        echo "replace_at_get:4" > "$CONTROL"
+        sleep 0.3
+        timeout 500 "${PSQL[@]}" -f "$sqlf" 2>&1 | tr '\n' ' '
+        echo ok > "$CONTROL"
     }
 
     cat > "$TMP/fullscan.sql" <<SQL
@@ -543,6 +548,8 @@ SQL
     OUT=$(replace_midscan "$TMP/fullscan.sql")
     timeout 200 python3 "$ADMIN" swap A >/dev/null 2>&1
     case "$OUT" in
+        NOPROXY)
+            echo "  skip    mid-scan replacement needs the fault proxy and a writable $CONTROL" ;;
         *"the object changed since this read began"*)
             ok "replacing the object mid-scan gives an explicit consistency error" ;;
         *"412"*)
