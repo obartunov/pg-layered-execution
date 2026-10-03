@@ -1,0 +1,149 @@
+/*
+ * xpb_s3_reader.h -- an ObjectReader over HTTP ranged GET.
+ *
+ * Phase 1 of the S3 series: prove that a remote reader sits under the existing
+ * ObjectReader contract without anything above it changing. Nothing here is
+ * reachable from the Parquet reader except through ObjectReader, and this
+ * header is not included by the shim's Arrow-facing code.
+ *
+ * ---------------------------------------------------------------- WHAT IT IS
+ *
+ * A minimal, blocking HTTP/1.1 client plus AWS SigV4, and nothing else:
+ *
+ *   - no SDK, therefore no SDK thread pool, therefore no question about which
+ *     thread a callback runs on. Every read happens on the caller's thread,
+ *     synchronously. That is a deliberate answer to the defect v0 shipped --
+ *     see docs/OBJECT_READER_V0.md section 7 -- rather than a limitation to be
+ *     fixed later;
+ *   - no async, no cache, no prefetch, no connection reuse. One request per
+ *     read_at_most(), one socket, closed after;
+ *   - no TLS. http:// only. This cannot talk to real AWS S3 and is not
+ *     intended to yet; see LIMITS.
+ *
+ * ------------------------------------------------------------------- EOF
+ *
+ * This is the reader the v1 contract was written for, so the mapping is the
+ * whole point:
+ *
+ *   206 + Content-Range: bytes a-b/total
+ *       bytes delivered = b - a + 1, and eof is TRUE only when b + 1 >= total.
+ *       The object's own stated length decides it.
+ *
+ *   body shorter than Content-Length
+ *       A TRUNCATED TRANSFER. ok = false, and eof stays false. This is exactly
+ *       the case the v0 contract would have reported as a clean end of object,
+ *       and therefore the case that would have produced a silently short
+ *       column chunk.
+ *
+ *   416 Range Not Satisfiable
+ *       The range is entirely past the end. bytes = 0, eof = TRUE, ok = true:
+ *       the server has stated the object ends before the request, which is
+ *       authoritative in a way a short body never is.
+ *
+ *   200 to a ranged request
+ *       The server ignored Range. An ERROR, not a silent whole-object read: a
+ *       180 MB body in answer to a 218-byte request is a configuration fault,
+ *       and taking a slice of it would hide that.
+ *
+ *   4xx / 5xx
+ *       Error. Phase 1 does not retry anything; retry policy is phase 2 and
+ *       belongs inside this class, under read_exact, never in the adapter.
+ *
+ * ------------------------------------------------------------------- LIMITS
+ *
+ * Stated here rather than discovered later. None of these is a correctness
+ * boundary for what phase 1 claims, and all of them block real S3 use:
+ *
+ *   - no TLS, so credentials and data cross the wire in clear. Only usable
+ *     against a local endpoint;
+ *   - SigV4 is implemented but UNVERIFIED against a real signer in this
+ *     environment, because the test endpoint accepts unsigned requests. It is
+ *     checked against botocore's SigV4Auth on the same canonical request
+ *     instead, which proves the algorithm and not the integration;
+ *   - no redirects, no 100-continue, no chunked transfer-encoding on
+ *     responses, no IPv6 literal hosts, no virtual-host-style addressing
+ *     (path style only);
+ *   - credentials come from the environment of the BACKEND process, which
+ *     means the postmaster's environment. Configuration has no proper home
+ *     yet, and this is not it;
+ *   - one connection per read. Phase 7 can measure what that costs; it is not
+ *     a correctness question.
+ */
+#ifndef XPB_S3_READER_H
+#define XPB_S3_READER_H
+
+#include <string>
+
+namespace xpb {
+
+class ObjectReader;
+
+/*
+ * Open s3://bucket/key.
+ *
+ * Endpoint and credentials are taken from the environment:
+ *
+ *   XPB_S3_ENDPOINT        http://host:port   (required; no default, because a
+ *                                              default pointing at AWS over
+ *                                              plain HTTP would be worse than
+ *                                              a refusal)
+ *   XPB_S3_ACCESS_KEY      access key id
+ *   XPB_S3_SECRET_KEY      secret access key
+ *   XPB_S3_REGION          region, default us-east-1
+ *
+ * Deliberately NOT the AWS_* names: these are read from the postmaster's
+ * environment, and silently picking up a developer's real AWS credentials to
+ * send over plain HTTP to whatever XPB_S3_ENDPOINT says is not a thing this
+ * should do by accident.
+ *
+ * Returns NULL with *error set. The caller owns the result.
+ */
+ObjectReader *open_s3_reader(const char *uri, std::string *error);
+
+/* True for a URI this reader handles, so the one place that chooses a byte
+ * source can ask rather than parse. */
+bool is_s3_uri(const char *uri);
+
+/*
+ * SigV4 over an already-canonical request, exposed only so it can be checked
+ * against an independent signer. Returns the lowercase hex signature.
+ *
+ * It is here because a signing implementation that is never compared with
+ * another one is a guess.
+ */
+std::string sigv4_signature(const std::string &canonical_request,
+                            const std::string &amz_date,       /* 20130524T000000Z */
+                            const std::string &datestamp,      /* 20130524 */
+                            const std::string &region,
+                            const std::string &service,
+                            const std::string &secret_key);
+
+/*
+ * The full Authorization header this reader would send, with the timestamp
+ * injected so the result is reproducible.
+ *
+ * Exists to be compared with an independent signer: it covers canonicalisation
+ * as well as the HMAC chain, because a correct signing algorithm over a wrong
+ * canonical request still fails against AWS. The local test endpoint accepts
+ * unsigned requests, so without this the signing code would ship unchecked.
+ */
+std::string s3_test_canonical_request(const char *method, const char *uri,
+                                      const char *host, const char *range,
+                                      const char *amz_date);
+
+std::string s3_test_authorization(const char *method, const char *uri,
+                                  const char *host, const char *range,
+                                  const char *amz_date, const char *datestamp,
+                                  const char *region, const char *access,
+                                  const char *secret);
+
+/* Counters a test needs that are specific to a remote transport. -1 when the
+ * reader is not an S3 one. */
+int64_t s3_head_calls(const ObjectReader *r);
+int64_t s3_get_calls(const ObjectReader *r);
+int64_t s3_http_errors(const ObjectReader *r);
+int64_t s3_bytes_transferred(const ObjectReader *r);
+
+}   /* namespace xpb */
+
+#endif  /* XPB_S3_READER_H */

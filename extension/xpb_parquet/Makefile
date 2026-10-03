@@ -23,13 +23,14 @@
 ARROW_HOME ?= /home/claude/arrow-cpp
 
 MODULE_big = xpb_parquet
-OBJS = src/xpb_parquet_module.o src/xpb_parquet_shim.o src/xpb_object_reader.o
+OBJS = src/xpb_parquet_module.o src/xpb_parquet_shim.o src/xpb_object_reader.o \
+       src/xpb_s3_reader.o
 
 PG_CPPFLAGS = -I../xp_batch/src -Isrc
 
 # The shim is C++ and must not see PostgreSQL headers; the module is C and must
 # not see Arrow headers. Only the shim gets the Arrow include path.
-SHLIB_LINK = -L$(ARROW_HOME)/lib -lparquet -larrow -lstdc++ \
+SHLIB_LINK = -L$(ARROW_HOME)/lib -lparquet -larrow -lstdc++ -lcrypto \
              -Wl,-rpath,$(ARROW_HOME)/lib
 
 PG_CONFIG ?= pg_config
@@ -46,5 +47,12 @@ src/xpb_parquet_shim.o: src/xpb_parquet_shim.cpp src/xpb_parquet_shim.h src/xpb_
 # The byte-range boundary. No Arrow include path: it must not need one, and
 # leaving it out is how that stays true.
 src/xpb_object_reader.o: src/xpb_object_reader.cpp src/xpb_object_reader.h
+	g++ -std=c++20 -O2 -fPIC -fvisibility=hidden -Wall \
+	    -Isrc -c -o $@ $<
+
+# The remote transport. No Arrow include path either, for the same reason: it
+# must not be able to reach Arrow, and leaving the path out is how that stays
+# true. OpenSSL is for SigV4 and is the only new dependency.
+src/xpb_s3_reader.o: src/xpb_s3_reader.cpp src/xpb_s3_reader.h src/xpb_object_reader.h
 	g++ -std=c++20 -O2 -fPIC -fvisibility=hidden -Wall \
 	    -Isrc -c -o $@ $<

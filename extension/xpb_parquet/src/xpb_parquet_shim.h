@@ -177,6 +177,15 @@ int64_t     xpq_logical_calls(const XpqReader *r);
 int64_t     xpq_logical_bytes(const XpqReader *r);
 
 /*
+ * Remote-transport counters. -1 when the source is not an S3 one, which is how
+ * a test tells "the S3 path was taken" from "it fell back to a file".
+ */
+int64_t     xpq_s3_head_calls(const XpqReader *r);
+int64_t     xpq_s3_get_calls(const XpqReader *r);
+int64_t     xpq_s3_http_errors(const XpqReader *r);
+int64_t     xpq_s3_bytes_transferred(const XpqReader *r);
+
+/*
  * Open with a fault injected underneath the Parquet reader.
  *
  * Same file, same bytes, same decode path; only the delivery is damaged, so the

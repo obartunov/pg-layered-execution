@@ -752,7 +752,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(30);
+    tupdesc = CreateTemplateTupleDesc(34);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -787,6 +787,12 @@ xpq_scan(PG_FUNCTION_ARGS)
     /* What Arrow asked for, as opposed to what the reader did. */
     TupleDescInitEntry(tupdesc, 29, "logical_calls",           INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, 30, "logical_bytes",           INT8OID, -1, 0);
+    /* Remote transport. -1 when the source is not an S3 one, which is how a
+     * test tells "the S3 path was taken" from "it fell back to a file". */
+    TupleDescInitEntry(tupdesc, 31, "s3_head_calls",           INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 32, "s3_get_calls",            INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 33, "s3_http_errors",          INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 34, "s3_bytes_transferred",    INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -796,8 +802,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[30];
-        bool    nulls[30] = {false};
+        Datum   vals[34];
+        bool    nulls[34] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -831,6 +837,10 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[27] = Int64GetDatum(xpq_faulty_injected(st->reader));
         vals[28] = Int64GetDatum(xpq_logical_calls(st->reader));
         vals[29] = Int64GetDatum(xpq_logical_bytes(st->reader));
+        vals[30] = Int64GetDatum(xpq_s3_head_calls(st->reader));
+        vals[31] = Int64GetDatum(xpq_s3_get_calls(st->reader));
+        vals[32] = Int64GetDatum(xpq_s3_http_errors(st->reader));
+        vals[33] = Int64GetDatum(xpq_s3_bytes_transferred(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 

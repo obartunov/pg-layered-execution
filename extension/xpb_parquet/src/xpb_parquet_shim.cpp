@@ -11,6 +11,7 @@
  */
 #include "xpb_parquet_shim.h"
 #include "xpb_object_reader.h"
+#include "xpb_s3_reader.h"
 
 #include <atomic>
 #include <chrono>
@@ -251,7 +252,14 @@ extern "C" {
 static xpb::ObjectReader *
 make_object_reader(const char *path, const xpb::FaultSpec *fault, std::string *err)
 {
-    xpb::ObjectReader *base = xpb::open_file_reader(path, err);
+    /*
+     * The scheme branch, and the whole of what adding a transport costs above
+     * the reader. Nothing else in this file, in the Parquet reader or in any
+     * XPBatch operator distinguishes the two.
+     */
+    xpb::ObjectReader *base = xpb::is_s3_uri(path)
+                            ? xpb::open_s3_reader(path, err)
+                            : xpb::open_file_reader(path, err);
     if (base == nullptr)
         return nullptr;
     if (fault == nullptr || fault->mode == xpb::FaultMode::kNone)
@@ -709,6 +717,14 @@ int64_t xpq_logical_calls(const XpqReader *r)
 { return (r && r->input) ? r->input->logical_calls() : 0; }
 int64_t xpq_logical_bytes(const XpqReader *r)
 { return (r && r->input) ? r->input->logical_bytes() : 0; }
+int64_t xpq_s3_head_calls(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_head_calls(r->object.get()) : -1; }
+int64_t xpq_s3_get_calls(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_get_calls(r->object.get()) : -1; }
+int64_t xpq_s3_http_errors(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_http_errors(r->object.get()) : -1; }
+int64_t xpq_s3_bytes_transferred(const XpqReader *r)
+{ return (r && r->object) ? xpb::s3_bytes_transferred(r->object.get()) : -1; }
 
 /*
  * Controlled failure for the exception boundary.
