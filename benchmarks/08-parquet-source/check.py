@@ -228,7 +228,10 @@ def main():
          "bytes_requested bigint, bytes_returned bigint, "
          "meta_calls bigint, data_calls bigint, irq_skipped_offthread bigint, "
          "short_reads_without_eof bigint, fault_attempts bigint, "
-         "fault_injected bigint, logical_calls bigint, logical_bytes bigint) "
+         "fault_injected bigint, logical_calls bigint, logical_bytes bigint, "
+         "s3_head_calls bigint, s3_get_calls bigint, s3_http_errors bigint, "
+         "s3_bytes_transferred bigint, s3_http_attempts bigint, "
+         "s3_retries bigint) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
     npass = nfail = 0

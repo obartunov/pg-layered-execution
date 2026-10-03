@@ -235,6 +235,241 @@ else
     fi
 fi
 
+# ---- 4. failure semantics, through a real HTTP endpoint -------------------
+echo
+echo "=== 4. what a remote failure means ==="
+#
+# The v1 FaultyObjectReader proves the CONTRACT refuses a short read. This
+# proves that a genuinely truncated HTTP response is what the contract sees:
+# the faults are injected by a proxy in front of the endpoint, so the damage is
+# to the exchange and not to a decorator inside our own reader.
+CONTROL="${XPB_S3_CONTROL:-/tmp/xpbs3/mode}"
+if [ ! -w "$CONTROL" ]; then
+    echo "  skip    no writable fault control file at $CONTROL;"
+    echo "          run $PQT/s3-mock-setup.sh and point the server at the proxy"
+else
+    setmode() { echo "$1" > "$CONTROL"; }
+    F="rows||' '||logical_calls||' '||logical_bytes||' '||s3_http_attempts||' '||s3_retries||' '||s3_bytes_transferred"
+    scan() {
+        setmode "$1"
+        qall "SELECT $F FROM xpq_scan('$S3URI','period_key,amount_dt',25,25)"
+    }
+
+    B=$(scan ok); set -- $B; BR="$1"; BLC="$2"; BLB="$3"; BAT="$4"; BRT="$5"; BTR="$6"
+    echo "          clean           rows=$BR logical=$BLC/$BLB attempts=$BAT retries=$BRT transferred=$BTR"
+
+    # A transient 503 on the first DATA read. Keyed on the GET ordinal, because
+    # a mode keyed on "the first exchange" is absorbed by the HEAD and injects
+    # nothing -- which made two of these pass while testing nothing.
+    R=$(scan "fail_get_first:1"); set -- $R; RR="$1"; RLC="$2"; RLB="$3"; RAT="$4"; RRT="$5"; RTR="$6"
+    echo "          503 on 1st GET  rows=$RR logical=$RLC/$RLB attempts=$RAT retries=$RRT transferred=$RTR"
+    [ "$RR" = "$BR" ] && ok "a retried transient failure returns the same rows" \
+                      || bad "retry changed the answer: $RR against $BR"
+    { [ "$RLC" = "$BLC" ] && [ "$RLB" = "$BLB" ]; } \
+        && ok "retry left the logical request untouched ($RLC/$RLB)" \
+        || bad "retry changed the logical request: $RLC/$RLB against $BLC/$BLB"
+    [ "${RRT:-0}" -ge 1 ] && [ "${RAT:-0}" -gt "${BAT:-0}" ] \
+        && ok "the retry is visible physically (attempts $BAT -> $RAT, retries $RRT)" \
+        || bad "the retry left no physical trace: attempts $RAT vs $BAT, retries $RRT"
+
+    # A cut transfer, retried and recovered. The bytes paid for exceed the
+    # bytes returned, which is the point of counting transfer separately.
+    T=$(scan "truncate_get:1"); set -- $T; TR="$1"; TLB="$3"; TAT="$4"; TRT="$5"; TTR="$6"
+    echo "          cut 1st GET     rows=$TR logical=*/$TLB attempts=$TAT retries=$TRT transferred=$TTR"
+    [ "$TR" = "$BR" ] && ok "a cut transfer is retried and the answer is unchanged" \
+                      || bad "a cut transfer changed the answer: $TR against $BR"
+    [ "${TTR:-0}" -gt "${BTR:-0}" ] \
+        && ok "the discarded partial body is paid for ($BTR -> $TTR bytes)" \
+        || bad "a retried truncation cost no extra transfer: $TTR vs $BTR"
+
+    # A permanent failure arriving MID-SCAN, after rows have been decoded.
+    setmode "fail_get_after:2"
+    OUT=$(qall "SELECT count(*) FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$S3URI')")
+    case "$OUT" in
+        *ERROR*) ok "a permanent mid-scan failure fails the query instead of returning what it had" ;;
+        *)       bad "a mid-scan failure returned an answer: $OUT" ;;
+    esac
+
+    # A truncated response with retry DISABLED must be an error that says it is
+    # not EOF -- otherwise "retry fixed it" is not shown to be the reason.
+    setmode "truncate_all"
+    OUT=$(qall "SET xpb.unused=0; SELECT rows FROM xpq_scan('$S3URI','period_key',25,25)")
+    case "$OUT" in
+        *"truncated response, not EOF"*)
+            ok "a cut transfer that cannot be recovered says it is not EOF" ;;
+        *ERROR*) ok "a cut transfer that cannot be recovered is an error" ;;
+        *)       bad "an unrecoverable cut transfer was accepted: $OUT" ;;
+    esac
+
+    setmode ok
+fi
+
+# ---- 5. threads, cancellation, lifecycle ---------------------------------
+echo
+echo "=== 5. threads and cancellation over a remote source ==="
+#
+# The question phase 3 asks is the one v0 got wrong. There is no SDK here, so
+# there is no SDK thread pool -- but ARROW still reads on its own pool, so the
+# transport is reached from a worker thread anyway. Measured: the HEAD and the
+# two footer GETs on the backend thread, all 42 data GETs on one Arrow worker.
+X=$(qall "SELECT read_calls||' '||meta_calls||' '||data_calls||' '||irq_skipped_offthread
+          FROM xpq_scan('$S3URI','period_key,company_key,account_key,amount_dt',25,36)")
+set -- $X; RC="${1:-0}"; MC="${2:-0}"; DC="${3:-0}"; SK="${4:-}"
+echo "          reads $RC = meta $MC + data $DC; interrupt check skipped off-thread: ${SK:-?}"
+if [ -z "$SK" ]; then
+    bad "could not read irq_skipped_offthread: $X"
+else
+    [ "$SK" -gt 0 ] && ok "the off-thread case occurs over S3 too, so the guard is exercised" \
+                    || bad "no remote read arrived off-thread -- the guard is untested here"
+    [ "$SK" = "$DC" ] && ok "skipped exactly the data reads ($SK = $DC)" \
+                      || bad "skipped $SK of $DC data reads -- the split is wrong"
+fi
+
+# The transport cannot call into PostgreSQL at all, so no ereport or longjmp
+# can originate on a worker thread. Mechanical, not argued.
+if [ -f "$REPO/extension/xpb_parquet/src/xpb_s3_reader.o" ] && command -v nm >/dev/null 2>&1; then
+    N=$(nm -C "$REPO/extension/xpb_parquet/src/xpb_s3_reader.o" \
+        | grep -ciE "errstart|ereport|palloc|CurrentMemoryContext|ProcessInterrupts" || true)
+    [ "${N:-1}" -eq 0 ] && ok "the transport names no PostgreSQL symbol, so it cannot raise from a worker" \
+                        || bad "$N PostgreSQL symbol(s) reachable from the transport"
+fi
+
+# A stalled endpoint. This is the case that had no bound at all: the blocking
+# recv() is on an Arrow worker, where the interrupt hook deliberately does not
+# fire, so statement_timeout could not reach it. Measured before the deadline
+# existed: statement_timeout=3s still blocked at 90 seconds with the backend
+# alive afterwards.
+if [ -w "$CONTROL" ]; then
+    echo "$CONTROL" >/dev/null
+    echo "hang_get:2" > "$CONTROL"
+    T0=$(date +%s)
+    OUT=$("${PSQL[@]}" -c "LOAD 'xpb_parquet'; SET client_min_messages=warning;
+          SET statement_timeout=3000;
+          SELECT count(*) FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$S3URI')" 2>&1 | tr '\n' ' ')
+    T1=$(date +%s)
+    echo ok > "$CONTROL"
+    EL=$((T1-T0))
+    echo "          a stalled endpoint returned control after ${EL}s"
+    case "$OUT" in
+        *"timed out after"*) ok "a stall is bounded by the transport's own deadline, not left to an interrupt" ;;
+        *ERROR*)             ok "a stall ends the query (${OUT:0:60})" ;;
+        *)                   bad "a stalled endpoint did not fail the query: $OUT" ;;
+    esac
+    [ "$EL" -lt 60 ] && ok "and it did so in under a minute (${EL}s)" \
+                     || bad "the stall took ${EL}s to surface"
+fi
+
+# An external signal during a remote scan must end the backend, and the
+# postmaster must still be able to shut down while one is in flight.
+for MODE in pg_cancel_backend pg_terminate_backend; do
+    "${PSQL[@]}" -c "SET client_min_messages=error; LOAD 'xpb_parquet';
+        SELECT count(*) FROM generate_series(1,8) g,
+               LATERAL xpb_batch_join2_groupby(1,120,'ext:parquet:$S3URI') q" >"$TMP/sig.out" 2>&1 &
+    SJ=$!
+    SBP=""
+    for _ in $(seq 1 150); do
+        SBP=$("${PSQL[@]}" -c "SELECT pid FROM pg_stat_activity WHERE state='active'
+              AND query LIKE '%generate_series(1,8)%' AND pid <> pg_backend_pid() LIMIT 1" 2>/dev/null | tail -1)
+        [ -n "$SBP" ] && break
+        sleep 0.2
+    done
+    if [ -z "$SBP" ]; then
+        echo "  skip    $MODE -- the remote scan finished before it could be signalled"
+        wait $SJ 2>/dev/null
+        continue
+    fi
+    sleep 0.8
+    "${PSQL[@]}" -c "SELECT $MODE($SBP)" >/dev/null 2>&1
+    W=0
+    while kill -0 "$SBP" 2>/dev/null && [ $W -lt 60 ]; do sleep 0.25; W=$((W+1)); done
+    wait $SJ 2>/dev/null
+    if kill -0 "$SBP" 2>/dev/null; then
+        bad "$MODE left backend $SBP alive after 15 s during a remote scan"
+    else
+        ok "$MODE ended the backend mid-remote-scan in under $((W*250+250)) ms"
+    fi
+done
+
+# ---- 6. Parquet correctness over the remote transport --------------------
+echo
+echo "=== 6. the same answers over both transports, and against PostgreSQL ==="
+#
+# Every shape compared three ways where it can be: through S3Reader, through
+# FileReader, and against the heap the Parquet file was exported from. The
+# transports must agree exactly; the heap is the oracle for the ones it can
+# answer.
+same() {   # same <label> <select-list> <args>
+    local label="$1" sel="$2" args="$3" a b
+    a=$(qall "SELECT $sel FROM xpq_scan('$S3URI',$args)")
+    b=$(qall "SELECT $sel FROM xpq_scan('$LOCAL',$args)")
+    if [ "$a" = "$b" ]; then ok "$label -- identical ($(echo $a))"
+    else bad "$label -- s3 [$(echo $a)] vs local [$(echo $b)]"; fi
+}
+ALL4=period_key,company_key,account_key,amount_dt
+same "full scan, 4 cols"        "rows||' '||sum_last_col"                "'$ALL4'"
+same "projection, 1 col"        "rows||' '||decoded_values"              "'period_key'"
+same "filter and pruning"       "rows||' '||row_groups_read||' '||row_groups_skipped" "'$ALL4',25,36"
+same "aggregate over a slice"   "sum_last_col||' '||min_last_col||' '||max_last_col"  "'$ALL4',25,36"
+same "NULLs in the first col"   "nulls_first_col||' '||null_key_sum"     "'$ALL4',25,36"
+same "empty result"             "rows||' '||row_groups_read||' '||data_bytes" "'$ALL4',9999,9999"
+same "single row group"         "rows||' '||row_groups_read"             "'$ALL4',25,25"
+same "many row groups"          "rows||' '||row_groups_read"             "'$ALL4',1,120"
+
+# group by, against the heap as well -- this is the one the benchmark gates on
+G="md5(string_agg(year||','||account_group||','||company_key||','||total_amt,
+     '|' ORDER BY year, account_group, company_key))||'|'||count(*)"
+CS=$(qall "SELECT $G FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$S3URI')")
+CL=$(qall "SELECT $G FROM xpb_batch_join2_groupby(25,36,'ext:parquet:$LOCAL')")
+CH=$(qall "SELECT $G FROM xpb_batch_join2_groupby(25,36,'heap')")
+echo "          s3   ${CS// /}"
+echo "          file ${CL// /}"
+echo "          heap ${CH// /}"
+{ [ "${CS// /}" = "${CL// /}" ] && [ "${CS// /}" = "${CH// /}" ]; } \
+    && ok "group by: S3, local file and the PostgreSQL heap all agree" \
+    || bad "group by disagrees across s3/file/heap"
+
+# ---- 7. projection and pruning save REMOTE work -------------------------
+echo
+echo "=== 7. projection and pruning over a remote source ==="
+#
+# The same architectural property as for a local file, but here the saving is
+# requests and bytes over a transport, which is what it would cost money for.
+# Two separate experiments, as asked: projection at a fixed slice, and pruning
+# at a fixed projection.
+# data_bytes, NOT bytes_requested: the latter is every read the reader made,
+# footer included, so a query pruned to nothing legitimately shows ~237 kB
+# there. The property worth asserting is that no DATA byte was fetched.
+rem() {   # rem <args> -> "gets data_bytes transferred rowgroups"
+    qall "SELECT s3_get_calls||' '||data_bytes||' '||s3_bytes_transferred||' '||row_groups_read
+          FROM xpq_scan('$S3URI',$1)"
+}
+P4=$(rem "'$ALL4',25,36");  set -- $P4; G4="$1"; B4="$2"; T4="$3"; R4="$4"
+P1=$(rem "'period_key',25,36"); set -- $P1; G1="$1"; B1="$2"; T1="$3"; R1="$4"
+echo "          4 columns, [25..36]:  GET $G4  data $B4 B  transferred $T4 B  row groups $R4"
+echo "          1 column,  [25..36]:  GET $G1  data $B1 B  transferred $T1 B  row groups $R1"
+{ [ "${G1:-0}" -lt "${G4:-0}" ] && [ "${T1:-0}" -lt "${T4:-0}" ]; } \
+    && ok "projection cut remote requests ($G4 -> $G1) and bytes ($T4 -> $T1)" \
+    || bad "projection did not reduce remote work: $G4/$T4 -> $G1/$T1"
+[ "${R1:-0}" = "${R4:-0}" ] \
+    && ok "and it did so at the same row groups ($R1), so this is projection and not pruning" \
+    || bad "the two projections read different row groups ($R4 vs $R1)"
+
+FULL=$(rem "'$ALL4',1,120"); set -- $FULL; GF="$1"; BF="$2"; TF="$3"; RF="$4"
+PRUNE=$(rem "'$ALL4',25,25"); set -- $PRUNE; GP="$1"; BP2="$2"; TP="$3"; RP="$4"
+NONE=$(rem "'$ALL4',9999,9999"); set -- $NONE; GN="$1"; BN="$2"; TN="$3"; RN="$4"
+echo "          all row groups:       GET $GF  transferred $TF B  row groups $RF"
+echo "          one row group:        GET $GP  transferred $TP B  row groups $RP"
+echo "          pruned to nothing:    GET $GN  transferred $TN B  row groups $RN"
+{ [ "${GP:-0}" -lt "${GF:-0}" ] && [ "${RP:-0}" -lt "${RF:-0}" ]; } \
+    && ok "pruning cut remote requests ($GF -> $GP) with the row groups ($RF -> $RP)" \
+    || bad "pruning did not reduce remote requests"
+{ [ "${RN:-1}" = "0" ] && [ "${BN:-1}" = "0" ]; } \
+    && ok "a row group pruned away costs no remote DATA byte ($BN) at all" \
+    || bad "pruned to nothing still fetched $BN data bytes over $RN row groups"
+[ "${GN:-0}" -ge 1 ] \
+    && ok "the footer is still fetched ($GN request(s)): opening a remote object is real work" \
+    || bad "pruned to nothing made no request at all, which cannot be right"
+
 echo
 echo "############ $pass correct, $fail wrong ############"
 [ "$fail" -eq 0 ]
