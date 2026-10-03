@@ -402,6 +402,17 @@ same() {   # same <label> <select-list> <args>
     local label="$1" sel="$2" args="$3" a b
     a=$(qall "SELECT $sel FROM xpq_scan('$S3URI',$args)")
     b=$(qall "SELECT $sel FROM xpq_scan('$LOCAL',$args)")
+    # Equality alone is not agreement. Both arms failing the same way produced
+    # eight "identical" passes whose value was the SAME ERROR TEXT, because a
+    # concurrently redeclared xpq_scan made every scan fail: a test that cannot
+    # tell "both right" from "both broken" is not a test. The value must be an
+    # answer -- present, and not an error -- before equality means anything.
+    case "$a" in
+        ""|*ERROR*) bad "$label -- the S3 arm produced no answer: $(echo $a)"; return ;;
+    esac
+    case "$b" in
+        ""|*ERROR*) bad "$label -- the local arm produced no answer: $(echo $b)"; return ;;
+    esac
     if [ "$a" = "$b" ]; then ok "$label -- identical ($(echo $a))"
     else bad "$label -- s3 [$(echo $a)] vs local [$(echo $b)]"; fi
 }
@@ -424,9 +435,13 @@ CH=$(qall "SELECT $G FROM xpb_batch_join2_groupby(25,36,'heap')")
 echo "          s3   ${CS// /}"
 echo "          file ${CL// /}"
 echo "          heap ${CH// /}"
-{ [ "${CS// /}" = "${CL// /}" ] && [ "${CS// /}" = "${CH// /}" ]; } \
-    && ok "group by: S3, local file and the PostgreSQL heap all agree" \
-    || bad "group by disagrees across s3/file/heap"
+# Same reasoning as same(): three equal error strings are not an agreement.
+case "${CS}${CL}${CH}" in
+    *ERROR*|"") bad "group by: at least one arm produced no answer" ;;
+    *) { [ "${CS// /}" = "${CL// /}" ] && [ "${CS// /}" = "${CH// /}" ]; } \
+           && ok "group by: S3, local file and the PostgreSQL heap all agree" \
+           || bad "group by disagrees across s3/file/heap" ;;
+esac
 
 # ---- 7. projection and pruning save REMOTE work -------------------------
 echo
