@@ -470,6 +470,128 @@ echo "          pruned to nothing:    GET $GN  transferred $TN B  row groups $RN
     && ok "the footer is still fetched ($GN request(s)): opening a remote object is real work" \
     || bad "pruned to nothing made no request at all, which cannot be right"
 
+# ---- 8. one reader, one object version ------------------------------------
+echo
+echo "=== 8. object identity: a scan cannot mix two incarnations ==="
+#
+# The gap v0 named as its most serious: a footer read from one incarnation of
+# an object and data ranges from another. Over a real object store that is a
+# wrong-answer class, not a missing feature.
+#
+# Needs an endpoint that enforces SigV4 (so the signature over the added
+# If-Match header is actually checked) and a staged replacement object.
+ADMIN="$PQT/s3-object-admin.py"
+# The auth probe and the object administration must address the SERVER. When
+# the fault proxy is in front, XPB_S3_ENDPOINT is the proxy: it re-signs (so it
+# accepts anything) and serves only GET and HEAD (so it cannot stage). Asking
+# the proxy whether auth is enforced reports "no" and means nothing -- which it
+# did, before this was separated.
+if [ -z "${XPB_S3_UPSTREAM:-}" ]; then
+    echo "  note    XPB_S3_UPSTREAM not set; using XPB_S3_ENDPOINT for object admin"
+fi
+AUTH=$(timeout 120 python3 "$ADMIN" auth 2>&1 | tail -1)
+echo "          server auth: $AUTH"
+case "$AUTH" in
+    *unsigned=403*wrong_secret=SignatureDoesNotMatch*unknown_key=InvalidAccessKeyId*)
+        ok "the endpoint enforces SigV4, so the signed If-Match is really checked" ;;
+    *)
+        bad "the endpoint does not enforce auth ($AUTH) -- a signature check here would be vacuous" ;;
+esac
+
+if ! timeout 300 python3 "$ADMIN" stage >/dev/null 2>&1; then
+    echo "  skip    could not stage objects A and B (run $PQT/s3-make-object-b.py first)"
+else
+    BEFORE=$(timeout 120 python3 "$ADMIN" head 2>&1 | tail -1)
+    echo "          object under test: $BEFORE"
+
+    # The identity must actually be pinned, and must be the server's ETag. An
+    # empty one would make every assertion below vacuous.
+    IDENT=$(qall "SELECT s3_identity FROM xpq_scan('$S3URI','period_key',25,25)")
+    IDENT=$(echo $IDENT)
+    SRVETAG=$(echo "$BEFORE" | awk '{print $2}')
+    echo "          identity pinned at open: $IDENT"
+    if [ -z "$IDENT" ] || [ "$IDENT" = "-1" ]; then
+        bad "no identity was pinned, so the guard is not active and section 8 proves nothing"
+    elif [ "$IDENT" = "$SRVETAG" ]; then
+        ok "the pinned identity is the server's own ETag for the object"
+    else
+        bad "pinned [$IDENT] but the server reports [$SRVETAG]"
+    fi
+
+    # ---- the replacement test ------------------------------------------
+    # A and B differ by one byte in total length and have the same 200 row
+    # groups, so without a guard a read can technically continue into B.
+    replace_midscan() {   # replace_midscan <sql-file> -> output
+        local sqlf="$1" out j
+        out="$TMP/mid.out"
+        rm -f "$out"
+        timeout 500 "${PSQL[@]}" -f "$sqlf" > "$out" 2>&1 &
+        j=$!
+        sleep 2
+        timeout 200 python3 "$ADMIN" swap B >/dev/null 2>&1
+        wait $j 2>/dev/null
+        tr '\n' ' ' < "$out"
+    }
+
+    cat > "$TMP/fullscan.sql" <<SQL
+SET client_min_messages=error;
+LOAD 'xpb_parquet';
+SELECT 'rows='||rows||' sum='||sum_last_col||' conflicts='||s3_identity_conflicts
+FROM xpq_scan('$S3URI','period_key,company_key,account_key,amount_dt',1,120);
+SQL
+
+    OUT=$(replace_midscan "$TMP/fullscan.sql")
+    timeout 200 python3 "$ADMIN" swap A >/dev/null 2>&1
+    case "$OUT" in
+        *"the object changed since this read began"*)
+            ok "replacing the object mid-scan gives an explicit consistency error" ;;
+        *"412"*)
+            ok "replacing the object mid-scan is refused (412)" ;;
+        *ERROR*)
+            bad "mid-scan replacement failed, but not as a consistency error: ${OUT:0:140}" ;;
+        *)
+            bad "mid-scan replacement produced an ANSWER, which is the mixed-version read this guard exists to prevent: $OUT" ;;
+    esac
+    case "$OUT" in
+        *rows=*) bad "a partial result was returned alongside the failure: $OUT" ;;
+        *)       ok "and no partial result came back with it" ;;
+    esac
+
+    # ---- replacement during a retry ------------------------------------
+    # The nastier case: the retry must carry the identity captured at OPEN and
+    # not re-HEAD and adopt the new object. Needs the fault proxy in front.
+    if [ ! -w "$CONTROL" ]; then
+        echo "  skip    replacement-during-retry needs the fault proxy and a writable $CONTROL"
+    else
+        echo "fail_then_replace:3" > "$CONTROL"
+        sleep 0.3
+        OUT=$(timeout 500 "${PSQL[@]}" -f "$TMP/fullscan.sql" 2>&1 | tr '\n' ' ')
+        echo ok > "$CONTROL"
+        timeout 200 python3 "$ADMIN" swap A >/dev/null 2>&1
+        case "$OUT" in
+            *"the object changed since this read began"*)
+                ok "a retry keeps the identity captured at open and refuses the new object" ;;
+            *ERROR*)
+                bad "the retry failed for another reason: ${OUT:0:140}" ;;
+            *)
+                bad "the retry silently adopted the replaced object: $OUT" ;;
+        esac
+    fi
+
+    # ---- size and identity are one snapshot ----------------------------
+    # They come from the same HEAD response. The observable consequence is that
+    # a reader never holds a length from one incarnation and ranges from
+    # another: any range read after a change is refused, so there is no state
+    # in which the two disagree.
+    S=$(qall "SELECT s3_head_calls||' '||s3_identity||' '||rows
+              FROM xpq_scan('$S3URI','period_key,amount_dt',25,25)")
+    set -- $S; HD="${1:-}"; ID2="${2:-}"; RW="${3:-}"
+    echo "          one open: HEAD=$HD identity=$ID2 rows=$RW"
+    { [ "$HD" = "1" ] && [ -n "$ID2" ] && [ "$RW" = "100000" ]; } \
+        && ok "size and identity come from the one HEAD that opened the object" \
+        || bad "expected exactly one HEAD carrying both size and identity, got HEAD=$HD identity=$ID2"
+fi
+
 echo
 echo "############ $pass correct, $fail wrong ############"
 [ "$fail" -eq 0 ]

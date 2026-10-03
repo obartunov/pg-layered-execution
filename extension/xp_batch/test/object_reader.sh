@@ -43,7 +43,8 @@ RETURNS TABLE (rows bigint, batches bigint, sum_last_col bigint, nulls_first_col
   short_reads_without_eof bigint, fault_attempts bigint, fault_injected bigint,
   logical_calls bigint, logical_bytes bigint,
   s3_head_calls bigint, s3_get_calls bigint, s3_http_errors bigint,
-  s3_bytes_transferred bigint, s3_http_attempts bigint, s3_retries bigint)
+  s3_bytes_transferred bigint, s3_http_attempts bigint, s3_retries bigint,
+  s3_identity text, s3_identity_conflicts bigint)
 LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan';
 DROP FUNCTION IF EXISTS xpq_arm_fault(int,bigint,bigint,int);
 CREATE FUNCTION xpq_arm_fault(mode int, at_read bigint, nbytes bigint, retries int)

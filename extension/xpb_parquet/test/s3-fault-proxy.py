@@ -34,6 +34,9 @@ Modes:
   hang                  accept, promise a body, send nothing, never close
   hang_get:N            the same for GETs after the Nth -- a stall arriving
                         mid-scan on whatever thread Arrow is reading from
+  fail_then_replace:N   fail GET N transiently AND replace the object before
+                        the retry arrives -- the retry must still carry the
+                        identity captured at open and be refused
 
 Deterministic by construction: every trigger is an exchange ordinal, never a
 clock or a random number.
@@ -45,6 +48,21 @@ import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Re-signing is needed only in front of a server that VERIFIES SigV4. The
+# client signs for this proxy's host; the upstream checks the signature over
+# ITS host, so forwarding the client's Authorization unchanged always fails.
+# The proxy therefore strips it and re-signs with the same credentials, which
+# is fine for a test harness and is the only way the fault modes can be used
+# against a real server. Without botocore the proxy still works for an
+# endpoint that does not check auth.
+try:
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    _HAVE_BOTOCORE = True
+except ImportError:
+    _HAVE_BOTOCORE = False
 
 STATE = {"mode": "ok", "mtime": None, "n": 0, "g": 0}
 LOCK = threading.Lock()
@@ -93,16 +111,38 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- plumbing ----------------------------------------------------------
-    def _upstream(self, method):
+    def _upstream(self, method, path=None):
         host, _, port = self.server.upstream.partition(":")
-        c = http.client.HTTPConnection(host, int(port), timeout=30)
-        headers = {}
-        for k in ("Range", "Authorization", "x-amz-content-sha256", "x-amz-date"):
-            v = self.headers.get(k)
-            if v is not None:
-                headers[k] = v
-        headers["Host"] = self.server.upstream
-        c.request(method, self.path, headers=headers)
+        path = path or self.path
+        c = http.client.HTTPConnection(host, int(port), timeout=60)
+
+        if self.server.resign:
+            # Forward the semantics (Range, If-Match) and sign them afresh for
+            # the upstream host. Both are signed headers there too, so they
+            # must be present before signing, not added after.
+            hdrs = {"host": self.server.upstream,
+                    "x-amz-content-sha256":
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+            for k in ("Range", "If-Match", "If-None-Match"):
+                v = self.headers.get(k)
+                if v is not None:
+                    hdrs[k.lower()] = v
+            req = AWSRequest(method=method,
+                             url="http://" + self.server.upstream + path,
+                             headers=hdrs)
+            SigV4Auth(Credentials(self.server.access_key, self.server.secret_key),
+                      "s3", self.server.region).add_auth(req)
+            headers = dict(req.headers)
+        else:
+            headers = {}
+            for k in ("Range", "If-Match", "If-None-Match", "Authorization",
+                      "x-amz-content-sha256", "x-amz-date"):
+                v = self.headers.get(k)
+                if v is not None:
+                    headers[k] = v
+            headers["Host"] = self.server.upstream
+
+        c.request(method, path, headers=headers)
         r = c.getresponse()
         body = r.read()
         return r, body
@@ -140,6 +180,9 @@ class Handler(BaseHTTPRequestHandler):
         mode = current_mode(self.server.control)
         n, g = next_ordinal(method == "GET")
         name, _, arg = mode.partition(":")
+        if self.server.trace:
+            print(f"{method} n={n} g={g} mode={mode} range={self.headers.get('Range')} "
+                  f"if-match={self.headers.get('If-Match')}", flush=True)
 
         if name == "permanent":
             return self._error(500, "permanent injected failure")
@@ -168,6 +211,18 @@ class Handler(BaseHTTPRequestHandler):
         if name == "fail_get_first" and method == "GET" and g <= int(arg or 1):
             return self._error(503, f"injected transient GET failure {g}")
 
+        if name == "fail_then_replace" and method == "GET" and g == int(arg or 1):
+            # THE PHASE 6 CASE. Fail this GET transiently AND replace the
+            # object before the client's retry arrives, so the retry meets a
+            # different incarnation. A reader that re-HEADed on retry would
+            # silently adopt the new one.
+            try:
+                _replace_object(self.server)
+                why = "injected transient failure, object replaced underneath"
+            except Exception as e:                      # noqa: BLE001
+                why = f"injected transient failure, replacement FAILED: {e}"
+            return self._error(503, why)
+
         if name == "fail_get_after" and method == "GET" and g > int(arg or 0):
             # A permanent failure arriving MID-SCAN, after the footer was read
             # and some row groups already decoded. The query must fail rather
@@ -179,7 +234,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(r.status,
                               [("Content-Length", str(int(arg or 0))),
                                ("Accept-Ranges", "bytes"),
-                               ("Connection", "close")], None)
+                               ("Connection", "close")]
+                              + _identity_headers(r), None)
 
         try:
             r, body = self._upstream(method)
@@ -190,20 +246,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(r.status,
                               [("Content-Length", r.getheader("Content-Length", "0")),
                                ("Accept-Ranges", "bytes"),
-                               ("Connection", "close")], None)
+                               ("Connection", "close")]
+                              + _identity_headers(r), None)
 
         if name == "ignore_range":
             # Answer 200 with the whole object, which is what a misconfigured
             # endpoint does. The reader must refuse rather than slice it.
-            host, _, port = self.server.upstream.partition(":")
-            c = http.client.HTTPConnection(host, int(port), timeout=60)
-            c.request("GET", self.path, headers={"Host": self.server.upstream})
-            whole = c.getresponse()
-            full = whole.read()
+            saved = self.headers
+            class _NoRange:
+                def __init__(self, h): self._h = h
+                def get(self, k, d=None):
+                    return d if k in ("Range",) else self._h.get(k, d)
+            self.headers = _NoRange(saved)
+            try:
+                whole, full = self._upstream("GET")
+            finally:
+                self.headers = saved
             return self._send(200, [("Content-Length", str(len(full))),
                                     ("Connection", "close")], full)
 
-        hdrs = [("Connection", "close")]
+        hdrs = [("Connection", "close")] + _identity_headers(r)
         cr = r.getheader("Content-Range")
         if cr:
             hdrs.append(("Content-Range", cr))
@@ -230,11 +292,56 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("HEAD")
 
 
+def _identity_headers(r):
+    """ETag and Last-Modified, forwarded verbatim.
+
+    Dropping ETag makes a reader with an identity guard refuse to open, which
+    is how this was found: the guard reported "the server returned no ETag"
+    and stopped. Forwarding it is not cosmetic -- it is what makes the proxy a
+    transparent stand-in for the real server.
+    """
+    out = []
+    for h in ("ETag", "Last-Modified"):
+        v = r.getheader(h)
+        if v is not None:
+            out.append((h, v))
+    return out
+
+
+def _replace_object(srv):
+    """Overwrite the object under test with the staged replacement.
+
+    Server-side copy, so it is one fast operation rather than a 180 MB upload
+    racing the scan.
+    """
+    import boto3
+    from botocore.config import Config
+    s3 = boto3.client("s3", endpoint_url="http://" + srv.upstream,
+                      aws_access_key_id=srv.access_key,
+                      aws_secret_access_key=srv.secret_key,
+                      region_name=srv.region,
+                      config=Config(s3={"addressing_style": "path"}))
+    bucket, _, key = srv.replace_target.partition("/")
+    s3.copy_object(Bucket=bucket, Key=key,
+                   CopySource={"Bucket": bucket, "Key": srv.replace_source})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5556)
     ap.add_argument("--upstream", default="127.0.0.1:5555")
     ap.add_argument("--control", required=True)
+    ap.add_argument("--trace", action="store_true",
+                    help="log every request's mode decision, for diagnosing a "
+                         "fault that did not fire")
+    ap.add_argument("--resign", action="store_true",
+                    help="re-sign upstream requests; required in front of a "
+                         "server that verifies SigV4")
+    ap.add_argument("--access-key", default="rustkey")
+    ap.add_argument("--secret-key", default="rustsecret0123456789")
+    ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--replace-target", default="xpb/reg_buh.parquet")
+    ap.add_argument("--replace-source", default="staged_B.parquet")
     a = ap.parse_args()
 
     if not os.path.exists(a.control):
@@ -244,7 +351,17 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     srv.upstream = a.upstream
     srv.control = a.control
+    srv.resign = a.resign
+    srv.trace = a.trace
+    srv.access_key = a.access_key
+    srv.secret_key = a.secret_key
+    srv.region = a.region
+    srv.replace_target = a.replace_target
+    srv.replace_source = a.replace_source
     srv.daemon_threads = True
+    if a.resign and not _HAVE_BOTOCORE:
+        print("!! --resign needs botocore", flush=True)
+        return 2
     print(f"fault proxy on 127.0.0.1:{a.port} -> {a.upstream}, control {a.control}",
           flush=True)
     srv.serve_forever()
