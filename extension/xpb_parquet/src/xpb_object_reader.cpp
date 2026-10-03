@@ -22,10 +22,92 @@ namespace xpb {
 
 namespace {
 
+/*
+ * The identity of an open local file.
+ *
+ * CHOSEN FROM A MEASUREMENT, not from intuition. The matrix in
+ * test/local_identity_matrix.cpp runs eight mutation scenarios and records, for
+ * each, what moves when observed through the READER'S OWN descriptor:
+ *
+ *   scenario                       ino size mtime ctime | fd sees new bytes
+ *   1 same-size overwrite           no   no   YES   yes | YES   <- must detect
+ *   2 different-size rewrite        no  yes   YES   yes | YES   <- must detect
+ *   3 append                        no  yes   yes   yes | no
+ *   4 truncate + rewrite same size  no   no   YES   yes | YES   <- must detect
+ *   5 rename away, new file at path no   no    no   YES | no    <- must NOT flag
+ *   6 atomic replace via rename     no   no    no   YES | no    <- must NOT flag
+ *   7 unlink while reader open      no   no    no   YES | no    <- must NOT flag
+ *   8 overwrite right after open    no   no   YES   yes | YES   <- must detect
+ *
+ * What that rules out:
+ *
+ *   st_ctim  changes in ALL EIGHT, including the three where the reader's
+ *            bytes are untouched -- rename and unlink both touch it. Using
+ *            ctime would condemn an atomic replace, which is the safe idiom.
+ *            A "catch more by including ctime" instinct is wrong here, and
+ *            only the matrix says so.
+ *   st_size  alone misses 1, 4 and 8, all same-size mutations.
+ *   st_ino   never moves: fstat follows the descriptor to its inode, so it
+ *            cannot be a change detector. It is still carried, because it
+ *            states WHICH inode is pinned.
+ *   statx change cookie -- designed for exactly this question, and NOT
+ *            supported by this kernel and filesystem. Probed, not assumed.
+ *
+ * So: (st_dev, st_ino, st_size, st_mtim), via fstat on our own fd.
+ *
+ * THE LIMIT OF THE GUARANTEE, stated rather than implied. mtime is the only
+ * detector for a same-size overwrite, so the guarantee is only as fine as the
+ * filesystem's timestamp. Measured here: 200 of 200 back-to-back writes moved
+ * st_mtim, at nanosecond granularity. On a filesystem with coarse timestamps a
+ * same-size overwrite inside one tick would go unnoticed, and this token would
+ * be unsound there. It is not a guarantee about all filesystems.
+ *
+ * Append (3) is detected and refused although the bytes already read are
+ * intact. That is deliberate and conservative: the object is no longer the one
+ * that was opened, and a reader holding a footer from a file of size N cannot
+ * claim it is authoritative for a file of size N + M.
+ */
+struct FileIdentity
+{
+    dev_t    dev = 0;
+    ino_t    ino = 0;
+    int64_t  size = -1;
+    int64_t  mtime_sec = 0;
+    long     mtime_nsec = 0;
+
+    static FileIdentity of(const struct stat &st)
+    {
+        FileIdentity id;
+        id.dev = st.st_dev;
+        id.ino = st.st_ino;
+        id.size = static_cast<int64_t>(st.st_size);
+        id.mtime_sec = static_cast<int64_t>(st.st_mtim.tv_sec);
+        id.mtime_nsec = static_cast<long>(st.st_mtim.tv_nsec);
+        return id;
+    }
+
+    bool operator==(const FileIdentity &o) const
+    {
+        return dev == o.dev && ino == o.ino && size == o.size &&
+               mtime_sec == o.mtime_sec && mtime_nsec == o.mtime_nsec;
+    }
+
+    /* For the error message. Deliberately not exposed above ObjectReader. */
+    std::string str() const
+    {
+        return "dev " + std::to_string((unsigned long long) dev) +
+               " ino " + std::to_string((unsigned long long) ino) +
+               " size " + std::to_string(size) +
+               " mtime " + std::to_string(mtime_sec) + "." +
+               std::to_string(mtime_nsec);
+    }
+};
+
 class FileReader : public ObjectReader
 {
 public:
-    FileReader(int fd, int64_t size) : fd_(fd), size_(size) {}
+    FileReader(int fd, int64_t size, const FileIdentity &id)
+        : fd_(fd), size_(size), identity_(id) {}
 
     ~FileReader() override { close(); }
 
@@ -60,6 +142,17 @@ public:
          * here on its own thread, so nothing is allocated or half-updated
          * before it runs: the counters are touched only after the read returns.
          */
+        /*
+         * The identity check sits with the interrupt hook, before the physical
+         * read, so a read is never issued against an object that has already
+         * moved. Checked on EVERY read rather than every Nth: the overhead is
+         * one fstat, and a sampled check would leave a window in which a
+         * mixed-incarnation read is served -- which is the whole thing this
+         * prevents.
+         */
+        if (!identity_still_ours())
+            return ReadResult::failure();
+
         before_read();
 
         char   *dst = static_cast<char *>(out);
@@ -110,8 +203,37 @@ public:
     }
 
 private:
-    int     fd_;
-    int64_t size_;
+    /*
+     * fstat on OUR descriptor, never stat on a pathname. That distinction is
+     * the whole reason an atomic rename replacement is safe here: the
+     * descriptor still refers to the inode it was opened on, so its identity
+     * does not move, while "what the pathname names now" has changed and is
+     * none of this reader's business. A path-based check would report
+     * corruption for the one replacement idiom that is correct.
+     */
+    bool identity_still_ours()
+    {
+        struct stat st;
+
+        if (::fstat(fd_, &st) != 0)
+        {
+            fail(std::string("fstat while verifying object identity: ") +
+                 std::strerror(errno));
+            return false;
+        }
+
+        FileIdentity now = FileIdentity::of(st);
+        if (now == identity_)
+            return true;
+
+        fail_identity_moved("local file was " + identity_.str() +
+                            " at open, is now " + now.str());
+        return false;
+    }
+
+    int             fd_;
+    int64_t         size_;
+    FileIdentity    identity_;
 };
 
 }   /* namespace */
@@ -158,7 +280,12 @@ open_file_reader(const char *path, std::string *error)
      */
     try
     {
-        return new FileReader(fd, static_cast<int64_t>(st.st_size));
+        /*
+     * Size and identity come from the SAME fstat, so there is no window in
+     * which the reader holds a length from one incarnation and pins another.
+     */
+    return new FileReader(fd, static_cast<int64_t>(st.st_size),
+                          FileIdentity::of(st));
     }
     catch (...)
     {

@@ -135,6 +135,37 @@
  *       the reader holds no C++ object needing destruction across the call: the
  *       hook runs first, then the read.
  *
+ *   identity -- ONE READER READS ONE INCARNATION OF THE OBJECT
+ *       An implementation captures an opaque identity at open and must refuse
+ *       any later read that does not belong to that same incarnation. This is
+ *       a TRANSPORT-GENERAL obligation of the contract; the token is
+ *       transport-specific and is never exposed upward.
+ *
+ *       The invariant exists because the alternative is a wrong answer rather
+ *       than an error. Measured on both transports: over S3, replacing the
+ *       object two seconds into a full scan had row groups 0-52 served from
+ *       one incarnation and row group 53 from another, failing with
+ *       "Deserializing page header failed" -- indistinguishable from a corrupt
+ *       file. Locally, one FileReader returned "PAR1" and then "XXXX" from the
+ *       same offset across an in-place overwrite, with its cached size
+ *       unchanged.
+ *
+ *       What the token means: "is this still the thing I opened". What it does
+ *       NOT mean: a content hash. Over S3 the same bytes carry different ETags
+ *       depending on how they were written -- a 22-part multipart upload and a
+ *       server-side copy of identical content give different values, and the
+ *       first is not an MD5 of anything. Nothing may compare a token with a
+ *       checksum, or across objects.
+ *
+ *       Validation is the implementation's business, like retry. The layers
+ *       above learn only that a read failed, never why in transport terms:
+ *       ParquetReader, Arrow and the XPBatch operators have no notion of
+ *       ETags, inodes or timestamps, and must not acquire one.
+ *
+ *       A reader must NOT reopen, re-pin, or adopt a new incarnation on its
+ *       own. Recovering from a changed object is a decision for a layer that
+ *       knows what the query meant, and no such layer has asked for it.
+ *
  *   accounting
  *       The reader is the authoritative place for it, because it is the only
  *       layer that sees physical reads. bytes_requested and bytes_returned are
@@ -256,6 +287,17 @@ public:
      */
     int64_t short_reads_without_eof() const { return short_reads_without_eof_; }
 
+    /*
+     * Reads refused because the object was no longer the one this reader
+     * opened. Transport-general and deliberately just a COUNT: it reports that
+     * the invariant held, without leaking what the token was or what kind of
+     * store produced it.
+     *
+     * Nonzero means a mixed-incarnation read was PREVENTED, not that one
+     * happened.
+     */
+    int64_t identity_conflicts() const { return identity_conflicts_; }
+
     int64_t read_calls()      const { return read_calls_; }
     int64_t bytes_requested() const { return bytes_requested_; }
     int64_t bytes_returned()  const { return bytes_returned_; }
@@ -301,6 +343,19 @@ protected:
         return -1;
     }
 
+    /*
+     * The one way to report the invariant broken, so both transports say it
+     * the same way and neither invents its own wording. Counting here rather
+     * than in each implementation is what makes the count transport-general.
+     */
+    void fail_identity_moved(const std::string &detail)
+    {
+        identity_conflicts_++;
+        fail("the object changed since this read began (" + detail +
+             "). One reader reads one object incarnation; not retrying and "
+             "not reopening");
+    }
+
     void clear_error() { error_.clear(); }
 
     /*
@@ -339,6 +394,7 @@ private:
     std::atomic<int64_t> data_calls_{0};
     std::atomic<int64_t> skipped_offthread_{0};
     std::atomic<int64_t> short_reads_without_eof_{0};
+    std::atomic<int64_t> identity_conflicts_{0};
 };
 
 /*

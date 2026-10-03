@@ -275,7 +275,6 @@ public:
     void set_io_timeout_ms(int n) { io_timeout_ms_ = n; }
     void set_require_identity(bool b) { require_identity_ = b; }
     const std::string &identity() const { return identity_; }
-    int64_t identity_conflicts() const { return identity_conflicts_; }
     void set_connect_timeout_ms(int n) { connect_timeout_ms_ = n; }
 
     ~S3Reader() override { close(); }
@@ -482,10 +481,15 @@ public:
         if (status == 412)
         {
             http_errors_++;
-            identity_conflicts_++;
-            fail("GET " + path() + " " + range + ": the object changed since this "
-                 "read began (If-Match " + identity_ + " -> HTTP 412). One reader "
-                 "reads one object version; not retrying and not reopening");
+            /*
+             * Reported through the base class, which is where the invariant
+             * lives and where the count is kept, so this transport and the
+             * local one say the same thing in the same words. The ETag appears
+             * only in the DETAIL -- it is this transport's private token and
+             * nothing above ObjectReader is told what kind of token it is.
+             */
+            fail_identity_moved("GET " + path() + " " + range +
+                                ": If-Match " + identity_ + " -> HTTP 412");
             return ReadResult::failure();
         }
 
@@ -923,7 +927,6 @@ private:
     int64_t     http_attempts_ = 0;     /* physical exchanges, retries included */
     std::string identity_;              /* opaque ETag captured with size_     */
     bool        require_identity_ = true;
-    int64_t     identity_conflicts_ = 0;
     int64_t     retries_done_ = 0;
     int         max_attempts_ = 3;
     int         io_timeout_ms_ = 15000;
@@ -1092,7 +1095,14 @@ int64_t s3_http_attempts(const ObjectReader *r)
 int64_t s3_retries(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->retries() : -1; }
 int64_t s3_identity_conflicts(const ObjectReader *r)
-{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->identity_conflicts() : -1; }
+{
+    /*
+     * Now the base class's transport-general count, kept here only so the
+     * existing SQL column keeps working. A -1 still means "not an S3 reader".
+     */
+    const S3Reader *s = dynamic_cast<const S3Reader *>(r);
+    return s ? s->identity_conflicts() : -1;
+}
 const char *s3_identity(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->identity().c_str() : ""; }
 
