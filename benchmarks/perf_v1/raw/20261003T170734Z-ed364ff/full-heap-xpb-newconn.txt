@@ -1,0 +1,19 @@
+# arm=heap-xpb shape=full range=[1..120] state=newconn commit=ed364ff
+# command: psql -f <2 calls of xpb_batch_join2_groupby(1,120,'heap')>
+
+Time: 0.162 ms
+Time: 8.958 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [1..120] mode=heap: total=238.9 ms  build=0.2 ms  source=179.5 ms  join1=16.2 ms  join2=17.6 ms  agg=25.5 ms  rows=10000000  batches=153  groups=2000  dim1=120 dim2=200
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 240.452 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [1..120] mode=heap: total=220.7 ms  build=0.0 ms  source=158.1 ms  join1=16.6 ms  join2=18.5 ms  agg=27.5 ms  rows=10000000  batches=153  groups=2000  dim1=120 dim2=200
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 221.728 ms

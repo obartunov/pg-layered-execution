@@ -1,0 +1,19 @@
+# arm=parquet-s3-xpb shape=full range=[1..120] state=newconn commit=ed364ff
+# command: psql -f <2 calls of xpb_batch_join2_groupby(1,120,'ext:parquet:s3://xpb/reg_buh.parquet')>
+
+Time: 0.159 ms
+Time: 9.553 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [1..120] mode=ext:parquet:s3://xpb/reg_buh.parquet: total=11054.3 ms  build=0.2 ms  source=10967.7 ms  join1=20.5 ms  join2=24.0 ms  agg=30.5 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  filter=11.4 ms  filter_in=10000000 filter_out=10000000
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 11100.830 ms (00:11.101)
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [1..120] mode=ext:parquet:s3://xpb/reg_buh.parquet: total=10304.1 ms  build=0.0 ms  source=10223.3 ms  join1=19.0 ms  join2=22.9 ms  agg=28.0 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  filter=10.6 ms  filter_in=10000000 filter_out=10000000
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 10348.144 ms (00:10.348)

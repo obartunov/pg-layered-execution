@@ -1,0 +1,46 @@
+commit:        ed364ff
+stamp:         20261003T170734Z
+host:          Linux 6.18.44-fc-v64 x86_64  cpus=2
+memory:        8031 MB total
+pg:            PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+pgbin:         /home/claude/pginstall20/bin
+port/host/db:  5420 /tmp/xpb_sock testdb
+
+-- PostgreSQL settings that bear on this measurement
+  effective_cache_size = 5242888kB
+  huge_pages = try
+  io_method = worker
+  jit = off
+  maintenance_work_mem = 65536kB
+  max_parallel_workers = 8
+  max_parallel_workers_per_gather = 2
+  random_page_cost = 4
+  seq_page_cost = 1
+  shared_buffers = 1310728kB
+  track_io_timing = off
+  work_mem = 262144kB
+
+-- extensions
+  pgcolumnar 1.0-alpha5
+  plpgsql 1.0
+  xp_batch 1.0
+
+-- dataset identity (the SAME logical rows in every representation)
+  heap   reg_buh:      rows=10000000  sum(amount_dt)=500103444582  period_key=1..120
+  pgcol  reg_buh_col:  rows=10000000  sum(amount_dt)=500103444582
+  size   dim_account = 40 kB
+  size   dim_period = 40 kB
+  size   reg_buh = 575 MB
+  size   reg_buh_col = 98 MB
+  parquet /home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet
+          180143345 bytes  md5=0d8da64d7ccb93afad60f721b6594e9d
+  s3      s3://xpb/reg_buh.parquet at <unset in this shell>
+          server ETag: "0d8da64d7ccb93afad60f721b6594e9d"
+
+-- zlfs zones
+  [25..36] rows=1000008 size=15625 kB VALID
+  [1..120] rows=10000000 size=156250 kB VALID
+  [25..25] rows=83334 size=1302 kB VALID
+
+-- build flags of the Parquet module
+  PG_CPPFLAGS = -I../xp_batch/src -Isrc

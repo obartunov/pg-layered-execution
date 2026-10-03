@@ -1,0 +1,53 @@
+# arm=heap-xpb shape=mid state=warm runs=5 (after 1 warm-up) commit=ed364ff
+# sql: SELECT count(*) FROM xpb_batch_groupby(1,120,'heap');
+
+Time: 0.211 ms
+Time: 8.313 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:4: NOTICE:  batch_groupby [1..120] mode=heap: total=189.6 ms  source=170.5 ms  agg=19.2 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:4: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 191.314 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:5: NOTICE:  batch_groupby [1..120] mode=heap: total=167.4 ms  source=147.8 ms  agg=19.6 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:5: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 168.429 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:6: NOTICE:  batch_groupby [1..120] mode=heap: total=170.7 ms  source=149.8 ms  agg=20.9 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:6: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 171.809 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:7: NOTICE:  batch_groupby [1..120] mode=heap: total=201.6 ms  source=170.7 ms  agg=30.9 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:7: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 203.279 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:8: NOTICE:  batch_groupby [1..120] mode=heap: total=172.1 ms  source=151.7 ms  agg=20.4 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:8: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 173.235 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:9: NOTICE:  batch_groupby [1..120] mode=heap: total=168.1 ms  source=148.5 ms  agg=19.7 ms  rows=10000000  batches=153  groups=6000
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171536Z-ed364ff-groupagg/.q.sql:9: NOTICE:    heap: pages_rejected=0 pages_scanned=73680 tuples_visited=10000000 tuples_passed=10000000
+ count 
+-------
+  6000
+(1 row)
+
+Time: 169.200 ms

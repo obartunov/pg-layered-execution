@@ -1,0 +1,14 @@
+# arm=heap-xpb shape=selective range=[25..36] state=cold commit=ed364ff
+# postmaster restarted: yes    page cache dropped: yes
+# free after drop: 609 MB used, 349 MB buff/cache
+# command: psql -c "SELECT count(*) FROM xpb_batch_join2_groupby(25,36,'heap')"
+
+Time: 1.595 ms
+Time: 33.335 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171227Z-ed364ff-cold/.q.sql:4: NOTICE:  batch_join2_groupby [25..36] mode=heap: total=716.4 ms  build=1.2 ms  source=709.8 ms  join1=1.9 ms  join2=2.2 ms  agg=2.4 ms  rows=1000008  batches=16  groups=200  dim1=120 dim2=200
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 722.669 ms

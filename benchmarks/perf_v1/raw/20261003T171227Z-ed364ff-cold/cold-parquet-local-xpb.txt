@@ -1,0 +1,14 @@
+# arm=parquet-local-xpb shape=selective range=[25..36] state=cold commit=ed364ff
+# postmaster restarted: yes    page cache dropped: yes
+# free after drop: 754 MB used, 349 MB buff/cache
+# command: psql -c "SELECT count(*) FROM xpb_batch_join2_groupby(25,36,'ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet')"
+
+Time: 1.494 ms
+Time: 29.175 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T171227Z-ed364ff-cold/.q.sql:4: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=45.9 ms  build=1.1 ms  source=35.1 ms  join1=2.5 ms  join2=3.0 ms  agg=3.3 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.9 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 62.550 ms

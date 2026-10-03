@@ -1,0 +1,40 @@
+# xpq_scan arm=s3 shape=projection cols=period_key range=[all..all] commit=ed364ff
+
+Time: 0.223 ms
+Time: 11.569 ms
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms     | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+-------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4718.035656998167 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4790.683 ms (00:04.791)
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms     | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+-------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4669.365443001967 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4735.532 ms (00:04.736)
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms     | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+-------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4898.418041001074 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4962.022 ms (00:04.962)
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms      | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+--------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4710.0900569995865 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4777.402 ms (00:04.777)
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms      | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+--------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4870.7556709996425 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4937.457 ms (00:04.937)
+   rows   | read_calls | meta_calls | data_calls | meta_bytes | data_bytes | bytes_requested | bytes_returned | logical_calls | logical_bytes | row_groups_read | row_groups_skipped | decoded_values |     decode_ms     | s3_get_calls | s3_http_attempts | s3_bytes_transferred | s3_retries | s3_connections | s3_reconnects 
+----------+------------+------------+------------+------------+------------+-----------------+----------------+---------------+---------------+-----------------+--------------------+----------------+-------------------+--------------+------------------+----------------------+------------+----------------+---------------
+ 10000000 |        202 |          2 |        200 |     237693 |      43202 |          280895 |         280895 |           202 |        280895 |             200 |                  0 |       10000000 | 4775.812493000645 |          202 |              203 |               280895 |          0 |              1 |             0
+(1 row)
+
+Time: 4844.318 ms (00:04.844)

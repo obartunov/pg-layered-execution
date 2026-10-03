@@ -1,0 +1,46 @@
+# arm=pgcolumnar-xpb shape=full range=[1..120] state=warm runs=5 (after 1 warm-up) commit=ed364ff
+
+Time: 0.169 ms
+Time: 10.844 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=402.1 ms  build=0.2 ms  source=310.8 ms  join1=26.0 ms  join2=25.5 ms  agg=39.6 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 405.165 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=322.1 ms  build=0.0 ms  source=251.0 ms  join1=19.3 ms  join2=20.8 ms  agg=31.0 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 323.145 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:6: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=286.3 ms  build=0.0 ms  source=226.8 ms  join1=15.7 ms  join2=17.4 ms  agg=26.3 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 287.224 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:7: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=281.3 ms  build=0.0 ms  source=219.9 ms  join1=15.5 ms  join2=17.5 ms  agg=28.3 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 282.563 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:8: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=266.3 ms  build=0.0 ms  source=211.4 ms  join1=14.1 ms  join2=17.0 ms  agg=23.7 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 267.203 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:9: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=273.3 ms  build=0.0 ms  source=214.4 ms  join1=15.7 ms  join2=17.7 ms  agg=25.5 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 274.533 ms

@@ -1,0 +1,46 @@
+# arm=parquet-local-xpb shape=selective range=[25..36] state=warm runs=5 (after 1 warm-up) commit=ed364ff
+
+Time: 0.244 ms
+Time: 8.329 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=22.9 ms  build=0.2 ms  source=15.5 ms  join1=1.7 ms  join2=2.1 ms  agg=2.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.2 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 27.205 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=20.5 ms  build=0.0 ms  source=13.6 ms  join1=1.6 ms  join2=1.9 ms  agg=2.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.0 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 23.126 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:6: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=20.5 ms  build=0.0 ms  source=13.5 ms  join1=1.7 ms  join2=2.0 ms  agg=2.3 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=0.9 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 22.750 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:7: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=20.7 ms  build=0.0 ms  source=13.5 ms  join1=1.9 ms  join2=1.9 ms  agg=2.3 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.0 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 22.891 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:8: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=22.2 ms  build=0.0 ms  source=15.2 ms  join1=1.5 ms  join2=2.0 ms  agg=2.4 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.0 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 24.419 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:9: NOTICE:  batch_join2_groupby [25..36] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=20.3 ms  build=0.0 ms  source=13.6 ms  join1=1.5 ms  join2=1.9 ms  agg=2.3 ms  rows=1000008  batches=21  groups=200  dim1=120 dim2=200  filter=1.0 ms  filter_in=1050000 filter_out=1000008
+ groups |  checksum   
+--------+-------------
+    200 | 50004205035
+(1 row)
+
+Time: 22.480 ms

@@ -1,0 +1,19 @@
+# arm=pgcolumnar-xpb shape=full range=[1..120] state=newconn commit=ed364ff
+# command: psql -f <2 calls of xpb_batch_join2_groupby(1,120,'pgcolumnar')>
+
+Time: 0.275 ms
+Time: 9.174 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=269.9 ms  build=0.2 ms  source=215.2 ms  join1=14.2 ms  join2=17.3 ms  agg=23.1 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 271.761 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [1..120] mode=pgcolumnar: total=255.4 ms  build=0.0 ms  source=201.3 ms  join1=14.4 ms  join2=17.0 ms  agg=22.7 ms  rows=10000000  batches=200  groups=2000  dim1=120 dim2=200  rowgroups=67 copied=0 copied_bytes=0
+ groups |   checksum   
+--------+--------------
+   2000 | 500103444582
+(1 row)
+
+Time: 256.422 ms

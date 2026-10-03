@@ -1,0 +1,41 @@
+# arm=heap-sql shape=high state=warm runs=5 (after 1 warm-up) commit=ed364ff
+# sql: SELECT count(*) FROM (SELECT period_key, company_key, account_key, sum(amount_dt) FROM reg_buh GROUP BY 1,2,3) q;
+
+Time: 0.193 ms
+Time: 7.844 ms
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1175.328 ms (00:01.175)
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1124.268 ms (00:01.124)
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1174.431 ms (00:01.174)
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1282.061 ms (00:01.282)
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1059.115 ms (00:01.059)
+ count 
+-------
+ 24000
+(1 row)
+
+Time: 1094.346 ms (00:01.094)

@@ -1,0 +1,46 @@
+# arm=heap-xpb shape=narrow range=[25..25] state=warm runs=5 (after 1 warm-up) commit=ed364ff
+
+Time: 0.201 ms
+Time: 8.237 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=141.2 ms  build=0.2 ms  source=140.1 ms  join1=0.4 ms  join2=0.5 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 142.652 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=144.5 ms  build=0.0 ms  source=143.5 ms  join1=0.3 ms  join2=0.5 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 145.386 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:6: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=115.7 ms  build=0.0 ms  source=114.8 ms  join1=0.3 ms  join2=0.4 ms  agg=0.3 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 116.595 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:7: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=126.1 ms  build=0.0 ms  source=124.8 ms  join1=0.4 ms  join2=0.5 ms  agg=0.3 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 127.040 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:8: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=114.2 ms  build=0.0 ms  source=113.4 ms  join1=0.3 ms  join2=0.4 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 115.124 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170221Z-ed364ff/.q.sql:9: NOTICE:  batch_join2_groupby [25..25] mode=heap: total=110.7 ms  build=0.0 ms  source=109.8 ms  join1=0.3 ms  join2=0.4 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 111.525 ms

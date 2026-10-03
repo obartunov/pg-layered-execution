@@ -1,0 +1,19 @@
+# arm=parquet-local-xpb shape=narrow range=[25..25] state=newconn commit=ed364ff
+# command: psql -f <2 calls of xpb_batch_join2_groupby(25,25,'ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet')>
+
+Time: 0.228 ms
+Time: 8.955 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:4: NOTICE:  batch_join2_groupby [25..25] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=6.7 ms  build=0.2 ms  source=4.5 ms  join1=0.3 ms  join2=0.4 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200  filter=1.2 ms  filter_in=100000 filter_out=83334
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 17.505 ms
+psql:/home/claude/pg-layered-execution/benchmarks/perf_v1/raw/20261003T170734Z-ed364ff/.q.sql:5: NOTICE:  batch_join2_groupby [25..25] mode=ext:parquet:/home/claude/pg-layered-execution/benchmarks/02-batch-joins/data/reg_buh.parquet: total=2.8 ms  build=0.0 ms  source=1.4 ms  join1=0.2 ms  join2=0.3 ms  agg=0.2 ms  rows=83334  batches=2  groups=200  dim1=120 dim2=200  filter=0.7 ms  filter_in=100000 filter_out=83334
+ groups |  checksum  
+--------+------------
+    200 | 4164778492
+(1 row)
+
+Time: 5.623 ms

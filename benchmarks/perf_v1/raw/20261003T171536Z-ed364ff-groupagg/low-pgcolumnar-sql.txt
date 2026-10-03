@@ -1,0 +1,41 @@
+# arm=pgcolumnar-sql shape=low state=warm runs=5 (after 1 warm-up) commit=ed364ff
+# sql: SELECT count(*) FROM (SELECT period_key, sum(amount_dt) FROM reg_buh_col GROUP BY 1) q;
+
+Time: 0.203 ms
+Time: 8.319 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 581.013 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 597.256 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 550.166 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 549.085 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 637.807 ms
+ count 
+-------
+   120
+(1 row)
+
+Time: 620.123 ms
