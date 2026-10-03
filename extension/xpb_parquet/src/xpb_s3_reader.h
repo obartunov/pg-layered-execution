@@ -90,6 +90,9 @@ class ObjectReader;
  *   XPB_S3_ACCESS_KEY      access key id
  *   XPB_S3_SECRET_KEY      secret access key
  *   XPB_S3_REGION          region, default us-east-1
+ *   XPB_S3_MAX_ATTEMPTS    total attempts per request, clamped to 1..5,
+ *                          default 3. 1 disables retry, which is what the
+ *                          failure tests use to see the raw error.
  *
  * Deliberately NOT the AWS_* names: these are read from the postmaster's
  * environment, and silently picking up a developer's real AWS credentials to
@@ -143,6 +146,11 @@ int64_t s3_head_calls(const ObjectReader *r);
 int64_t s3_get_calls(const ObjectReader *r);
 int64_t s3_http_errors(const ObjectReader *r);
 int64_t s3_bytes_transferred(const ObjectReader *r);
+/* Physical HTTP exchanges and how many of them were retries. The pair is how
+ * "a retry changes the physical traffic and not the logical request" is shown
+ * for a remote source. */
+int64_t s3_http_attempts(const ObjectReader *r);
+int64_t s3_retries(const ObjectReader *r);
 
 }   /* namespace xpb */
 

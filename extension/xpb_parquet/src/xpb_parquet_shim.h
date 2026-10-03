@@ -120,7 +120,20 @@ int64_t     xpq_copy_bytes(const XpqReader *r);       /* copied, not borrowed   
 int         xpq_row_groups_read(const XpqReader *r);
 int64_t     xpq_chunks_seen(const XpqReader *r);      /* Arrow chunks, summed      */
 double      xpq_open_ms(const XpqReader *r);          /* footer read + parse       */
-double      xpq_decode_ms(const XpqReader *r);        /* cumulative decode         */
+/*
+ * Time spent inside Arrow's ReadRowGroup(), which is DECODE PLUS WHATEVER I/O
+ * ARROW DID THERE -- not decode.
+ *
+ * The name was accurate enough for a local file, where the reads inside that
+ * call come from the page cache: 148 ms for a full scan of the benchmark file,
+ * nearly all of it decode. Over a remote source it is dominated by transfer:
+ * the same scan reports 38 890 ms, of which ~38.7 s is 402 HTTP requests at
+ * ~95 ms each. Reporting that as "decode" would be a mislabelled instrument,
+ * so it is named here for what it measures. Decode alone is not separated;
+ * the local figure is the only proxy for it, and it is a good one because the
+ * data and the decoding code are identical.
+ */
+double      xpq_decode_ms(const XpqReader *r);
 
 /*
  * Real byte-range accounting, counted in the ObjectReader -- the only layer
@@ -184,6 +197,8 @@ int64_t     xpq_s3_head_calls(const XpqReader *r);
 int64_t     xpq_s3_get_calls(const XpqReader *r);
 int64_t     xpq_s3_http_errors(const XpqReader *r);
 int64_t     xpq_s3_bytes_transferred(const XpqReader *r);
+int64_t     xpq_s3_http_attempts(const XpqReader *r);
+int64_t     xpq_s3_retries(const XpqReader *r);
 
 /*
  * Open with a fault injected underneath the Parquet reader.

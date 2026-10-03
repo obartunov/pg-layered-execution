@@ -12,13 +12,18 @@
 #include "xpb_s3_reader.h"
 #include "xpb_object_reader.h"
 
+/* TEMPORARY: thread census, removed before commit. */
+#include <sys/syscall.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -251,12 +256,18 @@ public:
           access_(std::move(access)), secret_(std::move(secret)),
           region_(std::move(region)) {}
 
+    void set_max_attempts(int n) { max_attempts_ = n; }
+    void set_io_timeout_ms(int n) { io_timeout_ms_ = n; }
+    void set_connect_timeout_ms(int n) { connect_timeout_ms_ = n; }
+
     ~S3Reader() override { close(); }
 
     int64_t head_calls()        const { return head_calls_; }
     int64_t get_calls()         const { return get_calls_; }
     int64_t http_errors()       const { return http_errors_; }
     int64_t bytes_transferred() const { return bytes_transferred_; }
+    int64_t http_attempts()     const { return http_attempts_; }
+    int64_t retries()           const { return retries_done_; }
 
     int64_t size() override
     {
@@ -266,11 +277,23 @@ public:
             return size_;            /* fixed for the reader's life, as the
                                       * ObjectReader contract requires */
 
-        before_read();
         head_calls_++;
 
         std::string headers, body;
-        int status = request("HEAD", "", &headers, &body, 0);
+        int status = -1;
+        for (int attempt = 1; attempt <= max_attempts_; attempt++)
+        {
+            before_read();
+            headers.clear();
+            status = request("HEAD", "", &headers, &body, 0);
+            bool retryable = (status < 0) || status == 429 ||
+                             (status >= 500 && status < 600);
+            if (!retryable || attempt == max_attempts_)
+                break;
+            retries_done_++;
+            struct timespec ts = {0, 10 * 1000 * 1000};
+            nanosleep(&ts, nullptr);
+        }
         if (status < 0)
             return -1;
         if (status != 200)
@@ -306,15 +329,63 @@ public:
             return ReadResult::failure();
         }
 
-        before_read();
         get_calls_++;
 
         char range[128];
         snprintf(range, sizeof(range), "bytes=%lld-%lld",
                  (long long) offset, (long long) (offset + nbytes - 1));
 
+        /*
+         * BOUNDED RETRY, here and nowhere above.
+         *
+         * The v1 contract puts retry inside the implementation, under
+         * read_exact, so the Arrow adapter never learns that a read was
+         * attempted more than once. Minimal on purpose: a fixed small number
+         * of attempts, a fixed small delay, no exponential backoff, no jitter,
+         * no circuit breaker. Those are policy, and policy with no measured
+         * need is a guess.
+         *
+         * What is retryable is a judgement about whether another attempt could
+         * plausibly differ, not about whether the error looks bad:
+         *
+         *   connect/send/recv failure   yes, the exchange did not complete
+         *   5xx, 429                    yes, the server said "later"
+         *   truncated body              yes, the transfer was cut; THIS is the
+         *                               case v0 would have called EOF
+         *   416                         NO, it is a valid and stable answer
+         *   other 4xx                   NO, another attempt gives the same
+         *   200 to a ranged request     NO, the endpoint is misconfigured
+         *
+         * The interrupt hook runs before EACH attempt, so a cancel is seen
+         * between retries and not only between logical reads.
+         */
         std::string headers, body;
-        int status = request("GET", range, &headers, &body, nbytes);
+        int status = -1;
+
+        for (int attempt = 1; attempt <= max_attempts_; attempt++)
+        {
+            before_read();
+
+            headers.clear();
+            body.clear();
+            status = request("GET", range, &headers, &body, nbytes);
+
+            bool retryable = false;
+            if (status < 0)
+                retryable = true;                       /* exchange failed    */
+            else if (status == 429 || (status >= 500 && status < 600))
+                retryable = true;
+            else if (status == 206 && body_is_truncated(headers, body))
+                retryable = true;
+
+            if (!retryable || attempt == max_attempts_)
+                break;
+
+            retries_done_++;
+            struct timespec ts = {0, 10 * 1000 * 1000};  /* 10 ms, fixed */
+            nanosleep(&ts, nullptr);
+        }
+
         if (status < 0)
             return ReadResult::failure();
 
@@ -372,12 +443,43 @@ public:
         const int64_t got = static_cast<int64_t>(body.size());
 
         /*
-         * THE CASE THIS WHOLE CONTRACT EXISTS FOR.
+         * THE CASE THIS WHOLE CONTRACT EXISTS FOR, and the order of these two
+         * tests is the whole of it.
          *
-         * Fewer bytes than asked for, and the object does not end here. For a
-         * local file that cannot happen; over a transport it is a truncated
-         * response, and v0's "short means EOF" would have turned it into a
-         * silently short column chunk. It is an error, and eof stays false.
+         * A CUT TRANSFER IS CHECKED FIRST, against the response's own
+         * Content-Length, and it is never EOF whatever Content-Range says.
+         *
+         * This was wrong when first written: it decided eof from Content-Range
+         * before looking at whether the body was complete. A response whose
+         * range happens to reach the end of the object -- which is EVERY
+         * Parquet footer probe, since the footer is read backwards from the
+         * end -- was therefore classified as a clean end of object when its
+         * transfer had been cut in half. read_exact refused it, so no wrong
+         * answer escaped through that path; but read_at_most is what Arrow's
+         * sequential footer read uses, and it would have been handed
+         * eof = true with half a footer. "The file ends here" is exactly the
+         * lie this contract exists to prevent, and it survived in the remote
+         * implementation for precisely the ranges that matter most.
+         *
+         * Found by pointing the footer probe at an endpoint that truncates
+         * every response.
+         */
+        if (body_is_truncated(headers, body))
+        {
+            account(nbytes, got);
+            http_errors_++;
+            fail("GET " + path() + " " + range + ": transfer cut at " +
+                 std::to_string(got) + " of the " +
+                 header_value(headers, "Content-Length") +
+                 " bytes the response promised (" + cr +
+                 ") -- truncated response, not EOF");
+            return ReadResult::failure();
+        }
+
+        /*
+         * Short, but the response delivered everything it promised. So the
+         * server is telling us the object ends here, and Content-Range is the
+         * authority on that.
          */
         if (got < nbytes)
         {
@@ -389,7 +491,7 @@ public:
                 fail("GET " + path() + " " + range + ": body is " +
                      std::to_string(got) + " of " + std::to_string(nbytes) +
                      " bytes and the object does not end here (" + cr +
-                     ") -- truncated response, not EOF");
+                     ") -- short range with no end of object");
                 return ReadResult::failure();
             }
             memcpy(out, body.data(), static_cast<size_t>(got));
@@ -424,6 +526,21 @@ private:
     std::string path() const { return "/" + bucket_ + "/" + key_; }
 
     /*
+     * Short against the response's OWN Content-Length -- the transfer was cut
+     * mid-flight. Deliberately not "short against what the caller asked for":
+     * a legitimately short range at the end of the object has a matching
+     * Content-Length and must not be retried.
+     */
+    static bool body_is_truncated(const std::string &headers, const std::string &body)
+    {
+        std::string cl = header_value(headers, "Content-Length");
+        if (cl.empty())
+            return false;
+        int64_t promised = strtoll(cl.c_str(), nullptr, 10);
+        return promised >= 0 && static_cast<int64_t>(body.size()) < promised;
+    }
+
+    /*
      * One request, one socket, closed on return. `expect_body` is how many
      * bytes the caller wants, used only to size the reserve.
      *
@@ -434,6 +551,8 @@ private:
                 std::string *headers_out, std::string *body_out,
                 int64_t expect_body)
     {
+        http_attempts_++;
+
         int fd = connect_endpoint();
         if (fd < 0)
             return -1;
@@ -459,7 +578,11 @@ private:
             {
                 if (errno == EINTR)
                     continue;
-                fail(std::string("recv: ") + std::strerror(errno));
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    fail("timed out after " + std::to_string(io_timeout_ms_) +
+                         " ms waiting for response headers from " + ep_.host);
+                else
+                    fail(std::string("recv: ") + std::strerror(errno));
                 ::close(fd);
                 return -1;
             }
@@ -531,7 +654,12 @@ private:
             {
                 if (errno == EINTR)
                     continue;
-                fail(std::string("recv body: ") + std::strerror(errno));
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    fail("timed out after " + std::to_string(io_timeout_ms_) +
+                         " ms with " + std::to_string(body.size()) + " of " +
+                         std::to_string(want) + " body bytes from " + ep_.host);
+                else
+                    fail(std::string("recv body: ") + std::strerror(errno));
                 ::close(fd);
                 return -1;
             }
@@ -572,18 +700,89 @@ private:
             ::freeaddrinfo(res);
             return -1;
         }
-        if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0)
+        /*
+         * Non-blocking connect plus poll. The OS default can be minutes, and
+         * this thread cannot be interrupted -- see set_deadlines().
+         */
+        int flags = ::fcntl(fd, F_GETFL, 0);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int rcc = ::connect(fd, res->ai_addr, res->ai_addrlen);
+        if (rcc != 0 && errno == EINPROGRESS)
+        {
+            struct pollfd pfd;
+
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            int pr = ::poll(&pfd, 1, connect_timeout_ms_);
+            if (pr == 0)
+            {
+                fail("connect " + ep_.host + ":" + port + ": timed out after " +
+                     std::to_string(connect_timeout_ms_) + " ms");
+                ::close(fd);
+                ::freeaddrinfo(res);
+                return -1;
+            }
+            if (pr < 0)
+            {
+                fail(std::string("poll on connect: ") + std::strerror(errno));
+                ::close(fd);
+                ::freeaddrinfo(res);
+                return -1;
+            }
+            int       soerr = 0;
+            socklen_t slen = sizeof(soerr);
+            ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+            if (soerr != 0)
+            {
+                fail("connect " + ep_.host + ":" + port + ": " + std::strerror(soerr));
+                ::close(fd);
+                ::freeaddrinfo(res);
+                return -1;
+            }
+        }
+        else if (rcc != 0)
         {
             fail("connect " + ep_.host + ":" + port + ": " + std::strerror(errno));
             ::close(fd);
             ::freeaddrinfo(res);
             return -1;
         }
+        ::fcntl(fd, F_SETFL, flags);
         ::freeaddrinfo(res);
 
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        set_deadlines(fd);
         return fd;
+    }
+
+    /*
+     * A DEADLINE, not an interrupt check.
+     *
+     * Every data read below Arrow's pre_buffer runs on an Arrow worker thread,
+     * and the interrupt hook deliberately does not fire there -- see
+     * docs/OBJECT_READER_V0.md section 7. So a blocking recv() on a worker is
+     * unreachable by statement_timeout, pg_cancel_backend and
+     * pg_terminate_backend alike.
+     *
+     * Measured before this existed: an endpoint that accepts a connection,
+     * promises a body and then sends nothing left statement_timeout = 3 s
+     * still blocked at 90 seconds, with the backend alive afterwards. That is
+     * the v0 defect class reached by a different route -- not an interrupt
+     * check on the wrong thread, but no interrupt check reachable at all.
+     *
+     * The transport therefore carries its own bound, because at this depth it
+     * is the only thing that can: it is the only code holding the syscall.
+     */
+    void set_deadlines(int fd) const
+    {
+        struct timeval tv;
+
+        tv.tv_sec = io_timeout_ms_ / 1000;
+        tv.tv_usec = (io_timeout_ms_ % 1000) * 1000;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 
     static bool send_all_fd(int fd, const char *p, size_t n)
@@ -632,10 +831,15 @@ private:
     std::string bucket_, key_, access_, secret_, region_;
     int64_t     size_ = -1;
     bool        closed_ = false;
-    int64_t     head_calls_ = 0;
-    int64_t     get_calls_ = 0;
+    int64_t     head_calls_ = 0;        /* logical size() calls that did I/O  */
+    int64_t     get_calls_ = 0;         /* logical range reads                */
     int64_t     http_errors_ = 0;
-    int64_t     bytes_transferred_ = 0;
+    int64_t     bytes_transferred_ = 0; /* bytes off the wire, retries included */
+    int64_t     http_attempts_ = 0;     /* physical exchanges, retries included */
+    int64_t     retries_done_ = 0;
+    int         max_attempts_ = 3;
+    int         io_timeout_ms_ = 15000;
+    int         connect_timeout_ms_ = 5000;
 };
 
 }   /* namespace */
@@ -735,7 +939,42 @@ open_s3_reader(const char *uri, std::string *error)
 
     try
     {
-        return new S3Reader(ep, bucket, key, ak, sk, rg ? rg : "us-east-1");
+        S3Reader *r = new S3Reader(ep, bucket, key, ak, sk, rg ? rg : "us-east-1");
+        /*
+         * Bounded, and bounded again here: an operator who sets this to 1000
+         * turns a dead endpoint into a hung backend. 1 means no retry at all,
+         * which is what the tests use to see the raw failure.
+         */
+        const char *ma = getenv("XPB_S3_MAX_ATTEMPTS");
+        if (ma != nullptr)
+        {
+            int n = atoi(ma);
+            if (n < 1) n = 1;
+            if (n > 5) n = 5;
+            r->set_max_attempts(n);
+        }
+        /*
+         * Bounded at both ends. Too small and a healthy slow object fails; too
+         * large and an unreachable endpoint is indistinguishable from a hang,
+         * which is what these exist to prevent.
+         */
+        const char *io = getenv("XPB_S3_IO_TIMEOUT_MS");
+        if (io != nullptr)
+        {
+            int n = atoi(io);
+            if (n < 100) n = 100;
+            if (n > 300000) n = 300000;
+            r->set_io_timeout_ms(n);
+        }
+        const char *ct = getenv("XPB_S3_CONNECT_TIMEOUT_MS");
+        if (ct != nullptr)
+        {
+            int n = atoi(ct);
+            if (n < 100) n = 100;
+            if (n > 60000) n = 60000;
+            r->set_connect_timeout_ms(n);
+        }
+        return r;
     }
     catch (...)
     {
@@ -751,5 +990,9 @@ int64_t s3_http_errors(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->http_errors() : -1; }
 int64_t s3_bytes_transferred(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->bytes_transferred() : -1; }
+int64_t s3_http_attempts(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->http_attempts() : -1; }
+int64_t s3_retries(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->retries() : -1; }
 
 }   /* namespace xpb */
