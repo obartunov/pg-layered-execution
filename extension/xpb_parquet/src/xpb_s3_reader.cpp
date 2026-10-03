@@ -12,13 +12,11 @@
 #include "xpb_s3_reader.h"
 #include "xpb_object_reader.h"
 
-/* TEMPORARY: thread census, removed before commit. */
-#include <sys/syscall.h>
-
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -102,6 +100,37 @@ header_value(const std::string &headers, const std::string &name)
         return std::string();
     size_t e = v.find_last_not_of(" \t\r");
     return v.substr(b, e - b + 1);
+}
+
+/*
+ * Does a header carry `token`, case-insensitively, as one of its comma-separated
+ * values? Written for `Connection: close`, which a proxy may legitimately send
+ * as "Connection: close, foo" -- a plain equality test would miss it and the
+ * reader would then try to reuse a socket the peer is closing.
+ */
+bool
+header_is(const std::string &headers, const std::string &name,
+          const std::string &token)
+{
+    std::string v = header_value(headers, name);
+    for (char &c : v)
+        c = static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+
+    size_t at = 0;
+    while (at < v.size())
+    {
+        size_t comma = v.find(',', at);
+        std::string one = v.substr(at, comma == std::string::npos
+                                       ? std::string::npos : comma - at);
+        size_t b = one.find_first_not_of(" \t");
+        size_t e = one.find_last_not_of(" \t");
+        if (b != std::string::npos && one.substr(b, e - b + 1) == token)
+            return true;
+        if (comma == std::string::npos)
+            break;
+        at = comma + 1;
+    }
+    return false;
 }
 
 struct Endpoint
@@ -228,7 +257,8 @@ build_signed_request(const char *method, const std::string &uri,
                      const std::string &host, const std::string &range,
                      const std::string &amz_date, const std::string &datestamp,
                      const std::string &region, const std::string &access,
-                     const std::string &secret, const std::string &if_match)
+                     const std::string &secret, const std::string &if_match,
+                     bool keep_alive)
 {
     std::string signed_headers = "host;";
     if (!if_match.empty())
@@ -255,7 +285,13 @@ build_signed_request(const char *method, const std::string &uri,
     req += std::string("x-amz-date: ") + amz_date + "\r\n";
     req += "Authorization: AWS4-HMAC-SHA256 Credential=" + access + "/" + scope +
            ", SignedHeaders=" + signed_headers + ", Signature=" + sig + "\r\n";
-    req += "Connection: close\r\n";
+    /*
+     * Connection is a hop-by-hop header and is NOT part of the signed set, so
+     * switching it changes nothing about the signature. HTTP/1.1 defaults to
+     * persistent anyway; both values are stated explicitly so the wire shape
+     * of each mode is unambiguous in a capture.
+     */
+    req += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
     req += "\r\n";
     return req;
 }
@@ -274,6 +310,12 @@ public:
     void set_max_attempts(int n) { max_attempts_ = n; }
     void set_io_timeout_ms(int n) { io_timeout_ms_ = n; }
     void set_require_identity(bool b) { require_identity_ = b; }
+    /*
+     * Off exists so the one-connection-per-request baseline can be measured
+     * from the SAME binary; a before/after across two builds would compare two
+     * compilations as well as two transports.
+     */
+    void set_reuse(bool b) { reuse_ = b; }
     const std::string &identity() const { return identity_; }
     void set_connect_timeout_ms(int n) { connect_timeout_ms_ = n; }
 
@@ -284,6 +326,23 @@ public:
     int64_t http_errors()       const { return http_errors_; }
     int64_t bytes_transferred() const { return bytes_transferred_; }
     int64_t http_attempts()     const { return http_attempts_; }
+    int64_t connections()       const { return connections_; }
+    /*
+     * The most requests ever in flight at once. Kept rather than removed with
+     * the rest of the phase's instrumentation, because it is the only thing
+     * that shows the single connection loses no parallelism: it reads 1 in
+     * every scan shape, so serialising on one socket serialises nothing that
+     * was concurrent. Without it, "a mutex around the connection is free" would
+     * be an assertion about Arrow's scheduling rather than a measurement of it.
+     */
+    int64_t max_in_flight()     const { return max_in_flight_; }
+    /*
+     * Replays after a reused socket turned out to be already closed. Counted
+     * apart from retries() because they are different events: a retry answers a
+     * server that failed, a reconnect answers a connection that was gone before
+     * the server saw anything.
+     */
+    int64_t reconnects()        const { return reconnects_; }
     int64_t retries()           const { return retries_done_; }
 
     int64_t size() override
@@ -598,8 +657,17 @@ public:
 
     void close() override
     {
-        /* No persistent connection to release in phase 1; each request closes
-         * its own socket. Idempotent, as the contract requires. */
+        /*
+         * Releases the persistent socket if one is held. Idempotent, as the
+         * contract requires, and taken under the same lock as every other use
+         * of conn_fd_: close() runs on the backend thread while an Arrow worker
+         * may still be inside an exchange, so an unlocked close here would be a
+         * use-after-close on a live descriptor.
+         */
+        {
+            std::lock_guard<std::mutex> lk(conn_mutex_);
+            drop_connection();
+        }
         closed_ = true;
     }
 
@@ -622,28 +690,30 @@ private:
     }
 
     /*
-     * One request, one socket, closed on return. `expect_body` is how many
-     * bytes the caller wants, used only to size the reserve.
+     * One HTTP exchange on a connection the caller owns.
      *
-     * Returns the HTTP status, or -1 with last_error() set when the exchange
-     * itself failed.
+     * This function never closes `fd` and never connects: whether the socket
+     * survives is reported, not decided here, because the decision belongs with
+     * the code that holds the connection. That split is the whole of keep-alive
+     * support -- the response parsing below is byte-for-byte the one-socket
+     * version, so no failure classification moved with it.
      */
-    int request(const char *method, const std::string &range,
-                std::string *headers_out, std::string *body_out,
-                int64_t expect_body)
+    struct Exchange
     {
-        http_attempts_++;
+        int  status;        /* HTTP status, or -1 with last_error() set       */
+        bool got_bytes;     /* any response byte arrived -- see request()     */
+        bool reusable;      /* the socket is positioned at a clean boundary   */
+    };
 
-        int fd = connect_endpoint();
-        if (fd < 0)
-            return -1;
+    static Exchange ex_fail(bool got_bytes)
+    { return Exchange{-1, got_bytes, false}; }
 
-        std::string req = build_request(method, range);
+    Exchange do_exchange(int fd, const char *method, const std::string &req,
+                         std::string *headers_out, std::string *body_out,
+                         int64_t expect_body)
+    {
         if (!send_all(fd, req))
-        {
-            ::close(fd);
-            return -1;
-        }
+            return ex_fail(false);
 
         std::string buf;
         if (expect_body > 0)
@@ -664,14 +734,20 @@ private:
                          " ms waiting for response headers from " + ep_.host);
                 else
                     fail(std::string("recv: ") + std::strerror(errno));
-                ::close(fd);
-                return -1;
+                return ex_fail(!buf.empty());
             }
             if (n == 0)
             {
+                /*
+                 * The peer closed before a complete response. On a REUSED
+                 * socket with nothing received this is the ordinary race with
+                 * the server's idle timeout, and request() replays it once; on
+                 * a fresh socket, or after bytes arrived, it is a real failure.
+                 * This function does not know which, so it only reports what
+                 * happened.
+                 */
                 fail("connection closed before the response headers were complete");
-                ::close(fd);
-                return -1;
+                return ex_fail(!buf.empty());
             }
             buf.append(chunk, static_cast<size_t>(n));
             sep = buf.find("\r\n\r\n");
@@ -680,8 +756,7 @@ private:
             if (buf.size() > (1u << 20))
             {
                 fail("response headers exceed 1 MB");
-                ::close(fd);
-                return -1;
+                return ex_fail(true);
             }
         }
 
@@ -699,15 +774,22 @@ private:
         if (status == 0)
         {
             fail("malformed status line");
-            ::close(fd);
-            return -1;
+            return ex_fail(true);
         }
+
+        /*
+         * The server has the last word on whether the socket survives. Asking
+         * to keep it is a request; "Connection: close" in the response is an
+         * instruction, and reading a second response off a socket the server
+         * is about to close would be a self-inflicted failure.
+         */
+        const bool peer_closes = header_is(*headers_out, "Connection", "close");
 
         if (strcmp(method, "HEAD") == 0)
         {
-            ::close(fd);
+            /* No body by definition, so the socket is already at a boundary. */
             *body_out = std::string();
-            return status;
+            return Exchange{status, true, reuse_ && !peer_closes};
         }
 
         /*
@@ -723,8 +805,7 @@ private:
              * does not implement. Refused rather than guessed. */
             fail("response has no Content-Length (chunked transfer-encoding is "
                  "not implemented)");
-            ::close(fd);
-            return -1;
+            return ex_fail(true);
         }
 
         while (static_cast<int64_t>(body.size()) < want)
@@ -741,18 +822,136 @@ private:
                          std::to_string(want) + " body bytes from " + ep_.host);
                 else
                     fail(std::string("recv body: ") + std::strerror(errno));
-                ::close(fd);
-                return -1;
+                return ex_fail(true);
             }
             if (n == 0)
                 break;              /* short body; the caller sees it as such */
             body.append(chunk, static_cast<size_t>(n));
         }
 
-        ::close(fd);
         bytes_transferred_ += static_cast<int64_t>(body.size());
+
+        /*
+         * A socket may only be reused when the stream is at a known boundary,
+         * which means exactly Content-Length bytes consumed and no more. Short
+         * is the cut-transfer case the caller turns into an error; longer means
+         * the server sent something this code does not understand. Either way
+         * the next response could not be found reliably, so the connection is
+         * not reusable -- that is a transport decision and it does not change
+         * what the caller is told about the data.
+         */
+        const bool at_boundary = (static_cast<int64_t>(body.size()) == want);
+
         *body_out = std::move(body);
-        return status;
+        return Exchange{status, true, reuse_ && !peer_closes && at_boundary};
+    }
+
+    /*
+     * One logical HTTP request, on a persistent connection when there is one.
+     * `expect_body` is how many bytes the caller wants, used only to size the
+     * reserve. Returns the HTTP status, or -1 with last_error() set.
+     *
+     * Serialised on conn_mutex_ for the whole exchange. Measured first: reads
+     * never overlap in any scan shape (max_in_flight = 1 for footer, projected,
+     * pruned and full scans), because Arrow dispatches column-chunk reads to its
+     * pool but waits for each. So the lock is uncontended in practice; it is
+     * held anyway, because correctness here must not rest on Arrow's scheduling,
+     * and because the fd and its HTTP state are shared mutable state crossing
+     * threads.
+     *
+     * The interrupt hook is NOT called here -- before_read() runs in the
+     * caller's retry loop, outside this lock. That ordering is deliberate: the
+     * hook may longjmp out of a PostgreSQL ERROR, and a longjmp through a held
+     * std::mutex would leave the reader permanently locked.
+     */
+    int request(const char *method, const std::string &range,
+                std::string *headers_out, std::string *body_out,
+                int64_t expect_body)
+    {
+        /*
+         * How many requests are inside this function at once, counted BEFORE
+         * the lock. Counting it inside would measure the lock rather than the
+         * callers, and would read 1 by construction.
+         */
+        int64_t cur = in_flight_.fetch_add(1, std::memory_order_relaxed) + 1;
+        int64_t seen = max_in_flight_.load(std::memory_order_relaxed);
+        while (cur > seen &&
+               !max_in_flight_.compare_exchange_weak(seen, cur,
+                                                     std::memory_order_relaxed))
+            ;
+        struct InFlightGuard
+        {
+            std::atomic<int64_t> *c;
+            ~InFlightGuard() { c->fetch_sub(1, std::memory_order_relaxed); }
+        } ifg{&in_flight_};
+
+        std::lock_guard<std::mutex> lk(conn_mutex_);
+
+        /*
+         * At most two passes: the second exists only to replay a request that
+         * died on a connection the SERVER had already closed while it sat idle.
+         *
+         * That replay is bounded by construction and deliberately narrow:
+         *   - only on a socket that was reused, never on a fresh one;
+         *   - only when NO response byte arrived, so nothing can be replayed
+         *     over a partially delivered answer;
+         *   - GET and HEAD only, which is all this reader issues, and both are
+         *     idempotent, so the replay cannot have a side effect.
+         * It is counted as a RECONNECT and not as a retry: it consumes none of
+         * the caller's bounded retry budget, because no server answer was
+         * received to retry. A failure that happens after bytes arrive is left
+         * to the caller's retry loop exactly as before.
+         */
+        for (int pass = 0; pass < 2; pass++)
+        {
+            const bool reused = (conn_fd_ >= 0);
+
+            if (!reused)
+            {
+                conn_fd_ = connect_endpoint();
+                if (conn_fd_ < 0)
+                {
+                    conn_fd_ = -1;
+                    return -1;
+                }
+            }
+
+            http_attempts_++;
+
+            /*
+             * Signed afresh each pass. The replay therefore carries a new
+             * x-amz-date and signature, and -- the point that matters -- the
+             * SAME If-Match, because build_request() rebuilds it from the
+             * identity pinned at open. A reconnect cannot re-HEAD, cannot
+             * observe a new ETag and cannot widen the incarnation this reader
+             * reads.
+             */
+            std::string req = build_request(method, range);
+
+            headers_out->clear();
+            body_out->clear();
+            Exchange ex = do_exchange(conn_fd_, method, req,
+                                      headers_out, body_out, expect_body);
+
+            if (!ex.reusable)
+                drop_connection();
+
+            if (ex.status < 0 && reused && !ex.got_bytes && pass == 0)
+            {
+                reconnects_++;
+                clear_error();
+                continue;               /* conn_fd_ is -1: the next pass dials */
+            }
+            return ex.status;
+        }
+        return -1;                      /* not reachable: pass 1 always returns */
+    }
+
+    void drop_connection()
+    {
+        if (conn_fd_ >= 0)
+            ::close(conn_fd_);
+        conn_fd_ = -1;
     }
 
     int connect_endpoint()
@@ -835,6 +1034,7 @@ private:
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         set_deadlines(fd);
+        connections_.fetch_add(1, std::memory_order_relaxed);
         return fd;
     }
 
@@ -912,7 +1112,8 @@ private:
         const std::string cond = range.empty() ? std::string() : identity_;
 
         return build_signed_request(method, path(), host, range, amz_date,
-                                    datestamp, region_, access_, secret_, cond);
+                                    datestamp, region_, access_, secret_, cond,
+                                    reuse_);
     }
 
 
@@ -925,6 +1126,13 @@ private:
     int64_t     http_errors_ = 0;
     int64_t     bytes_transferred_ = 0; /* bytes off the wire, retries included */
     int64_t     http_attempts_ = 0;     /* physical exchanges, retries included */
+    std::atomic<int64_t> connections_{0};   /* actual connect() calls          */
+    std::atomic<int64_t> in_flight_{0};
+    std::atomic<int64_t> max_in_flight_{0};
+    int64_t     reconnects_ = 0;        /* replays after a server-closed idle  */
+    int         conn_fd_ = -1;          /* the persistent socket, or -1        */
+    std::mutex  conn_mutex_;            /* guards conn_fd_ and its HTTP state  */
+    bool        reuse_ = true;
     std::string identity_;              /* opaque ETag captured with size_     */
     bool        require_identity_ = true;
     int64_t     retries_done_ = 0;
@@ -964,9 +1172,11 @@ s3_test_authorization(const char *method, const char *uri, const char *host,
     std::string req = build_signed_request(method, uri, host,
                                            range ? range : "",
                                            amz_date, datestamp, region,
-                                           access, secret, std::string());
+                                           access, secret, std::string(),
+                                           /* keep_alive */ true);
     /* Return just the Authorization line's value, which is what the oracle
-     * produces too. */
+     * produces too. Connection is not a signed header, so this value cannot
+     * affect what the oracle compares; it matches what the reader sends. */
     const std::string tag = "Authorization: ";
     size_t at = req.find(tag);
     if (at == std::string::npos)
@@ -1066,6 +1276,15 @@ open_s3_reader(const char *uri, std::string *error)
         if (ig != nullptr && (strcmp(ig, "off") == 0 || strcmp(ig, "0") == 0))
             r->set_require_identity(false);
 
+        /*
+         * The baseline control. Off means one connection per request, which is
+         * what every earlier phase measured; it exists so the comparison is one
+         * binary with one flag, not two builds.
+         */
+        const char *cr = getenv("XPB_S3_CONNECTION_REUSE");
+        if (cr != nullptr && (strcmp(cr, "off") == 0 || strcmp(cr, "0") == 0))
+            r->set_reuse(false);
+
         const char *ct = getenv("XPB_S3_CONNECT_TIMEOUT_MS");
         if (ct != nullptr)
         {
@@ -1092,8 +1311,14 @@ int64_t s3_bytes_transferred(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->bytes_transferred() : -1; }
 int64_t s3_http_attempts(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->http_attempts() : -1; }
+int64_t s3_connections(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->connections() : -1; }
+int64_t s3_max_in_flight(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->max_in_flight() : -1; }
 int64_t s3_retries(const ObjectReader *r)
 { const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->retries() : -1; }
+int64_t s3_reconnects(const ObjectReader *r)
+{ const S3Reader *s = dynamic_cast<const S3Reader *>(r); return s ? s->reconnects() : -1; }
 int64_t s3_identity_conflicts(const ObjectReader *r)
 {
     /*

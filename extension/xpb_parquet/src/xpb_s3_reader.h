@@ -15,10 +15,39 @@
  *     synchronously. That is a deliberate answer to the defect v0 shipped --
  *     see docs/OBJECT_READER_V0.md section 7 -- rather than a limitation to be
  *     fixed later;
- *   - no async, no cache, no prefetch, no connection reuse. One request per
- *     read_at_most(), one socket, closed after;
+ *   - no async, no cache, no prefetch. One request per read_at_most(), and a
+ *     connection kept between requests (HTTP/1.1 keep-alive) -- a single
+ *     socket, reused, never a pool and never pipelined. See CONNECTIONS;
  *   - no TLS. http:// only. This cannot talk to real AWS S3 and is not
  *     intended to yet; see LIMITS.
+ *
+ * ----------------------------------------------------------- CONNECTIONS
+ *
+ * One socket, held across requests and serialised by a mutex. Not a pool, not
+ * pipelined, not HTTP/2: a reader issues one request at a time, measured rather
+ * than assumed -- the most requests ever in flight at once is 1 in every scan
+ * shape, because Arrow dispatches column-chunk reads to its thread pool and
+ * then waits for each. The mutex is therefore uncontended; it is held anyway,
+ * because the socket and its HTTP state are shared mutable state that an Arrow
+ * worker and the backend thread both touch, and because correctness here must
+ * not depend on Arrow's scheduling staying what it is today.
+ *
+ * The socket is dropped, not reused, whenever it is not known to be at a clean
+ * message boundary: the response said Connection: close, the body did not
+ * match Content-Length, or the exchange failed at all.
+ *
+ * A reused socket has exactly one failure the fresh one did not: the server
+ * closed it while it sat idle, and the client finds out by sending into a dead
+ * connection. One request is replayed on a new socket for that, and only when
+ * NO response byte had arrived, so a replay can never sit on top of a partly
+ * delivered answer. It is counted as a RECONNECT, not a retry, and spends no
+ * retry budget -- there was no server answer to retry. GET and HEAD are all
+ * this reader issues and both are idempotent, so the replay has no side effect.
+ *
+ * What reuse does NOT touch: the logical request, the bytes, the accounting,
+ * the identity pinned at open (a reconnect re-signs but never re-HEADs, so
+ * If-Match still names the incarnation opened), the deadlines, or any of the
+ * failure classifications below.
  *
  * ------------------------------------------------------------------- EOF
  *
@@ -66,8 +95,12 @@
  *   - credentials come from the environment of the BACKEND process, which
  *     means the postmaster's environment. Configuration has no proper home
  *     yet, and this is not it;
- *   - one connection per read. Phase 7 can measure what that costs; it is not
- *     a correctness question.
+ *   - SigV4 is now verified against a server that enforces it (RustFS), but
+ *     still not against AWS itself;
+ *   - keep-alive is not negotiated beyond Connection: close. A server that
+ *     keeps the socket but stops answering is caught by the I/O deadline, not
+ *     by any probe of connection health, so one dead-but-open connection costs
+ *     one deadline before the reader gives up on it.
  */
 #ifndef XPB_S3_READER_H
 #define XPB_S3_READER_H
@@ -155,6 +188,18 @@ int64_t s3_bytes_transferred(const ObjectReader *r);
  * for a remote source. */
 int64_t s3_http_attempts(const ObjectReader *r);
 int64_t s3_retries(const ObjectReader *r);
+/* Actual connect() calls. With one connection per request this equals
+ * s3_http_attempts; the point of keep-alive is to make it much smaller. */
+int64_t s3_connections(const ObjectReader *r);
+/*
+ * Requests replayed because a reused connection turned out to be already closed
+ * by the peer. Separate from s3_retries: a reconnect happens before the server
+ * has seen anything, and consumes no retry budget.
+ */
+int64_t s3_reconnects(const ObjectReader *r);
+/* The most reads ever in flight at once, which decides whether one persistent
+ * connection can be serialised without losing parallelism there is. */
+int64_t s3_max_in_flight(const ObjectReader *r);
 
 /*
  * Range reads refused because the object changed since the reader opened it

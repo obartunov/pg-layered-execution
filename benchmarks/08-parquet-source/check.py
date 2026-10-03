@@ -232,7 +232,8 @@ def main():
          "s3_head_calls bigint, s3_get_calls bigint, s3_http_errors bigint, "
          "s3_bytes_transferred bigint, s3_http_attempts bigint, "
          "s3_retries bigint, s3_identity text, "
-         "s3_identity_conflicts bigint) "
+         "s3_identity_conflicts bigint, s3_connections bigint, "
+         "s3_max_in_flight bigint, s3_reconnects bigint) "
          "LANGUAGE c AS '\$libdir/xpb_parquet', 'xpq_scan'")
 
     npass = nfail = 0

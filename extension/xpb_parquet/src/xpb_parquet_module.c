@@ -752,7 +752,7 @@ xpq_scan(PG_FUNCTION_ARGS)
     }
 
     oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-    tupdesc = CreateTemplateTupleDesc(38);
+    tupdesc = CreateTemplateTupleDesc(41);
     TupleDescInitEntry(tupdesc,  1, "rows",            INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  2, "batches",         INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc,  3, "sum_last_col",    INT8OID, -1, 0);
@@ -800,6 +800,10 @@ xpq_scan(PG_FUNCTION_ARGS)
     /* Object identity pinned at open, and reads refused because it changed. */
     TupleDescInitEntry(tupdesc, 37, "s3_identity",             TEXTOID, -1, 0);
     TupleDescInitEntry(tupdesc, 38, "s3_identity_conflicts",   INT8OID, -1, 0);
+    /* Transport cost: actual connect() calls, and peak read concurrency. */
+    TupleDescInitEntry(tupdesc, 39, "s3_connections",          INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 40, "s3_max_in_flight",        INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 41, "s3_reconnects",           INT8OID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
 
     store = tuplestore_begin_heap(true, false, work_mem);
@@ -809,8 +813,8 @@ xpq_scan(PG_FUNCTION_ARGS)
 
     {
         XpqSourceState *st = (XpqSourceState *) src->private_state;
-        Datum   vals[38];
-        bool    nulls[38] = {false};
+        Datum   vals[41];
+        bool    nulls[41] = {false};
 
         vals[0] = Int64GetDatum(rows);
         vals[1] = Int64GetDatum(nbatches);
@@ -852,6 +856,9 @@ xpq_scan(PG_FUNCTION_ARGS)
         vals[35] = Int64GetDatum(xpq_s3_retries(st->reader));
         vals[36] = CStringGetTextDatum(xpq_s3_identity(st->reader));
         vals[37] = Int64GetDatum(xpq_s3_identity_conflicts(st->reader));
+        vals[38] = Int64GetDatum(xpq_s3_connections(st->reader));
+        vals[39] = Int64GetDatum(xpq_s3_max_in_flight(st->reader));
+        vals[40] = Int64GetDatum(xpq_s3_reconnects(st->reader));
         tuplestore_putvalues(store, tupdesc, vals, nulls);
     }
 

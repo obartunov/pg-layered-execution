@@ -212,6 +212,9 @@ int64_t     xpq_s3_retries(const XpqReader *r);
  */
 const char *xpq_s3_identity(const XpqReader *r);
 int64_t     xpq_s3_identity_conflicts(const XpqReader *r);
+int64_t     xpq_s3_connections(const XpqReader *r);
+int64_t     xpq_s3_max_in_flight(const XpqReader *r);
+int64_t     xpq_s3_reconnects(const XpqReader *r);
 
 /*
  * Open with a fault injected underneath the Parquet reader.
