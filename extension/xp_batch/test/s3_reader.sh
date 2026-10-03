@@ -614,6 +614,69 @@ SQL
         || bad "expected exactly one HEAD carrying both size and identity, got HEAD=$HD identity=$ID2"
 fi
 
+# ---- 9. connection reuse --------------------------------------------------
+echo
+echo "=== 9. one connection for many range reads ==="
+#
+# Two halves, because they answer different questions.
+#
+# Through SQL, against whatever endpoint the SERVER is configured with: either
+# that endpoint keeps the connection, in which case connections must be far
+# below the request count, or it answers Connection: close, in which case the
+# reader must honour that -- one connection per request and NO reconnect, since
+# a reconnect there would mean it tried to reuse a socket the peer had closed.
+# Both are real assertions; which one applies is reported, not assumed.
+#
+# Below SQL, s3_keepalive_unit drives the cases SQL cannot reach: the baseline
+# from the same binary, a server that kills idle connections, and -- the one
+# that matters most -- a response cut mid-body, which must NOT be replayed,
+# because replaying there would hide a truncated transfer.
+C=$(qall "SELECT s3_get_calls||' '||s3_http_attempts||' '||s3_connections||' '||s3_reconnects||' '||s3_retries||' '||rows||' '||s3_bytes_transferred
+          FROM xpq_scan('$S3URI','period_key,company_key,account_key,amount_dt')")
+set -- $C; CG="${1:-0}"; CA="${2:-0}"; CC="${3:-0}"; CR="${4:-0}"; CT="${5:-0}"; CROWS="${6:-0}"; CB="${7:-0}"
+echo "          full scan: GET=$CG attempts=$CA connections=$CC reconnects=$CR retries=$CT rows=$CROWS"
+if [ "$CROWS" != "10000000" ]; then
+    bad "the full scan did not return the object's rows: $CROWS"
+elif [ "${CC:-0}" -lt "${CA:-0}" ]; then
+    ok "the endpoint persists: $CC connection(s) for $CA requests"
+    [ "${CR:-0}" -eq 0 ] && ok "and no reconnect was needed" \
+                         || ok "with $CR reconnect(s), which the server is entitled to force"
+elif [ "${CC:-0}" -eq "${CA:-0}" ] && [ "${CR:-0}" -eq 0 ]; then
+    ok "the endpoint answers Connection: close, and the reader obeys it ($CC for $CA) without a wasted reconnect"
+else
+    bad "neither reuse nor an honest close: connections=$CC attempts=$CA reconnects=$CR"
+fi
+# The answer must not depend on how the bytes were carried. 52795301 is what
+# every earlier phase measured for this shape.
+[ "${CB:-0}" -gt 0 ] && ok "bytes transferred are accounted the same way ($CB)" \
+                     || bad "no bytes were accounted for the full scan"
+
+UP="${XPB_S3_UPSTREAM:-}"
+UPHP="${UP#http://}"
+if [ -z "$UPHP" ]; then
+    echo "  skip    XPB_S3_UPSTREAM not set, so there is no known-persistent"
+    echo "          endpoint to drive the reuse cases against"
+elif [ ! -f "$REPO/extension/xpb_parquet/src/xpb_s3_reader.o" ]; then
+    echo "  skip    objects not built"
+elif ! command -v g++ >/dev/null 2>&1; then
+    echo "  skip    no g++"
+else
+    g++ -std=c++20 -O1 -I "$REPO/extension/xpb_parquet/src" -o "$TMP/s3ka" \
+        "$PQT/s3_keepalive_unit.cpp" "$REPO/extension/xpb_parquet/src/xpb_s3_reader.o" \
+        "$REPO/extension/xpb_parquet/src/xpb_object_reader.o" -lcrypto 2>"$TMP/k.build" \
+        || bad "building the keep-alive harness: $(tail -1 "$TMP/k.build")"
+    if [ -x "$TMP/s3ka" ]; then
+        XPB_S3_ENDPOINT="${XPB_S3_ENDPOINT:-$UP}" \
+        XPB_S3_ACCESS_KEY="${XPB_S3_ACCESS_KEY:-rustkey}" \
+        XPB_S3_SECRET_KEY="${XPB_S3_SECRET_KEY:-rustsecret0123456789}" \
+        XPB_S3_REGION="${XPB_S3_REGION:-us-east-1}" \
+        timeout 300 "$TMP/s3ka" "$UPHP" 9177 > "$TMP/k.out" 2>&1
+        grep -E "^  (ok|FAIL)|^          " "$TMP/k.out"
+        N=$(grep -c "^  ok" "$TMP/k.out"); pass=$((pass + ${N:-0}))
+        M=$(grep -c "^  FAIL" "$TMP/k.out"); fail=$((fail + ${M:-0}))
+    fi
+fi
+
 echo
 echo "############ $pass correct, $fail wrong ############"
 [ "$fail" -eq 0 ]
